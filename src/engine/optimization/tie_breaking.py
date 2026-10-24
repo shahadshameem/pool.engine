@@ -22,7 +22,13 @@ def get_candidate_sort_tuple(
        - canonical ordered_stops stop_id ASCII tuple
        - candidate_id ASCII string
     """
-    return (
+    cached: tuple[float, float, float, float, str, tuple[str, ...], tuple[str, ...], str] | None = getattr(
+        c, "_cached_sort_tuple", None
+    )
+    if cached is not None:
+        return cached
+
+    sort_tuple = (
         -round(c.objective_value, 6),
         -c.score_breakdown.vmt_savings_ratio,
         c.score_breakdown.detour_penalty_ratio,
@@ -32,6 +38,8 @@ def get_candidate_sort_tuple(
         tuple(s.stop_id for s in c.ordered_stops),
         c.candidate_id,
     )
+    object.__setattr__(c, "_cached_sort_tuple", sort_tuple)
+    return sort_tuple
 
 
 def compare_candidates_deterministic(

@@ -104,6 +104,29 @@ def _generate_all_precedence_permutations(
     return sequences
 
 
+def _generate_oracle_active_insertion_sequences(
+    existing_stops: Sequence[RouteStop],
+    request_stop_pairs: Sequence[tuple[RouteStop, RouteStop]],
+) -> list[list[RouteStop]]:
+    """
+    Independently enumerates all stop sequences resulting from inserting
+    a bundle of request stop pairs into an active ride's existing stops,
+    preserving the relative ordering of existing stops and ensuring pickup
+    precedes dropoff for each request.
+    """
+    sequences: list[list[RouteStop]] = [list(existing_stops)]
+    for p_stop, d_stop in request_stop_pairs:
+        next_sequences: list[list[RouteStop]] = []
+        for seq in sequences:
+            n = len(seq)
+            for i in range(n + 1):
+                for j in range(i + 1, n + 2):
+                    new_seq = seq[:i] + [p_stop] + seq[i : j - 1] + [d_stop] + seq[j - 1 :]
+                    next_sequences.append(new_seq)
+        sequences = next_sequences
+    return sequences
+
+
 def _evaluate_candidate_feasibility(
     vehicle_loc: Coordinate,
     stops: Sequence[RouteStop],
@@ -136,7 +159,9 @@ def _evaluate_candidate_feasibility(
                 if active_ride is None:
                     return None
                 existing_pickups = {
-                    st.request_id for st in active_ride.stops if st.stop_type == StopType.PICKUP
+                    st.request_id for st in active_ride.stops
+                    if st.stop_type == StopType.PICKUP
+                    and st.status in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
                 }
                 if s.request_id in existing_pickups:
                     return None
@@ -281,36 +306,28 @@ class IndependentCandidateOracle:
             active_ride = rides_by_veh.get(veh.vehicle_id)
 
             if active_ride is not None:
-                # Active ride: evaluate single-request insertions
+                # Active ride: evaluate single requests and multi-request bundles up to max_bundle_size
                 future_stops = [
                     s for s in active_ride.stops
                     if s.status in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
                 ]
-                n = len(future_stops)
                 t_start = current_time if current_time is not None else active_ride.scheduled_departure_time
+                capable_requests = [
+                    r for r in pending_requests if r.seat_count <= veh.total_seat_capacity
+                ]
+                for bundle_size in range(1, min(self.max_bundle_size, len(capable_requests)) + 1):
+                    for req_subset in itertools.combinations(capable_requests, bundle_size):
+                        req_pairs = [_generate_oracle_request_stops(r, active_ride.ride_id) for r in req_subset]
+                        valid_orderings = _generate_oracle_active_insertion_sequences(future_stops, req_pairs)
+                        sorted_req_ids = tuple(sorted(r.request_id for r in req_subset))
 
-                for req in pending_requests:
-                    if req.seat_count > veh.total_seat_capacity:
-                        continue
-
-                    p_stop, d_stop = _generate_oracle_request_stops(req, active_ride.ride_id)
-
-                    for i in range(n + 1):
-                        for j in range(i + 1, n + 2):
-                            candidate_stops = (
-                                future_stops[:i]
-                                + [p_stop]
-                                + future_stops[i : j - 1]
-                                + [d_stop]
-                                + future_stops[j - 1 :]
-                            )
-
+                        for stop_seq in valid_orderings:
                             eval_res = _evaluate_candidate_feasibility(
                                 vehicle_loc=v_loc,
-                                stops=candidate_stops,
+                                stops=stop_seq,
                                 initial_passengers=active_ride.active_passenger_count,
                                 capacity=veh.total_seat_capacity,
-                                eval_requests=[req],
+                                eval_requests=req_subset,
                                 active_ride=active_ride,
                                 router=self.router,
                                 policy=self.policy,
@@ -320,8 +337,8 @@ class IndependentCandidateOracle:
                                 peak_occ, total_vmt = eval_res
                                 sig = OracleCandidateSignature(
                                     vehicle_id=veh.vehicle_id,
-                                    request_ids=(req.request_id,),
-                                    ordered_stop_ids=tuple(s.stop_id for s in candidate_stops),
+                                    request_ids=sorted_req_ids,
+                                    ordered_stop_ids=tuple(s.stop_id for s in stop_seq),
                                     peak_occupancy=peak_occ,
                                     total_vmt_meters=total_vmt,
                                 )

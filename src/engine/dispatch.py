@@ -20,7 +20,10 @@ from engine.domain.enums import (
 from engine.domain.models import MatchResult, Ride, RideRequest, Vehicle
 from engine.optimization.set_packing import solve_set_packing_regret_k
 from engine.routing.bundle_generator import generate_group_bundles
-from engine.routing.insertion import generate_single_request_insertions
+from engine.routing.insertion import (
+    generate_active_ride_insertions,
+    generate_single_request_insertions,
+)
 from engine.spatial.index import SpatialIndexCoordinator
 from engine.spatial.lower_bounds import (
     DEFAULT_V_MAX_MPS,
@@ -149,6 +152,10 @@ def _sort_requests_by_active_detour(
     coords = [v_loc] + [
         Coordinate(s.location.latitude, s.location.longitude) for s in active_stops
     ]
+    segment_lengths = [
+        haversine_distance_meters(coords[i], coords[i + 1])
+        for i in range(len(coords) - 1)
+    ]
 
     def _req_detour_lower_bound(req: RideRequest) -> float:
         p = Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
@@ -160,7 +167,7 @@ def _sort_requests_by_active_detour(
             det = (
                 haversine_distance_meters(coords[i], p)
                 + haversine_distance_meters(p, coords[i + 1])
-                - haversine_distance_meters(coords[i], coords[i + 1])
+                - segment_lengths[i]
             )
             if det < min_p_detour:
                 min_p_detour = det
@@ -168,7 +175,7 @@ def _sort_requests_by_active_detour(
         if append_detour < min_p_detour:
             min_p_detour = append_detour
 
-        direct_pd = haversine_distance_meters(p, d)
+        direct_pd = float(req.direct_distance_meters)
         return min_p_detour + direct_pd
 
     return sorted(requests, key=_req_detour_lower_bound)
@@ -430,20 +437,22 @@ class DispatchEngine:
                 eval_reqs = sorted_reqs
 
             if active_ride is not None:
-                for req in eval_reqs:
-                    if time.monotonic() > effective_deadline - reserved_headroom:
-                        search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                        is_approximated = True
-                        break
-                    ins_cands = generate_single_request_insertions(
-                        active_ride=active_ride,
-                        request=req,
-                        vehicle=veh,
-                        router=self.routing_provider,
-                        policy=policy,
-                        current_time=current_time,
-                    )
-                    candidates.extend(ins_cands)
+                ins_cands = generate_active_ride_insertions(
+                    active_ride=active_ride,
+                    requests=eval_reqs,
+                    vehicle=veh,
+                    router=self.routing_provider,
+                    policy=policy,
+                    current_time=current_time,
+                    max_bundle_size=effective_config.max_bundle_size,
+                    deadline=effective_deadline,
+                    reserved_headroom=reserved_headroom,
+                )
+                candidates.extend(ins_cands)
+                if time.monotonic() > effective_deadline - reserved_headroom:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    is_approximated = True
+                    break
             else:
                 bundle_cands = generate_group_bundles(
                     requests=eval_reqs,
@@ -524,8 +533,8 @@ class DispatchEngine:
             )
 
         # Stage 2, 3, 4: Candidate Generation
-        # Reserve headroom for set packing solver (headroom + 50ms)
-        cand_headroom = reserved_headroom + 0.050
+        # Reserve headroom for set packing solver (headroom + 20ms)
+        cand_headroom = reserved_headroom + 0.020
         candidates = self.generate_candidates(
             requests=pending_requests,
             vehicles=eligible_vehicles,

@@ -389,6 +389,83 @@ def test_oracle_active_ride_with_onboard_passenger() -> None:
     assert cmp_res.recall_pct == 100.0
 
 
+def test_oracle_active_ride_multi_request_bundles() -> None:
+    """
+    Active ride with 1 onboard passenger and 2 compatible incoming requests.
+    Verifies that the oracle independently enumerates both single-request insertions
+    and multi-request group bundle insertions (bundle_size=2) into the active ride,
+    matching production candidates with 100% recall and precision.
+    """
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=600,
+        detour_relative_multiplier=1.40,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    spatial = H3SpatialIndexAdapter()
+
+    veh = _make_veh("veh-multi-act", 40.7100, -74.0000, capacity=4)
+    dropoff_stop = RouteStop(
+        stop_id="stop-d-onboard",
+        ride_id="ride-multi-act",
+        request_id="req-onboard",
+        stop_type=StopType.DROPOFF,
+        location=GeoCoordinate(latitude=40.7500, longitude=-74.0000),
+        passenger_delta=-1,
+        scheduled_arrival_time=1500,
+        promised_window_start=1000,
+        promised_window_end=2200,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-multi-act",
+        vehicle_id="veh-multi-act",
+        driver_id="drv-multi",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(dropoff_stop,),
+        scheduled_departure_time=1000,
+        active_passenger_count=1,
+    )
+
+    req1 = _make_req("req-1", 40.7200, -74.0000, 40.7350, -74.0000, seats=1, earliest_p=1000)
+    req2 = _make_req("req-2", 40.7250, -74.0000, 40.7400, -74.0000, seats=1, earliest_p=1020)
+
+    oracle = IndependentCandidateOracle(router=router, policy=policy, max_bundle_size=2)
+    oracle_cands = oracle.enumerate_feasible_candidates(
+        requests=[req1, req2],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=1000,
+    )
+
+    # Must contain both single-request insertions and multi-request bundles
+    oracle_single = [c for c in oracle_cands if len(c.request_ids) == 1]
+    oracle_bundle = [c for c in oracle_cands if len(c.request_ids) == 2]
+    assert len(oracle_single) >= 2, "Oracle must enumerate single-request insertions"
+    assert len(oracle_bundle) >= 1, "Oracle must enumerate multi-request bundle insertions"
+
+    cfg_exact = CandidateGenerationConfig.exact(max_bundle_size=2)
+    engine = DispatchEngine(policy_prov, router, spatial, config=cfg_exact)
+    prod_cands = engine.generate_candidates(
+        requests=[req1, req2],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=1000,
+        config=cfg_exact,
+    )
+
+    cmp_res = oracle.compare(production_candidates=prod_cands, oracle_candidates=oracle_cands)
+    assert cmp_res.is_perfect_match, (
+        f"Multi-request active ride candidate mismatch!\n"
+        f"  Oracle count: {cmp_res.oracle_count}, Production count: {cmp_res.production_count}\n"
+        f"  False Negatives: {cmp_res.false_negatives}\n"
+        f"  False Positives: {cmp_res.false_positives}"
+    )
+    assert cmp_res.recall_pct == 100.0
+    assert cmp_res.precision_pct == 100.0
+
+
 def test_oracle_overlapping_capacity_constraints() -> None:
     """
     Overlapping capacity: Two 2-seat requests on a 3-seat vehicle.
@@ -1196,4 +1273,414 @@ def test_oracle_property_capacity_and_sequence_permutations(
         f"  False Negatives: {cmp_res.false_negatives}\n"
         f"  False Positives: {cmp_res.false_positives}\n"
         f"  Seats: ({seat1}, {seat2}, {seat3}), Vehicle Capacity: {v_cap}, Max Bundle Size: {max_bundle_size}"
+    )
+
+
+@settings(max_examples=25, deadline=None)
+@given(
+    onboard_seats=st.integers(min_value=1, max_value=2),
+    seat1=st.integers(min_value=1, max_value=2),
+    seat2=st.integers(min_value=1, max_value=2),
+    v_cap=st.sampled_from([3, 4]),
+    offset_lat=st.sampled_from([0.005, 0.010, 0.015]),
+)
+def test_oracle_property_active_ride_multi_request_bundles(
+    onboard_seats: int,
+    seat1: int,
+    seat2: int,
+    v_cap: int,
+    offset_lat: float,
+) -> None:
+    """
+    Property-based testing covering multi-request insertions into active rides:
+    evaluates combinations of onboard passenger seats, vehicle capacity, and incoming
+    request seats, verifying 100% agreement between the oracle and production candidate generation.
+    """
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=600,
+        detour_relative_multiplier=1.40,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    spatial = H3SpatialIndexAdapter()
+
+    base_lat, base_lon = 40.7100, -74.0000
+    v_loc = Coordinate(base_lat, base_lon)
+    veh = _make_veh("veh-prop-multi-act", base_lat, base_lon, capacity=v_cap)
+
+    t_start = 1000
+    d_onboard_loc = Coordinate(base_lat + 0.040, base_lon)
+    _, dur_onboard = router.get_direct_leg(v_loc, d_onboard_loc)
+
+    drop_stop = RouteStop(
+        stop_id="stop-d-onboard",
+        ride_id="ride-prop-multi-act",
+        request_id="req-onboard",
+        stop_type=StopType.DROPOFF,
+        location=GeoCoordinate(latitude=d_onboard_loc.latitude, longitude=d_onboard_loc.longitude),
+        passenger_delta=-onboard_seats,
+        scheduled_arrival_time=t_start + dur_onboard,
+        promised_window_start=t_start,
+        promised_window_end=t_start + dur_onboard + 1200,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-prop-multi-act",
+        vehicle_id="veh-prop-multi-act",
+        driver_id="drv-prop",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(drop_stop,),
+        scheduled_departure_time=t_start,
+        active_passenger_count=onboard_seats,
+    )
+
+    r1 = _make_req_exact(
+        router, "r1", base_lat + offset_lat, base_lon, base_lat + offset_lat + 0.015, base_lon,
+        seats=seat1, earliest_p=1000
+    )
+    r2 = _make_req_exact(
+        router, "r2", base_lat + offset_lat + 0.005, base_lon, base_lat + offset_lat + 0.020, base_lon,
+        seats=seat2, earliest_p=1010
+    )
+
+    oracle = IndependentCandidateOracle(router=router, policy=policy, max_bundle_size=2)
+    oracle_cands = oracle.enumerate_feasible_candidates(
+        requests=[r1, r2],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+    )
+
+    cfg_exact = CandidateGenerationConfig.exact(max_bundle_size=2)
+    engine = DispatchEngine(policy_prov, router, spatial, config=cfg_exact)
+    prod_cands = engine.generate_candidates(
+        requests=[r1, r2],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+        config=cfg_exact,
+    )
+
+    cmp_res = oracle.compare(production_candidates=prod_cands, oracle_candidates=oracle_cands)
+    assert cmp_res.is_perfect_match, (
+        f"Multi-request active ride property mismatch!\n"
+        f"  Oracle count: {cmp_res.oracle_count}, Production count: {cmp_res.production_count}\n"
+        f"  False Negatives: {cmp_res.false_negatives}\n"
+        f"  False Positives: {cmp_res.false_positives}\n"
+        f"  Onboard: {onboard_seats}, Seats: ({seat1}, {seat2}), Capacity: {v_cap}"
+    )
+
+
+
+# ==============================================================================
+# Requirement B: Strengthened Property-Based Tests for Temporal Pruning & Oracle
+# ==============================================================================
+
+class AsymmetricPropertyRouter(MockRoutingProvider):
+    """Deterministic routing provider returning asymmetric durations for directional testing."""
+
+    def __init__(self, asym_factor: float = 1.3) -> None:
+        super().__init__(average_speed_kmh=40.0, circuity_factor=1.0)
+        self.asym_factor = asym_factor
+
+    def get_direct_leg(self, origin: Coordinate, destination: Coordinate) -> tuple[int, int]:
+        dist, dur = super().get_direct_leg(origin, destination)
+        if destination.latitude < origin.latitude:
+            return int(round(dist * self.asym_factor)), int(round(dur * self.asym_factor))
+        return dist, dur
+
+
+@settings(max_examples=12, deadline=None)
+@given(
+    onboard_seats=st.integers(min_value=1, max_value=2),
+    v_cap=st.sampled_from([4, 6]),
+    slack=st.sampled_from([100, 300, 1200]),
+    max_delay=st.sampled_from([180, 300, 600]),
+    detour_mult=st.sampled_from([1.20, 1.40, 1.60]),
+)
+def test_oracle_property_active_ride_bundle_size_3(
+    onboard_seats: int,
+    v_cap: int,
+    slack: int,
+    max_delay: int,
+    detour_mult: float,
+) -> None:
+    """
+    Property-based test covering bundle size 3 on active rides:
+    verifies 100% agreement between the independent oracle and production candidate generation
+    across varied onboard passenger counts, vehicle capacities, promised dropoff window slacks,
+    pickup delays, and detour multipliers.
+    """
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=max_delay,
+        detour_relative_multiplier=detour_mult,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    spatial = H3SpatialIndexAdapter()
+
+    base_lat, base_lon = 40.7100, -74.0000
+    v_loc = Coordinate(base_lat, base_lon)
+    veh = _make_veh("veh-prop-b3", base_lat, base_lon, capacity=v_cap)
+
+    t_start = 1000
+    d_onboard_loc = Coordinate(base_lat + 0.045, base_lon)
+    _, dur_onboard = router.get_direct_leg(v_loc, d_onboard_loc)
+
+    drop_stop = RouteStop(
+        stop_id="stop-d-onboard",
+        ride_id="ride-prop-b3",
+        request_id="req-onboard",
+        stop_type=StopType.DROPOFF,
+        location=GeoCoordinate(latitude=d_onboard_loc.latitude, longitude=d_onboard_loc.longitude),
+        passenger_delta=-onboard_seats,
+        scheduled_arrival_time=t_start + dur_onboard,
+        promised_window_start=t_start,
+        promised_window_end=t_start + dur_onboard + slack,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-prop-b3",
+        vehicle_id="veh-prop-b3",
+        driver_id="drv-prop",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(drop_stop,),
+        scheduled_departure_time=t_start,
+        active_passenger_count=onboard_seats,
+    )
+
+    r1 = _make_req_exact(
+        router, "req-b3-1", base_lat + 0.010, base_lon, base_lat + 0.025, base_lon,
+        seats=1, earliest_p=1000
+    )
+    r2 = _make_req_exact(
+        router, "req-b3-2", base_lat + 0.015, base_lon, base_lat + 0.035, base_lon,
+        seats=1, earliest_p=1005
+    )
+    r3 = _make_req_exact(
+        router, "req-b3-3", base_lat + 0.020, base_lon, base_lat + 0.040, base_lon,
+        seats=1, earliest_p=1010
+    )
+
+    oracle = IndependentCandidateOracle(router=router, policy=policy, max_bundle_size=3)
+    oracle_cands = oracle.enumerate_feasible_candidates(
+        requests=[r1, r2, r3],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+    )
+
+    cfg_exact = CandidateGenerationConfig.exact(max_bundle_size=3)
+    engine = DispatchEngine(policy_prov, router, spatial, config=cfg_exact)
+    prod_cands = engine.generate_candidates(
+        requests=[r1, r2, r3],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+        config=cfg_exact,
+    )
+
+    cmp_res = oracle.compare(production_candidates=prod_cands, oracle_candidates=oracle_cands)
+    assert cmp_res.is_perfect_match, (
+        f"Active ride bundle size 3 property mismatch!\n"
+        f"  Oracle count: {cmp_res.oracle_count}, Production count: {cmp_res.production_count}\n"
+        f"  False Negatives: {cmp_res.false_negatives}\n"
+        f"  False Positives: {cmp_res.false_positives}\n"
+        f"  Onboard: {onboard_seats}, Capacity: {v_cap}, Slack: {slack}"
+    )
+
+
+@settings(max_examples=12, deadline=None)
+@given(
+    dwell_sec=st.sampled_from([0, 15, 30, 45]),
+    asym_mult=st.sampled_from([1.0, 1.25, 1.5]),
+    max_delay=st.sampled_from([150, 300, 600]),
+    bundle_size=st.integers(min_value=1, max_value=2),
+)
+def test_oracle_property_asymmetric_and_dwell_temporal_pruning(
+    dwell_sec: int,
+    asym_mult: float,
+    max_delay: int,
+    bundle_size: int,
+) -> None:
+    """
+    Property-based test covering asymmetric routing and dwell duration interaction:
+    verifies that directional travel time differences and dwell accumulation do not
+    cause false negatives or false positives between oracle and production.
+    """
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=max_delay,
+        detour_relative_multiplier=1.40,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    router = AsymmetricPropertyRouter(asym_factor=asym_mult)
+    spatial = H3SpatialIndexAdapter()
+
+    base_lat, base_lon = 40.7100, -74.0000
+    v_loc = Coordinate(base_lat, base_lon)
+    veh = _make_veh("veh-prop-asym", base_lat, base_lon, capacity=4)
+
+    t_start = 1000
+    d_onboard_loc = Coordinate(base_lat + 0.030, base_lon)
+    _, dur_onb = router.get_direct_leg(v_loc, d_onboard_loc)
+
+    drop_stop = RouteStop(
+        stop_id="stop-d-onboard",
+        ride_id="ride-prop-asym",
+        request_id="req-onboard",
+        stop_type=StopType.DROPOFF,
+        location=GeoCoordinate(latitude=d_onboard_loc.latitude, longitude=d_onboard_loc.longitude),
+        passenger_delta=-1,
+        scheduled_arrival_time=t_start + dur_onb,
+        promised_window_start=t_start,
+        promised_window_end=t_start + dur_onb + 1200,
+        dwell_duration_seconds=dwell_sec,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-prop-asym",
+        vehicle_id="veh-prop-asym",
+        driver_id="drv-prop",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(drop_stop,),
+        scheduled_departure_time=t_start,
+        active_passenger_count=1,
+    )
+
+    r1 = _make_req_exact(
+        router, "req-asym-1", base_lat + 0.020, base_lon, base_lat - 0.005, base_lon,
+        seats=1, earliest_p=1000
+    )
+    r2 = _make_req_exact(
+        router, "req-asym-2", base_lat + 0.015, base_lon, base_lat - 0.010, base_lon,
+        seats=1, earliest_p=1010
+    )
+
+    eval_reqs = [r1] if bundle_size == 1 else [r1, r2]
+
+    oracle = IndependentCandidateOracle(router=router, policy=policy, max_bundle_size=bundle_size)
+    oracle_cands = oracle.enumerate_feasible_candidates(
+        requests=eval_reqs,
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+    )
+
+    cfg_exact = CandidateGenerationConfig.exact(max_bundle_size=bundle_size)
+    engine = DispatchEngine(policy_prov, router, spatial, config=cfg_exact)
+    prod_cands = engine.generate_candidates(
+        requests=eval_reqs,
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+        config=cfg_exact,
+    )
+
+    cmp_res = oracle.compare(production_candidates=prod_cands, oracle_candidates=oracle_cands)
+    assert cmp_res.is_perfect_match, (
+        f"Asymmetric & dwell property mismatch!\n"
+        f"  Oracle count: {cmp_res.oracle_count}, Production count: {cmp_res.production_count}\n"
+        f"  False Negatives: {cmp_res.false_negatives}\n"
+        f"  False Positives: {cmp_res.false_positives}\n"
+        f"  Dwell: {dwell_sec}, Asym: {asym_mult}, MaxDelay: {max_delay}"
+    )
+
+
+@settings(max_examples=12, deadline=None)
+@given(
+    is_colocated=st.booleans(),
+    tight_boundary=st.sampled_from([-1, 0, 10]),
+    onboard_seats=st.integers(min_value=0, max_value=2),
+)
+def test_oracle_property_colocated_and_tight_windows(
+    is_colocated: bool,
+    tight_boundary: int,
+    onboard_seats: int,
+) -> None:
+    """
+    Property-based test covering co-located stop coordinates, exact deadline boundaries,
+    and tightly constrained time windows for active rides.
+    """
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    base_lat, base_lon = 40.7100, -74.0000
+    v_loc = Coordinate(base_lat, base_lon)
+    veh = _make_veh("veh-prop-coloc", base_lat, base_lon, capacity=4)
+    t_start = 1000
+
+    p1_lat = base_lat + 0.015
+    p2_lat = base_lat + 0.015 if is_colocated else base_lat + 0.020
+    d1_lat = base_lat + 0.030
+    d2_lat = base_lat + 0.035
+
+    _, dur_p1 = router.get_direct_leg(v_loc, Coordinate(p1_lat, base_lon))
+
+    # Test exact boundary (dur_p1), strictly infeasible (dur_p1 - 1), or loose (dur_p1 + 10)
+    tested_delay = max(1, dur_p1 + tight_boundary)
+
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=tested_delay,
+        detour_relative_multiplier=1.40,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    spatial = H3SpatialIndexAdapter()
+
+    rides = []
+    if onboard_seats > 0:
+        d_onb = Coordinate(base_lat + 0.050, base_lon)
+        _, dur_onb = router.get_direct_leg(v_loc, d_onb)
+        drop_stop = RouteStop(
+            stop_id="stop-d-onboard",
+            ride_id="ride-prop-coloc",
+            request_id="req-onboard",
+            stop_type=StopType.DROPOFF,
+            location=GeoCoordinate(latitude=d_onb.latitude, longitude=d_onb.longitude),
+            passenger_delta=-onboard_seats,
+            scheduled_arrival_time=t_start + dur_onb,
+            promised_window_start=t_start,
+            promised_window_end=t_start + dur_onb + 1200,
+            status=StopStatus.SCHEDULED,
+        )
+        ride = Ride(
+            ride_id="ride-prop-coloc",
+            vehicle_id="veh-prop-coloc",
+            driver_id="drv-prop",
+            lifecycle_status=RideStatus.ACTIVE,
+            stops=(drop_stop,),
+            scheduled_departure_time=t_start,
+            active_passenger_count=onboard_seats,
+        )
+        rides.append(ride)
+
+    r1 = _make_req_exact(router, "req-co-1", p1_lat, base_lon, d1_lat, base_lon, seats=1, earliest_p=1000)
+    r2 = _make_req_exact(router, "req-co-2", p2_lat, base_lon, d2_lat, base_lon, seats=1, earliest_p=1000)
+
+    oracle = IndependentCandidateOracle(router=router, policy=policy, max_bundle_size=2)
+    oracle_cands = oracle.enumerate_feasible_candidates(
+        requests=[r1, r2],
+        vehicles=[veh],
+        active_rides=rides,
+        current_time=t_start,
+    )
+
+    cfg_exact = CandidateGenerationConfig.exact(max_bundle_size=2)
+    engine = DispatchEngine(policy_prov, router, spatial, config=cfg_exact)
+    prod_cands = engine.generate_candidates(
+        requests=[r1, r2],
+        vehicles=[veh],
+        active_rides=rides,
+        current_time=t_start,
+        config=cfg_exact,
+    )
+
+    cmp_res = oracle.compare(production_candidates=prod_cands, oracle_candidates=oracle_cands)
+    assert cmp_res.is_perfect_match, (
+        f"Colocated & boundary property mismatch!\n"
+        f"  Oracle count: {cmp_res.oracle_count}, Production count: {cmp_res.production_count}\n"
+        f"  False Negatives: {cmp_res.false_negatives}\n"
+        f"  False Positives: {cmp_res.false_positives}\n"
+        f"  Colocated: {is_colocated}, Boundary offset: {tight_boundary}, Delay: {tested_delay}"
     )

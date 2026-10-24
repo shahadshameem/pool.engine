@@ -17,6 +17,8 @@ try:
 except Exception:
     _H3_MODULE = None
 
+_GLOBAL_H3_RING_CACHE: dict[tuple[str, int], set[str]] = {}
+
 
 class H3SpatialIndexAdapter(SpatialIndexProvider):
     """
@@ -32,6 +34,7 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
         # Internal indexed storage: cell_id -> list of (entity_id, Coordinate)
         self._cells: dict[str, list[tuple[str, Coordinate]]] = {}
         self._all_entities: list[tuple[str, Coordinate]] = []
+        self._ring_cache: dict[tuple[str, int], set[str]] = _GLOBAL_H3_RING_CACHE
 
     def _grid_cell_id(self, coord: Coordinate) -> str:
         """Pure-Python discrete cell index generator."""
@@ -63,19 +66,33 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
 
     def _get_h3_k_ring_cells(self, origin_cell: str, k: int) -> set[str]:
         """Queries concentric cell rings using H3."""
+        cache_key = (origin_cell, k)
+        if cache_key in self._ring_cache:
+            return self._ring_cache[cache_key]
+
         if _H3_MODULE is not None:
             try:
                 if hasattr(_H3_MODULE, "grid_ring"):
-                    return set(_H3_MODULE.grid_ring(origin_cell, k))
+                    res = set(_H3_MODULE.grid_ring(origin_cell, k))
+                    self._ring_cache[cache_key] = res
+                    return res
                 if hasattr(_H3_MODULE, "grid_disk"):
-                    return set(_H3_MODULE.grid_disk(origin_cell, k))
-                return set(_H3_MODULE.k_ring(origin_cell, k))
+                    res = set(_H3_MODULE.grid_disk(origin_cell, k))
+                    self._ring_cache[cache_key] = res
+                    return res
+                res = set(_H3_MODULE.k_ring(origin_cell, k))
+                self._ring_cache[cache_key] = res
+                return res
             except Exception as ring_exc:
                 try:
                     if hasattr(_H3_MODULE, "grid_disk"):
-                        return set(_H3_MODULE.grid_disk(origin_cell, k))
+                        res = set(_H3_MODULE.grid_disk(origin_cell, k))
+                        self._ring_cache[cache_key] = res
+                        return res
                     if hasattr(_H3_MODULE, "k_ring"):
-                        return set(_H3_MODULE.k_ring(origin_cell, k))
+                        res = set(_H3_MODULE.k_ring(origin_cell, k))
+                        self._ring_cache[cache_key] = res
+                        return res
                     raise ring_exc
                 except Exception as disk_exc:
                     raise RuntimeError(

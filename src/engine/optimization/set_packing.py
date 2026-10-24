@@ -66,11 +66,13 @@ def solve_set_packing_regret_k(
         # Inverted index: request_id -> list of sorted candidates
         # Also vehicle_id -> list of sorted candidates
         req_to_cands: dict[str, list[CandidateAssignment]] = {r: [] for r in sorted_all_reqs}
+        req_to_all_cands: dict[str, list[CandidateAssignment]] = {r: [] for r in sorted_all_reqs}
         veh_to_cands: dict[str, list[CandidateAssignment]] = {}
 
         for c in valid_candidates:
             for r in c.request_ids:
                 req_to_cands[r].append(c)
+                req_to_all_cands[r].append(c)
             if c.vehicle_id not in veh_to_cands:
                 veh_to_cands[c.vehicle_id] = []
             veh_to_cands[c.vehicle_id].append(c)
@@ -78,6 +80,31 @@ def solve_set_packing_regret_k(
         selected_assignments: list[CandidateAssignment] = []
         assigned_requests: set[str] = set()
         assigned_vehicles: set[str] = set()
+        unassignable_requests: set[str] = {r for r in sorted_all_reqs if not req_to_cands[r]}
+
+        # Cached regret state: r -> (regret, c1)
+        req_info: dict[str, tuple[float, CandidateAssignment]] = {}
+
+        def _update_request(r: str) -> None:
+            surviving = [
+                c for c in req_to_cands[r]
+                if c.vehicle_id not in assigned_vehicles
+                and assigned_requests.isdisjoint(c.request_ids)
+            ]
+            req_to_cands[r] = surviving
+            if not surviving:
+                unassignable_requests.add(r)
+                req_info.pop(r, None)
+                return
+            c1 = surviving[0]
+            alt_idx = min(k - 1, len(surviving) - 1)
+            ck = surviving[alt_idx]
+            regret = c1.objective_value - ck.objective_value
+            req_info[r] = (regret, c1)
+
+        for r in sorted_all_reqs:
+            if r not in unassignable_requests:
+                _update_request(r)
 
         # =========================================================================
         # Stage 5: Regret-K Heuristic Assignment Loop (Hard Cutoff at cutoff_time)
@@ -91,27 +118,18 @@ def solve_set_packing_regret_k(
                 interrupted_by_deadline = True
                 break
 
-            # Find active request with maximum regret
-            active_requests = [r for r in sorted_all_reqs if r not in assigned_requests]
+            if not req_info:
+                break
+
+            # Find active request with maximum regret (deterministic ordering over sorted_all_reqs)
             best_req: str | None = None
             max_regret = -float("inf")
             best_cand_for_best_req: CandidateAssignment | None = None
 
-            for r in active_requests:
-                # Filter remaining candidates for request r to non-conflicting ones
-                surviving = [
-                    c for c in req_to_cands[r]
-                    if c.vehicle_id not in assigned_vehicles
-                    and not any(req in assigned_requests for req in c.request_ids)
-                ]
-                req_to_cands[r] = surviving
-                if not surviving:
+            for r in sorted_all_reqs:
+                if r not in req_info:
                     continue
-
-                c1 = surviving[0]
-                alt_idx = min(k - 1, len(surviving) - 1)
-                ck = surviving[alt_idx]
-                regret = c1.objective_value - ck.objective_value
+                regret, c1 = req_info[r]
 
                 # Deterministic comparison of regret and candidate tie-breaking
                 regret_diff = round(regret, 6) - round(max_regret, 6)
@@ -142,13 +160,28 @@ def solve_set_packing_regret_k(
 
             # Double check conflict freedom before committing
             if c_star.vehicle_id in assigned_vehicles or any(r in assigned_requests for r in c_star.request_ids):
+                _update_request(best_req)
                 continue
 
             # Commit selected candidate
             selected_assignments.append(c_star)
             assigned_vehicles.add(c_star.vehicle_id)
-            for r in c_star.request_ids:
+            newly_assigned_reqs = set(c_star.request_ids)
+            for r in newly_assigned_reqs:
                 assigned_requests.add(r)
+                req_info.pop(r, None)
+
+            # Prune only requests affected by the newly assigned vehicle or requests
+            affected_requests: set[str] = set()
+            for c in veh_to_cands.get(c_star.vehicle_id, []):
+                affected_requests.update(c.request_ids)
+            for r_assigned in newly_assigned_reqs:
+                for c in req_to_all_cands.get(r_assigned, []):
+                    affected_requests.update(c.request_ids)
+
+            for r in affected_requests:
+                if r not in assigned_requests and r not in unassignable_requests:
+                    _update_request(r)
 
         # =========================================================================
         # Stage 6: Final Verification, Deterministic Tie-Breaking & Serialization
