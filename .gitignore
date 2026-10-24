@@ -1,0 +1,88 @@
+# ==============================================================================
+# Git Ignore - Optimized Provider-Independent Ride-Pooling Engine
+# ==============================================================================
+
+# Cloned Sub-repositories (Preserve directories, do not track in root repo)
+/ECC/
+/spec-kit/
+/ponytail/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# Type checking & Linters
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment and sensitive data
+.env
+.env.*
+!.env.example
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# IDEs
+.idea/
+*.swp
+*.swo
+*~
+
+# Explicitly ensure Spec Kit and Agent configurations are tracked
+!.specify/
+!.agents/
