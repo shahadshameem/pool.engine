@@ -227,6 +227,10 @@ def _evaluate_candidate_feasibility(
         if detour > (max_detour + 1e-6):
             return None
 
+        # Latest dropoff deadline
+        if d_time > req.latest_dropoff_time:
+            return None
+
     # 5. First-principles Temporal Bounds for Existing Active Stops
     if active_ride is not None:
         existing_stop_ids = {st.stop_id for st in active_ride.stops}

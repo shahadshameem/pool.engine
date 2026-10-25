@@ -539,3 +539,398 @@ def test_antimeridian_and_polar_recall(monkeypatch: pytest.MonkeyPatch) -> None:
             f"recall={cmp_res['recall_pct']}%"
         )
 
+
+def test_latest_dropoff_deadline_enforced_idle_vehicle_single_request() -> None:
+    """
+    Verifies that RideRequest.latest_dropoff_time is strictly enforced for idle-vehicle bundling:
+    1. Detour constraint passes, but explicit latest_dropoff_time is exceeded -> pruned.
+    2. Arrival exactly at latest_dropoff_time -> accepted.
+    3. Arrival one second after latest_dropoff_time -> pruned.
+    4. Independent oracle independently verifies identical pruning behavior.
+    """
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=600,
+        detour_relative_multiplier=1.50,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    spatial = H3SpatialIndexAdapter()
+    engine = DispatchEngine(policy_prov, router, spatial)
+
+    # Vehicle at (40.7100, -74.0000)
+    # Pickup at (40.7100, -74.0000) -> 0m, 0s travel time
+    # Dropoff at (40.7200, -74.0000) -> 1,112m, 100s travel time
+    v_loc = Coordinate(40.7100, -74.0000)
+    p_loc = Coordinate(40.7100, -74.0000)
+    d_loc = Coordinate(40.7200, -74.0000)
+    _, dur_pd = router.get_direct_leg(p_loc, d_loc)
+
+    current_time = 1000
+    expected_arr_p = current_time  # 1000
+    expected_arr_d = expected_arr_p + dur_pd  # 1000 + 100 = 1100
+
+    veh = Vehicle(
+        vehicle_id="veh-idle-1",
+        driver_id="drv-1",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=v_loc.latitude, longitude=v_loc.longitude),
+        is_active=True,
+    )
+
+    # Case A: Detour passes (detour=0), but latest_dropoff_time is 1050 (< 1100) -> must be PRUNED
+    req_impossible = RideRequest(
+        request_id="req-drop-early",
+        user_id="u1",
+        pickup_location=GeoCoordinate(latitude=p_loc.latitude, longitude=p_loc.longitude),
+        dropoff_location=GeoCoordinate(latitude=d_loc.latitude, longitude=d_loc.longitude),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=expected_arr_d - 50,  # 1050 < 1100
+        direct_distance_meters=1112,
+        direct_duration_seconds=dur_pd,
+        status=RequestStatus.PENDING,
+    )
+    cands_a = engine.generate_candidates(
+        requests=[req_impossible],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=current_time,
+    )
+    oracle_a = enumerate_exhaustive_candidates(
+        requests=[req_impossible],
+        vehicles=[veh],
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=current_time,
+        max_bundle_size=1,
+    )
+    assert len(cands_a) == 0, "Candidate must be pruned when arrival exceeds latest_dropoff_time"
+    assert len(oracle_a) == 0, "Oracle must also reject candidate when arrival exceeds latest_dropoff_time"
+
+    # Case B: Boundary exact equality: latest_dropoff_time == expected_arr_d (1100) -> must be ACCEPTED
+    req_exact = RideRequest(
+        request_id="req-drop-exact",
+        user_id="u1",
+        pickup_location=GeoCoordinate(latitude=p_loc.latitude, longitude=p_loc.longitude),
+        dropoff_location=GeoCoordinate(latitude=d_loc.latitude, longitude=d_loc.longitude),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=expected_arr_d,  # Exactly 1100
+        direct_distance_meters=1112,
+        direct_duration_seconds=dur_pd,
+        status=RequestStatus.PENDING,
+    )
+    cands_b = engine.generate_candidates(
+        requests=[req_exact],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=current_time,
+    )
+    oracle_b = enumerate_exhaustive_candidates(
+        requests=[req_exact],
+        vehicles=[veh],
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=current_time,
+        max_bundle_size=1,
+    )
+    assert len(cands_b) == 1, "Candidate arriving exactly at latest_dropoff_time must be accepted"
+    assert len(oracle_b) == 1, "Oracle must accept candidate arriving exactly at latest_dropoff_time"
+    assert cands_b[0].ordered_stops[1].scheduled_arrival_time == expected_arr_d
+
+    # Case C: Boundary one second late: latest_dropoff_time == expected_arr_d - 1 (1099) -> must be PRUNED
+    req_late_1s = RideRequest(
+        request_id="req-drop-late-1s",
+        user_id="u1",
+        pickup_location=GeoCoordinate(latitude=p_loc.latitude, longitude=p_loc.longitude),
+        dropoff_location=GeoCoordinate(latitude=d_loc.latitude, longitude=d_loc.longitude),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=expected_arr_d - 1,  # 1099 (1 second late)
+        direct_distance_meters=1112,
+        direct_duration_seconds=dur_pd,
+        status=RequestStatus.PENDING,
+    )
+    cands_c = engine.generate_candidates(
+        requests=[req_late_1s],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=current_time,
+    )
+    oracle_c = enumerate_exhaustive_candidates(
+        requests=[req_late_1s],
+        vehicles=[veh],
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=current_time,
+        max_bundle_size=1,
+    )
+    assert len(cands_c) == 0, "Candidate arriving 1 second late must be strictly pruned"
+    assert len(oracle_c) == 0, "Oracle must also reject candidate arriving 1 second late"
+
+
+def test_latest_dropoff_deadline_enforced_active_ride_insertion() -> None:
+    """
+    Verifies that RideRequest.latest_dropoff_time is strictly enforced for active-ride insertions:
+    1. Detour constraint passes, but arrival at new dropoff exceeds latest_dropoff_time -> pruned.
+    2. Arrival exactly at latest_dropoff_time -> accepted.
+    3. Arrival one second after latest_dropoff_time -> pruned.
+    4. Independent oracle independently verifies identical pruning behavior.
+    """
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=600,
+        detour_relative_multiplier=1.50,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    spatial = H3SpatialIndexAdapter()
+    engine = DispatchEngine(policy_prov, router, spatial)
+
+    t_start = 1000
+    v_loc = Coordinate(40.7000, -74.0000)
+    veh = Vehicle(
+        vehicle_id="veh-act-1",
+        driver_id="drv-act",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=v_loc.latitude, longitude=v_loc.longitude),
+        is_active=True,
+    )
+
+    # Active ride with 1 onboard passenger heading far North
+    d_onboard = Coordinate(40.7500, -74.0000)
+    _, dur_onboard = router.get_direct_leg(v_loc, d_onboard)
+    dest_stop = RouteStop(
+        stop_id="stop-d-onboard",
+        ride_id="ride-act-1",
+        request_id="req-onboard",
+        stop_type=StopType.DROPOFF,
+        location=GeoCoordinate(latitude=d_onboard.latitude, longitude=d_onboard.longitude),
+        passenger_delta=-1,
+        scheduled_arrival_time=t_start + dur_onboard,
+        promised_window_start=t_start,
+        promised_window_end=t_start + dur_onboard + 2000,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-act-1",
+        vehicle_id="veh-act-1",
+        driver_id="drv-act",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(dest_stop,),
+        scheduled_departure_time=t_start,
+        active_passenger_count=1,
+    )
+
+    # New request along the route:
+    # Pickup at (40.7100, -74.0000)
+    # Dropoff at (40.7200, -74.0000)
+    p_new = Coordinate(40.7100, -74.0000)
+    d_new = Coordinate(40.7200, -74.0000)
+    _, dur_vp = router.get_direct_leg(v_loc, p_new)
+    _, dur_pd = router.get_direct_leg(p_new, d_new)
+
+    # If inserted before onboard dropoff:
+    # arr_p = 1000 + dur_vp
+    # arr_d = arr_p + dur_pd
+    expected_arr_d = t_start + dur_vp + dur_pd
+
+    # Case A: Boundary exact equality: latest_dropoff_time == expected_arr_d -> accepted
+    req_exact = RideRequest(
+        request_id="req-act-exact",
+        user_id="u-act",
+        pickup_location=GeoCoordinate(latitude=p_new.latitude, longitude=p_new.longitude),
+        dropoff_location=GeoCoordinate(latitude=d_new.latitude, longitude=d_new.longitude),
+        seat_count=1,
+        earliest_pickup_time=t_start,
+        latest_dropoff_time=expected_arr_d,  # Exact
+        direct_distance_meters=1112,
+        direct_duration_seconds=dur_pd,
+        status=RequestStatus.PENDING,
+    )
+    cands_exact = engine.generate_candidates(
+        requests=[req_exact],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+    )
+    oracle_exact = enumerate_exhaustive_candidates(
+        requests=[req_exact],
+        vehicles=[veh],
+        active_rides=[ride],
+        router=router,
+        policy=policy,
+        current_time=t_start,
+        max_bundle_size=1,
+    )
+    assert len(cands_exact) >= 1, "Candidate arriving exactly at deadline must be accepted"
+    assert len(oracle_exact) >= 1, "Oracle must accept candidate arriving exactly at deadline"
+
+    # Case B: Boundary one second late: latest_dropoff_time == expected_arr_d - 1 -> pruned
+    req_late_1s = RideRequest(
+        request_id="req-act-late-1s",
+        user_id="u-act",
+        pickup_location=GeoCoordinate(latitude=p_new.latitude, longitude=p_new.longitude),
+        dropoff_location=GeoCoordinate(latitude=d_new.latitude, longitude=d_new.longitude),
+        seat_count=1,
+        earliest_pickup_time=t_start,
+        latest_dropoff_time=expected_arr_d - 1,  # 1s late
+        direct_distance_meters=1112,
+        direct_duration_seconds=dur_pd,
+        status=RequestStatus.PENDING,
+    )
+    cands_late = engine.generate_candidates(
+        requests=[req_late_1s],
+        vehicles=[veh],
+        active_rides=[ride],
+        current_time=t_start,
+    )
+    oracle_late = enumerate_exhaustive_candidates(
+        requests=[req_late_1s],
+        vehicles=[veh],
+        active_rides=[ride],
+        router=router,
+        policy=policy,
+        current_time=t_start,
+        max_bundle_size=1,
+    )
+    assert len(cands_late) == 0, "Candidate arriving 1 second late must be strictly pruned"
+    assert len(oracle_late) == 0, "Oracle must also reject candidate arriving 1 second late"
+
+
+def test_latest_dropoff_deadline_enforced_idle_vehicle_multi_bundle() -> None:
+    """
+    Verifies that RideRequest.latest_dropoff_time is strictly enforced for multi-request group bundles:
+    1. Bundle of 2 requests (P1 -> P2 -> D1 -> D2).
+    2. Detour bounds pass for both requests.
+    3. If request 2 arrival exceeds latest_dropoff_time -> pruned from candidates.
+    4. Exact boundary equality (arrival == latest_dropoff_time) -> accepted.
+    5. Arrival 1s late -> pruned.
+    6. Independent oracle independently verifies identical pruning behavior.
+    """
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    policy = DispatchPolicy(
+        max_pickup_delay_seconds=600,
+        detour_relative_multiplier=1.50,
+        detour_absolute_cap_seconds=900,
+    )
+    policy_prov = DefaultPolicyProvider(initial_policy=policy)
+    spatial = H3SpatialIndexAdapter()
+    engine = DispatchEngine(policy_prov, router, spatial)
+
+    t_start = 1000
+    v_loc = Coordinate(40.7000, -74.0000)
+    veh = Vehicle(
+        vehicle_id="veh-idle-b2",
+        driver_id="drv-b2",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=v_loc.latitude, longitude=v_loc.longitude),
+        is_active=True,
+    )
+
+    p1 = Coordinate(40.7100, -74.0000)
+    p2 = Coordinate(40.7150, -74.0000)
+    d1 = Coordinate(40.7250, -74.0000)
+    d2 = Coordinate(40.7300, -74.0000)
+
+    _, dur_vp1 = router.get_direct_leg(v_loc, p1)
+    _, dur_p1p2 = router.get_direct_leg(p1, p2)
+    _, dur_p2d1 = router.get_direct_leg(p2, d1)
+    _, dur_d1d2 = router.get_direct_leg(d1, d2)
+    _, dur_p1d1 = router.get_direct_leg(p1, d1)
+    _, dur_p2d2 = router.get_direct_leg(p2, d2)
+
+    # In sequence P1 -> P2 -> D1 -> D2:
+    # arr_p1 = 1000 + dur_vp1
+    # arr_p2 = arr_p1 + dur_p1p2
+    # arr_d1 = arr_p2 + dur_p2d1
+    # arr_d2 = arr_d1 + dur_d1d2
+    arr_p1 = t_start + dur_vp1
+    arr_p2 = arr_p1 + dur_p1p2
+    arr_d1 = arr_p2 + dur_p2d1
+    arr_d2 = arr_d1 + dur_d1d2
+
+    # Case A: Boundary exact equality for req2
+    req1 = RideRequest(
+        request_id="req-m-1",
+        user_id="u1",
+        pickup_location=GeoCoordinate(latitude=p1.latitude, longitude=p1.longitude),
+        dropoff_location=GeoCoordinate(latitude=d1.latitude, longitude=d1.longitude),
+        seat_count=1,
+        earliest_pickup_time=t_start,
+        latest_dropoff_time=arr_d1 + 500,
+        direct_distance_meters=1668,
+        direct_duration_seconds=dur_p1d1,
+        status=RequestStatus.PENDING,
+    )
+    req2_exact = RideRequest(
+        request_id="req-m-2",
+        user_id="u2",
+        pickup_location=GeoCoordinate(latitude=p2.latitude, longitude=p2.longitude),
+        dropoff_location=GeoCoordinate(latitude=d2.latitude, longitude=d2.longitude),
+        seat_count=1,
+        earliest_pickup_time=t_start,
+        latest_dropoff_time=arr_d2,  # Exactly arr_d2
+        direct_distance_meters=1668,
+        direct_duration_seconds=dur_p2d2,
+        status=RequestStatus.PENDING,
+    )
+    cands_exact = engine.generate_candidates(
+        requests=[req1, req2_exact],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=t_start,
+        max_bundle_size=2,
+    )
+    oracle_exact = enumerate_exhaustive_candidates(
+        requests=[req1, req2_exact],
+        vehicles=[veh],
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=t_start,
+        max_bundle_size=2,
+    )
+    b2_exact = [c for c in cands_exact if len(c.request_ids) == 2]
+    b2_oracle_exact = [c for c in oracle_exact if len(c.request_ids) == 2]
+    assert len(b2_exact) >= 1, "Bundle of 2 arriving exactly at deadline must be accepted"
+    assert len(b2_oracle_exact) >= 1, "Oracle must accept bundle of 2 arriving exactly at deadline"
+
+    # Case B: Boundary 1s late for req2 -> bundle of 2 must be pruned
+    req2_late_1s = RideRequest(
+        request_id="req-m-2",
+        user_id="u2",
+        pickup_location=GeoCoordinate(latitude=p2.latitude, longitude=p2.longitude),
+        dropoff_location=GeoCoordinate(latitude=d2.latitude, longitude=d2.longitude),
+        seat_count=1,
+        earliest_pickup_time=t_start,
+        latest_dropoff_time=arr_d2 - 1,  # 1s late
+        direct_distance_meters=1668,
+        direct_duration_seconds=dur_p2d2,
+        status=RequestStatus.PENDING,
+    )
+    cands_late = engine.generate_candidates(
+        requests=[req1, req2_late_1s],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=t_start,
+        max_bundle_size=2,
+    )
+    oracle_late = enumerate_exhaustive_candidates(
+        requests=[req1, req2_late_1s],
+        vehicles=[veh],
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=t_start,
+        max_bundle_size=2,
+    )
+    b2_late = [c for c in cands_late if len(c.request_ids) == 2]
+    b2_oracle_late = [c for c in oracle_late if len(c.request_ids) == 2]
+    assert len(b2_late) == 0, "Bundle of 2 arriving 1s late must be pruned"
+    assert len(b2_oracle_late) == 0, "Oracle must also reject bundle of 2 arriving 1s late"
+

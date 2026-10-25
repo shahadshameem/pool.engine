@@ -160,6 +160,8 @@ def generate_group_bundles(
                     continue
                 leg2_dist, leg2_dur = get_cached_leg(p_id, d_id)
                 arr_d = arr_p + leg2_dur
+                if arr_d > r.latest_dropoff_time:
+                    continue
                 if (arr_d - arr_p) > (req_max_allowed_durs[r.request_id] + 1e-6):
                     continue
 
@@ -234,6 +236,7 @@ def generate_group_bundles(
 
             # Pre-index deadlines and bounds for fast lookup
             p_deadlines = [req_p_deadlines[r.request_id] for r in req_list]
+            d_deadlines = [r.latest_dropoff_time for r in req_list]
             max_allowed_durs = [req_max_allowed_durs[r.request_id] for r in req_list]
 
             p_ids = [req_p_id[r.request_id] for r in req_list]
@@ -268,8 +271,12 @@ def generate_group_bundles(
                 # 2. Picked-up requests: in-vehicle duration so far is (current_clock - p_arr).
                 #    If (current_clock - p_arr) > max_allowed_dur, dropoff in any continuation
                 #    arrives at or after current_clock, so in-vehicle detour strictly violates check_detour_bound.
+                # 3. Dropoff deadline: if current_clock > d_deadline, dropoff in any continuation
+                #    arrives at or after current_clock, so latest_dropoff_time is strictly violated.
                 for i in range(num_reqs):
                     if req_status[i] == 0 and current_clock > p_deadlines[i]:
+                        return
+                    if req_status[i] != 2 and current_clock > d_deadlines[i]:
                         return
                     if req_status[i] == 1:
                         p_arr = p_arr_times[i]
@@ -415,6 +422,8 @@ def generate_group_bundles(
                         d_id = d_ids[i]
                         leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_id)
                         arr = current_clock + leg_dur
+                        if arr > d_deadlines[i]:
+                            continue
                         p_arr = p_arr_times[i]
                         in_veh_dur = max(0, arr - p_arr)
                         if not check_detour_bound(

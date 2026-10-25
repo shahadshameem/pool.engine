@@ -200,6 +200,7 @@ def generate_active_ride_insertions(
 
             # Pre-index deadlines and stop pairs for fast lookup
             p_deadlines = [req_p_deadlines[r.request_id] for r in req_list]
+            d_deadlines = [r.latest_dropoff_time for r in req_list]
             max_allowed_durs = [req_max_allowed_durs[r.request_id] for r in req_list]
 
             req_p_stops = [req_stops_dict[r.request_id][0] for r in req_list]
@@ -231,10 +232,14 @@ def generate_active_ride_insertions(
                 # 2. Picked-up requests: in-vehicle duration so far is (current_clock - p_arr).
                 #    If (current_clock - p_arr) > max_allowed_dur, dropoff in any continuation
                 #    arrives at or after current_clock, so in-vehicle detour strictly violates check_detour_bound.
-                # 3. Unvisited existing dropoffs: arrival cannot be earlier than current_clock.
+                # 3. Dropoff deadline: if current_clock > d_deadline, dropoff in any continuation
+                #    arrives at or after current_clock, so latest_dropoff_time is strictly violated.
+                # 4. Unvisited existing dropoffs: arrival cannot be earlier than current_clock.
                 #    If current_clock > promised_window_end, every continuation violates the promise.
                 for i in range(num_reqs):
                     if req_status[i] == 0 and current_clock > p_deadlines[i]:
+                        return
+                    if req_status[i] != 2 and current_clock > d_deadlines[i]:
                         return
                     if req_status[i] == 1:
                         p_arr = arrival_times[req_p_stops[i].stop_id]
@@ -356,6 +361,9 @@ def generate_active_ride_insertions(
                                     if (arr - p_arr) > (max_allowed_durs[i] + 1e-6):
                                         feasible = False
                                         break
+                                    if arr > d_deadlines[i]:
+                                        feasible = False
+                                        break
 
                         if feasible:
                             arrival_times[ex_stop.stop_id] = arr
@@ -403,6 +411,8 @@ def generate_active_ride_insertions(
                         if next_occ >= 0:
                             leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_stop.stop_id)
                             arr = current_clock + leg_dur
+                            if arr > d_deadlines[i]:
+                                continue
                             p_id = req_p_stops[i].stop_id
                             in_veh = max(0, arr - arrival_times[p_id])
                             if check_detour_bound(in_veh, req_list[i].direct_duration_seconds, policy):
