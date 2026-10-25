@@ -1,0 +1,556 @@
+"""Unit tests for OsrmRoutingAdapter and HTTP transport handling."""
+
+import json
+from typing import Any
+import pytest
+
+from engine.contracts.routing import (
+    Coordinate,
+    InvalidRouteDataError,
+    MatrixResult,
+    RoadNetworkRoutingProvider,
+    RouteGeometry,
+    RouteLookupError,
+    RouteTimeoutError,
+)
+from engine.adapters.osrm_routing import (
+    DefaultOsrmTransport,
+    OsrmHttpTransport,
+    OsrmRoutingAdapter,
+)
+
+
+class FakeOsrmTransport(OsrmHttpTransport):
+    """Controllable fake HTTP transport for unit testing."""
+
+    def __init__(self) -> None:
+        self.responses: dict[str, tuple[int, bytes]] = {}
+        self.call_history: list[str] = []
+        self.raise_on_calls: list[Exception | None] = []
+
+    def set_response(self, path_and_query: str, status_code: int, data: dict[str, Any] | str | bytes) -> None:
+        if isinstance(data, dict):
+            body = json.dumps(data).encode("utf-8")
+        elif isinstance(data, str):
+            body = data.encode("utf-8")
+        else:
+            body = data
+        self.responses[path_and_query] = (status_code, body)
+
+    def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+        self.call_history.append(path_and_query)
+        if self.raise_on_calls:
+            exc = self.raise_on_calls.pop(0)
+            if exc is not None:
+                raise exc
+
+        # Find matching response (exact or prefix)
+        if path_and_query in self.responses:
+            return self.responses[path_and_query]
+
+        for pattern, resp in self.responses.items():
+            if pattern in path_and_query:
+                return resp
+
+        # Default fallback: 404
+        return 404, json.dumps({"code": "InvalidQuery", "message": "Not found in fake"}).encode("utf-8")
+
+
+# Sample coordinates
+C_PHL = Coordinate(latitude=39.9526, longitude=-75.1652)  # Philadelphia Center City
+C_UPENN = Coordinate(latitude=39.9522, longitude=-75.1932)  # UPenn
+C_TEMPLE = Coordinate(latitude=39.9800, longitude=-75.1575)  # Temple University
+C_AIRPORT = Coordinate(latitude=39.8744, longitude=-75.2424)  # PHL Airport
+
+
+def test_osrm_adapter_implements_provider_contract() -> None:
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(base_url="http://localhost:5000", transport=transport)
+    assert isinstance(adapter, RoadNetworkRoutingProvider)
+
+
+def test_get_direct_leg_same_coordinate_zero_cost_no_network() -> None:
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport)
+    dist, dur = adapter.get_direct_leg(C_PHL, C_PHL)
+    assert dist == 0
+    assert dur == 0
+    assert len(transport.call_history) == 0
+
+
+def test_get_direct_leg_cache_hit_and_miss() -> None:
+    transport = FakeOsrmTransport()
+    # Table response for single pair
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[2500.0]],
+            "durations": [[320.0]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    # First call -> cache miss, network query
+    dist1, dur1 = adapter.get_direct_leg(C_PHL, C_UPENN)
+    assert dist1 == 2500
+    assert dur1 == 320
+    assert len(transport.call_history) == 1
+    assert adapter.cache_hits == 0
+    assert adapter.cache_misses == 1
+
+    # Second call -> cache hit, no network query
+    dist2, dur2 = adapter.get_direct_leg(C_PHL, C_UPENN)
+    assert dist2 == 2500
+    assert dur2 == 320
+    assert len(transport.call_history) == 1
+    assert adapter.cache_hits == 1
+    assert adapter.cache_misses == 1
+
+
+def test_get_direct_leg_asymmetry_preserved() -> None:
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    # Responses differ in forward vs backward direction
+    transport.set_response(
+        f"{C_PHL.longitude:.6f},{C_PHL.latitude:.6f};{C_UPENN.longitude:.6f},{C_UPENN.latitude:.6f}",
+        200,
+        {"code": "Ok", "distances": [[2500.0]], "durations": [[320.0]]},
+    )
+    transport.set_response(
+        f"{C_UPENN.longitude:.6f},{C_UPENN.latitude:.6f};{C_PHL.longitude:.6f},{C_PHL.latitude:.6f}",
+        200,
+        {"code": "Ok", "distances": [[2750.0]], "durations": [[360.0]]},
+    )
+
+    d_fwd, t_fwd = adapter.get_direct_leg(C_PHL, C_UPENN)
+    d_rev, t_rev = adapter.get_direct_leg(C_UPENN, C_PHL)
+
+    assert (d_fwd, t_fwd) == (2500, 320)
+    assert (d_rev, t_rev) == (2750, 360)
+    assert len(transport.call_history) == 2
+
+
+def test_get_direct_leg_unreachable_route_raises_lookup_error() -> None:
+    transport = FakeOsrmTransport()
+    # OSRM returns null when route cannot be found
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[None]],
+            "durations": [[None]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(RouteLookupError, match="could not resolve route"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+
+def test_get_direct_leg_distinct_coords_zero_cost_raises_invalid_route_data() -> None:
+    transport = FakeOsrmTransport()
+    # OSRM returns 0 for distinct coordinates
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0]],
+            "durations": [[0.0]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(InvalidRouteDataError, match="zero distance or duration"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+
+def test_get_direct_leg_timeout_raises_timeout_error() -> None:
+    transport = FakeOsrmTransport()
+    transport.raise_on_calls = [TimeoutError("Gateway timeout")]
+    adapter = OsrmRoutingAdapter(transport=transport, max_retries=0)
+
+    with pytest.raises(RouteTimeoutError, match="Gateway timeout"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+
+def test_get_direct_leg_connection_error_raises_lookup_error() -> None:
+    transport = FakeOsrmTransport()
+    transport.raise_on_calls = [ConnectionRefusedError("Connection refused")]
+    adapter = OsrmRoutingAdapter(transport=transport, max_retries=0)
+
+    with pytest.raises(RouteLookupError, match="Connection refused"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+
+def test_get_direct_leg_http_400_raises_lookup_error() -> None:
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        400,
+        {"code": "InvalidQuery", "message": "Coordinates are out of bounds"},
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(RouteLookupError, match="InvalidQuery"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+
+def test_get_direct_leg_malformed_json_raises_invalid_route_data() -> None:
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        b"<html>Bad Gateway</html>",
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(InvalidRouteDataError, match="Failed to parse OSRM JSON"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+
+def test_get_direct_leg_retry_on_transient_failure() -> None:
+    transport = FakeOsrmTransport()
+    # First attempt raises ConnectionResetError, second succeeds
+    transport.raise_on_calls = [
+        ConnectionResetError("Socket reset"),
+        None,
+    ]
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {"code": "Ok", "distances": [[2500.0]], "durations": [[320.0]]},
+    )
+    adapter = OsrmRoutingAdapter(transport=transport, max_retries=1)
+
+    dist, dur = adapter.get_direct_leg(C_PHL, C_UPENN)
+    assert dist == 2500
+    assert dur == 320
+    assert len(transport.call_history) == 2
+
+
+def test_get_distance_matrix_success_and_populates_cache() -> None:
+    transport = FakeOsrmTransport()
+    origins = [C_PHL, C_UPENN]
+    destinations = [C_TEMPLE, C_AIRPORT]
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [
+                [3500.0, 14000.0],
+                [4200.0, 13000.0],
+            ],
+            "durations": [
+                [500.0, 1100.0],
+                [650.0, 1000.0],
+            ],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    matrix = adapter.get_distance_matrix(origins, destinations)
+    assert isinstance(matrix, MatrixResult)
+    assert matrix.distances_meters == [
+        [3500, 14000],
+        [4200, 13000],
+    ]
+    assert matrix.durations_seconds == [
+        [500, 1100],
+        [650, 1000],
+    ]
+    assert len(transport.call_history) == 1
+
+    # Calling get_direct_leg for (C_PHL, C_TEMPLE) should now hit the cache!
+    dist, dur = adapter.get_direct_leg(C_PHL, C_TEMPLE)
+    assert (dist, dur) == (3500, 500)
+    assert len(transport.call_history) == 1  # No additional network call!
+    assert adapter.cache_hits == 1
+
+
+def test_get_distance_matrix_all_cached_no_network_call() -> None:
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    # Pre-populate cache via direct legs or earlier matrix
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {"code": "Ok", "distances": [[1000.0]], "durations": [[100.0]]},
+    )
+    adapter.get_direct_leg(C_PHL, C_UPENN)
+    assert len(transport.call_history) == 1
+
+    # Query matrix with just that pair
+    matrix = adapter.get_distance_matrix([C_PHL], [C_UPENN])
+    assert matrix.distances_meters == [[1000]]
+    assert matrix.durations_seconds == [[100]]
+    # Zero extra network calls!
+    assert len(transport.call_history) == 1
+
+
+def test_get_distance_matrix_chunking_when_exceeding_max_table_size() -> None:
+    transport = FakeOsrmTransport()
+    # Set max_table_size to 3 coordinates total
+    # If 2 origins and 2 destinations (total 4 coordinates > 3), must chunk!
+    origins = [C_PHL, C_UPENN]
+    destinations = [C_TEMPLE, C_AIRPORT]
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_table_size=3)
+
+    # Set responses for each sub-chunk
+    # Origin 0 to destinations
+    transport.set_response(
+        f"{C_PHL.longitude:.6f},{C_PHL.latitude:.6f};{C_TEMPLE.longitude:.6f},{C_TEMPLE.latitude:.6f};{C_AIRPORT.longitude:.6f},{C_AIRPORT.latitude:.6f}",
+        200,
+        {"code": "Ok", "distances": [[3500.0, 14000.0]], "durations": [[500.0, 1100.0]]},
+    )
+    # Origin 1 to destinations
+    transport.set_response(
+        f"{C_UPENN.longitude:.6f},{C_UPENN.latitude:.6f};{C_TEMPLE.longitude:.6f},{C_TEMPLE.latitude:.6f};{C_AIRPORT.longitude:.6f},{C_AIRPORT.latitude:.6f}",
+        200,
+        {"code": "Ok", "distances": [[4200.0, 13000.0]], "durations": [[650.0, 1000.0]]},
+    )
+
+    matrix = adapter.get_distance_matrix(origins, destinations)
+    assert matrix.distances_meters == [
+        [3500, 14000],
+        [4200, 13000],
+    ]
+    assert matrix.durations_seconds == [
+        [500, 1100],
+        [650, 1000],
+    ]
+    # Multiple calls were made due to chunking
+    assert len(transport.call_history) >= 2
+
+
+def test_get_distance_matrix_empty_origins_or_destinations() -> None:
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    assert adapter.get_distance_matrix([], [C_PHL]).distances_meters == []
+    assert adapter.get_distance_matrix([C_PHL], []).distances_meters == [[]]
+    assert len(transport.call_history) == 0
+
+
+def test_get_distance_matrix_unreachable_cell_raises_lookup_error() -> None:
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[3500.0, None]],
+            "durations": [[500.0, None]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(RouteLookupError, match="could not resolve route"):
+        adapter.get_distance_matrix([C_PHL], [C_TEMPLE, C_AIRPORT])
+
+
+def test_get_route_success() -> None:
+    transport = FakeOsrmTransport()
+    waypoints = [C_PHL, C_UPENN, C_AIRPORT]
+
+    transport.set_response(
+        "/route/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "routes": [
+                {
+                    "distance": 16500.4,
+                    "duration": 1420.8,
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [
+                            [-75.1652, 39.9526],
+                            [-75.1700, 39.9530],
+                            [-75.1932, 39.9522],
+                            [-75.2424, 39.8744],
+                        ],
+                    },
+                }
+            ],
+            "waypoints": [],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    route = adapter.get_route(waypoints)
+    assert isinstance(route, RouteGeometry)
+    assert route.total_distance_meters == 16500
+    assert route.total_duration_seconds == 1421
+    assert len(route.points) == 4
+    assert route.points[0] == Coordinate(latitude=39.9526, longitude=-75.1652)
+    assert route.points[-1] == Coordinate(latitude=39.8744, longitude=-75.2424)
+
+
+def test_get_route_empty_or_single_waypoint() -> None:
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(InvalidRouteDataError, match="requires at least one"):
+        adapter.get_route([])
+
+    single = adapter.get_route([C_PHL])
+    assert single.total_distance_meters == 0
+    assert single.total_duration_seconds == 0
+    assert single.points == [C_PHL]
+    assert len(transport.call_history) == 0
+
+
+def test_get_route_no_route_raises_lookup_error() -> None:
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/route/v1/driving/",
+        200,
+        {
+            "code": "NoRoute",
+            "message": "Impossible route",
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    with pytest.raises(RouteLookupError, match="NoRoute"):
+        adapter.get_route([C_PHL, C_AIRPORT])
+
+
+def test_lru_cache_eviction_when_exceeding_maxsize() -> None:
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {"code": "Ok", "distances": [[1000.0]], "durations": [[100.0]]},
+    )
+    # Cache maxsize = 2
+    adapter = OsrmRoutingAdapter(transport=transport, cache_maxsize=2)
+
+    # Insert 1: (C_PHL, C_UPENN)
+    adapter.get_direct_leg(C_PHL, C_UPENN)
+    # Insert 2: (C_PHL, C_TEMPLE)
+    adapter.get_direct_leg(C_PHL, C_TEMPLE)
+    assert len(adapter.cache) == 2
+
+    # Insert 3: (C_PHL, C_AIRPORT) -> evicts oldest (C_PHL, C_UPENN)
+    adapter.get_direct_leg(C_PHL, C_AIRPORT)
+    assert len(adapter.cache) == 2
+
+    # (C_PHL, C_TEMPLE) should still be in cache
+    adapter.get_direct_leg(C_PHL, C_TEMPLE)
+    # (C_PHL, C_UPENN) was evicted, so accessing it causes a new network call
+    history_len_before = len(transport.call_history)
+    adapter.get_direct_leg(C_PHL, C_UPENN)
+    assert len(transport.call_history) == history_len_before + 1
+
+
+def test_osrm_adapter_dispatch_engine_integration() -> None:
+    """Verifies that DispatchEngine successfully dispatches with OsrmRoutingAdapter."""
+    from engine.adapters.default_policy import DefaultPolicyProvider
+    from engine.adapters.h3_spatial import H3SpatialIndexAdapter
+    from engine.dispatch import DispatchEngine
+    from engine.domain.enums import RequestStatus
+    from engine.domain.models import GeoCoordinate, RideRequest, Vehicle
+
+    transport = FakeOsrmTransport()
+    # Provide canned table responses for coordinates
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[1500.0]],
+            "durations": [[200.0]],
+        },
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport)
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=adapter,
+        spatial_index=H3SpatialIndexAdapter(),
+    )
+
+    req = RideRequest(
+        request_id="req-1",
+        user_id="user-1",
+        pickup_location=GeoCoordinate(latitude=39.9526, longitude=-75.1652),
+        dropoff_location=GeoCoordinate(latitude=39.9522, longitude=-75.1932),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=2500,
+        direct_distance_meters=1500,
+        direct_duration_seconds=200,
+        status=RequestStatus.PENDING,
+    )
+    veh = Vehicle(
+        vehicle_id="veh-1",
+        driver_id="drv-1",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=39.9525, longitude=-75.1650),
+        is_active=True,
+    )
+
+    result = engine.dispatch_batch(
+        requests=[req],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=1000,
+        batch_id="osrm-batch-1",
+    )
+
+    assert result.batch_id == "osrm-batch-1"
+    assert len(result.selected_assignments) == 1
+    assert "req-1" in result.selected_assignments[0].request_ids
+    assert len(result.unassigned_request_ids) == 0
+    assert len(transport.call_history) > 0
+    assert adapter.cache_hits > 0 or adapter.cache_misses > 0
+
+
+def test_osrm_adapter_concurrent_access() -> None:
+    """Verifies thread-safety of OsrmRoutingAdapter across concurrent threads."""
+    import concurrent.futures
+
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {"code": "Ok", "distances": [[2000.0]], "durations": [[250.0]]},
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    def query(worker_id: int) -> tuple[int, int]:
+        c1 = Coordinate(latitude=39.9526 + worker_id * 0.0001, longitude=-75.1652)
+        c2 = Coordinate(latitude=39.9522, longitude=-75.1932)
+        return adapter.get_direct_leg(c1, c2)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(query, i % 5) for i in range(40)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    assert len(results) == 40
+    assert all(r == (2000, 250) for r in results)
+    assert len(adapter.cache) <= 5
+    assert adapter.cache_hits > 0
+
+
+def test_default_osrm_transport_url_parsing_and_close() -> None:
+    """Verifies DefaultOsrmTransport parses endpoints properly and handles close."""
+    transport = DefaultOsrmTransport(base_url="https://osrm.example.com:8443/v1")
+    assert transport.scheme == "https"
+    assert transport.host == "osrm.example.com"
+    assert transport.port == 8443
+    assert transport.path_prefix == "/v1"
+
+    # Close should not raise even if connection was never opened
+    transport.close()
+

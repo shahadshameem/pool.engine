@@ -92,6 +92,7 @@ def validate_route_leg(
                 f"and ({destination.latitude}, {destination.longitude}) returned zero distance or duration "
                 f"({dist}m, {dur}s). Failed route lookups must never be treated as zero distance/time."
             )
+        return max(1, int(round(dist))), max(1, int(round(dur)))
 
     return int(round(dist)), int(round(dur))
 

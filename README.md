@@ -102,6 +102,20 @@ $env:TEST_DATABASE_URL = "postgresql://postgres@localhost:5433/pool_engine_test"
 pytest tests/integration/test_orchestrator_postgres.py -v
 ```
 
+### 11. Production Road-Network Routing (OSRM Adapter)
+```powershell
+# Unit tests (offline, fake HTTP transport, matrix chunking, LRU cache):
+pytest tests/unit/test_osrm_routing.py -v
+
+# Real-road benchmark comparison (Mock vs. OSRM cold/warm cache):
+python -m tests.benchmark.test_osrm_benchmark
+pytest tests/benchmark/test_osrm_benchmark.py -v
+
+# Live OSRM real-road test (requires running OSRM backend):
+$env:OSRM_BASE_URL = "http://localhost:5000"
+pytest tests/benchmark/test_osrm_benchmark.py -v -k "test_live_osrm"
+```
+
 ## Static Analysis & Testing
 
 Run all unit, scenario, property, concurrency, and benchmark tests:
@@ -124,6 +138,7 @@ src/engine/
   ├── routing/         # Stop insertion permutations, group bundling, invariant gates
   ├── optimization/    # Multi-objective utility, quantized tie-breaking, Regret-K set packing
   ├── lifecycle/       # Reservation protocol, transitions, timers, dwell verification
-  ├── adapters/        # H3 / grid spatial adapter, mock router, in-memory & Postgres storage
+  ├── adapters/        # H3 spatial, OSRM road router, mock router, in-memory & Postgres storage
+  ├── orchestration/   # DispatchOrchestrator connecting persistent storage and dispatch
   └── dispatch.py      # Unified DispatchEngine facade
 ```
