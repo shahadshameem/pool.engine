@@ -340,3 +340,37 @@ def test_mask_coordinate_and_sanitization() -> None:
     sanitized = sanitize_sensitive_strings(dsn)
     assert "secret_p@ssword!" not in sanitized
     assert sanitized == "postgresql://my_user:***@db.internal:5432/fleet"
+
+
+def test_create_request_idempotency_header_support() -> None:
+    service, _, _ = create_test_service()
+    app = create_app(service)
+    client = AsgiTestClient(app)
+
+    create_payload = {
+        "user_id": "usr-idemp-1",
+        "pickup_location": {"latitude": 40.75, "longitude": -73.98},
+        "dropoff_location": {"latitude": 40.78, "longitude": -73.96},
+        "seat_count": 1,
+        "earliest_pickup_time": 1000,
+        "latest_dropoff_time": 3000,
+    }
+
+    # 1. Initial creation with Idempotency-Key header returns 201
+    resp1 = client.post("/v1/requests", json=create_payload, headers={"Idempotency-Key": "key-req-001"})
+    assert resp1.status_code == 201
+    data1 = resp1.json()
+    assert data1["request_id"] == "key-req-001"
+
+    # 2. Replay with same Idempotency-Key header returns 200 OK
+    resp2 = client.post("/v1/requests", json=create_payload, headers={"Idempotency-Key": "key-req-001"})
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["request_id"] == "key-req-001"
+
+    # 3. Conflicting header and body returns 400
+    conflict_payload = dict(create_payload)
+    conflict_payload["request_id"] = "body-id-differ"
+    resp3 = client.post("/v1/requests", json=conflict_payload, headers={"Idempotency-Key": "key-req-001"})
+    assert resp3.status_code == 400
+    assert resp3.json()["error"]["code"] == "VALIDATION_ERROR"

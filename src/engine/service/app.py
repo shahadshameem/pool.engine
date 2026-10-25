@@ -172,6 +172,17 @@ def create_app(
         except Exception as e:
             return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
 
+        header_idemp = headers.get("idempotency-key")
+        body_req_id = raw_data.get("request_id")
+        if header_idemp and body_req_id and header_idemp != body_req_id:
+            return _error_response(
+                400,
+                "VALIDATION_ERROR",
+                f"Idempotency-Key header ('{header_idemp}') does not match body request_id ('{body_req_id}')",
+            )
+        if header_idemp and not body_req_id:
+            raw_data["request_id"] = header_idemp
+
         try:
             dto = CreateRideRequestInput.model_validate(raw_data)
         except PydanticValidationError as e:
@@ -181,8 +192,14 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Request input validation failed", details)
 
+        is_existing = (
+            eff_service.storage.get_request(dto.request_id) is not None
+            if dto.request_id
+            else False
+        )
         req = eff_service.create_request(dto)
-        return _json_response(201, req)
+        status_code = 200 if is_existing else 201
+        return _json_response(status_code, req)
 
     router.add("POST", "/v1/requests", handle_create_request)
 

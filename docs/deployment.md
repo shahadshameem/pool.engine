@@ -298,6 +298,17 @@ When scaling horizontally across multiple container instances or worker processe
    - **Concurrency Safety**: Row-level locking (`SELECT ... FOR UPDATE` on vehicles, rides, and requests) and optimistic concurrency control (`version` checks) guarantee that concurrent dispatch runs on different instances cannot double-book seats, corrupt itineraries, or assign the same request twice.
    - **Idempotency Replay**: If a dispatch run is retried on a *different* instance with the same idempotency token, PostgreSQL's `idempotency_records` table prevents duplicate execution and rejects conflicting commits. However, replaying the full API response body across instances requires session stickiness at the ingress load balancer or an external distributed cache.
 
+### Multi-Instance Operational Requirements
+To run multiple instances safely and efficiently in high-throughput production:
+
+1. **Single Dispatch Leader or Spatial Partition Sharding**:
+   - *Problem*: Although OCC prevents illegal states and double-booking, running simultaneous dispatch solver cycles across identical spatial partitions causes competing workers to collide on assignment commits, resulting in high `VERSION_CONFLICT` rejection rates and wasted routing compute.
+   - *Requirement*: Dispatch cycles should be scheduled with a single leader per spatial partition. Recommended patterns:
+     - **Spatial Partitioning**: Shard dispatch jobs by H3 spatial cluster (e.g., resolution 7), ensuring distinct geographic zones are solved independently by separate workers.
+     - **Distributed Leader Election**: Use PostgreSQL advisory locks (`SELECT pg_try_advisory_lock(partition_hash)`) or Kubernetes Leases to ensure only one worker drives matching for a partition at any given timestamp.
+2. **Distributed Idempotency Caching / Ingress Stickiness**:
+   - *Requirement*: Route client requests with the same `Idempotency-Key` to the same instance using consistent hashing at the reverse proxy (e.g., Envoy or NGINX), or integrate a distributed cache (e.g. Redis) if multi-node dispatch replay is required.
+
 ---
 
 ## 10. Production Deployment & Operations Checklist
