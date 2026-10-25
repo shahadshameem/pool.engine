@@ -135,3 +135,10 @@ class RoadNetworkRoutingProvider(ABC):
         Convenience query returning (distance_meters, duration_seconds) for a direct leg.
         """
         pass
+
+    def check_health(self) -> bool:
+        """
+        Operational health check verifying connectivity to the routing backend.
+        Default implementation returns True; concrete adapters can execute a lightweight query.
+        """
+        return True

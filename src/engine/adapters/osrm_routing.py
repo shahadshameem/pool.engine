@@ -191,6 +191,20 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
     def clear_cache(self) -> None:
         self._cache.clear()
 
+    def check_health(self) -> bool:
+        """
+        Lightweight connectivity probe verifying OSRM routing backend is reachable.
+        Returns True if backend is healthy, False if unreachable or timed out.
+        """
+        try:
+            status, _ = self.transport.get(
+                f"/nearest/v1/{self.profile}/-73.985130,40.758896?number=1",
+                self.timeout_seconds,
+            )
+            return status in (200, 400)
+        except Exception:
+            return False
+
     def _cache_key(self, origin: Coordinate, destination: Coordinate) -> tuple[float, float, float, float]:
         return (
             round(origin.latitude, self.coord_precision),

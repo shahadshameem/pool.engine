@@ -646,3 +646,27 @@ def test_transaction_rollback_on_error(postgres_storage: PostgresRideStorage) ->
     assert reloaded_ride.version == 1, "Ride version must not have been modified due to rollback"
     holds = postgres_storage.get_active_seat_holds("ride-rb-1")
     assert len(holds) == 0, "No seat holds should exist after rollback"
+
+
+def test_connection_recovery_after_disconnect(postgres_storage: PostgresRideStorage) -> None:
+    """Verifies that if the underlying connection is closed or broken, the adapter cleanly reconnects."""
+    v = Vehicle(
+        vehicle_id="veh-recov-1",
+        driver_id="drv-recov-1",
+        total_seat_capacity=4,
+        luggage_capacity_units=2,
+        current_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        is_active=True,
+    )
+    postgres_storage.save_vehicle(v)
+    assert postgres_storage.get_vehicle("veh-recov-1") is not None
+
+    # Simulate connection loss by explicitly closing the internal connection
+    conn = postgres_storage._get_connection()
+    conn.close()
+    assert conn.closed
+
+    # Next operation should automatically establish a fresh connection
+    fetched = postgres_storage.get_vehicle("veh-recov-1")
+    assert fetched is not None
+    assert fetched.vehicle_id == "veh-recov-1"

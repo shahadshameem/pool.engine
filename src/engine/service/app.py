@@ -1,5 +1,6 @@
 """Pure standard-library ASGI 3 application for the pool engine API service."""
 
+import asyncio
 import json
 import logging
 import re
@@ -126,6 +127,9 @@ def create_app(
     eff_telemetry = telemetry or service.telemetry
     router = AsgiRouter()
 
+    is_shutting_down = False
+    active_request_count = 0
+
     # Route: GET /v1/health (general health check)
     async def handle_health(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
@@ -146,7 +150,7 @@ def create_app(
     async def handle_readiness(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
-        readiness = service.check_readiness()
+        readiness = service.check_readiness(strict_routing=eff_config.strict_routing_readiness)
         status_code = 200 if readiness.get("ready") else 503
         return _json_response(status_code, readiness)
 
@@ -332,6 +336,7 @@ def create_app(
 
     async def asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
         """Standard ASGI 3 entry point."""
+        nonlocal is_shutting_down, active_request_count
         scope_type = scope.get("type")
 
         if scope_type == "lifespan":
@@ -341,6 +346,17 @@ def create_app(
                 if msg_type == "lifespan.startup":
                     await send({"type": "lifespan.startup.complete"})
                 elif msg_type == "lifespan.shutdown":
+                    is_shutting_down = True
+                    start_shutdown = time.monotonic()
+                    while active_request_count > 0:
+                        if time.monotonic() - start_shutdown >= eff_config.shutdown_timeout_seconds:
+                            logger.warning(
+                                "Shutdown grace period exceeded with %d active requests remaining.",
+                                active_request_count,
+                            )
+                            break
+                        await asyncio.sleep(0.02)
+                    service.close()
                     await send({"type": "lifespan.shutdown.complete"})
                     return
             return
@@ -348,164 +364,193 @@ def create_app(
         if scope_type != "http":
             return
 
-        start_time = time.monotonic()
-        method = scope.get("method", "GET").upper()
-        path = scope.get("path", "/")
-
-        # Parse request headers
-        headers_dict: dict[str, str] = {}
-        for raw_k, raw_v in scope.get("headers", []):
-            try:
-                headers_dict[raw_k.decode("latin1").lower()] = raw_v.decode("latin1")
-            except Exception:
-                pass
-
-        # Match route
-        handler, path_params, method_mismatch = router.match(method, path)
-
         status: int
         resp_headers: dict[str, str]
         resp_body: bytes
 
-        if method_mismatch:
+        if is_shutting_down:
             status, resp_headers, resp_body = _error_response(
-                405, "METHOD_NOT_ALLOWED", f"HTTP method '{method}' not allowed on path '{path}'"
+                503,
+                "SERVICE_SHUTTING_DOWN",
+                "Service is shutting down and no longer accepting new requests",
             )
-        elif handler is None:
-            status, resp_headers, resp_body = _error_response(
-                404, "ROUTE_NOT_FOUND", f"Endpoint '{method} {path}' does not exist"
+            header_tuples = [
+                (k.encode("latin1"), v.encode("latin1")) for k, v in resp_headers.items()
+            ]
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": status,
+                    "headers": header_tuples,
+                }
             )
-        else:
-            # Enforce authentication if required
-            auth_error: Optional[tuple[int, dict[str, str], bytes]] = None
-            if eff_config.require_auth and path not in PUBLIC_HEALTH_PATHS:
-                auth_ctx = eff_auth.authenticate(scope, headers_dict)
-                if not auth_ctx.authenticated:
-                    auth_error = _error_response(
-                        401,
-                        "AUTHENTICATION_REQUIRED",
-                        "Authentication credentials are missing or invalid",
-                    )
-                else:
-                    action = "read" if method == "GET" else ("dispatch" if path == "/v1/dispatch" else "write")
-                    if not eff_auth.authorize(auth_ctx, action, path):
-                        auth_error = _error_response(
-                            403,
-                            "FORBIDDEN",
-                            f"Caller is not authorized to execute '{action}' on '{path}'",
-                        )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": resp_body,
+                    "more_body": False,
+                }
+            )
+            return
 
-            if auth_error is not None:
-                status, resp_headers, resp_body = auth_error
+        active_request_count += 1
+        try:
+            start_time = time.monotonic()
+            method = scope.get("method", "GET").upper()
+            path = scope.get("path", "/")
+
+            # Parse request headers
+            headers_dict: dict[str, str] = {}
+            for raw_k, raw_v in scope.get("headers", []):
+                try:
+                    headers_dict[raw_k.decode("latin1").lower()] = raw_v.decode("latin1")
+                except Exception:
+                    pass
+
+            # Match route
+            handler, path_params, method_mismatch = router.match(method, path)
+
+            if method_mismatch:
+                status, resp_headers, resp_body = _error_response(
+                    405, "METHOD_NOT_ALLOWED", f"HTTP method '{method}' not allowed on path '{path}'"
+                )
+            elif handler is None:
+                status, resp_headers, resp_body = _error_response(
+                    404, "ROUTE_NOT_FOUND", f"Endpoint '{method} {path}' does not exist"
+                )
             else:
-                # Pre-check Content-Length header against max body size
-                content_length_str = headers_dict.get("content-length")
-                length_error: Optional[tuple[int, dict[str, str], bytes]] = None
-                if content_length_str is not None:
-                    try:
-                        content_len = int(content_length_str)
-                        if content_len > eff_config.max_request_body_bytes:
+                # Enforce authentication if required
+                auth_error: Optional[tuple[int, dict[str, str], bytes]] = None
+                if eff_config.require_auth and path not in PUBLIC_HEALTH_PATHS:
+                    auth_ctx = eff_auth.authenticate(scope, headers_dict)
+                    if not auth_ctx.authenticated:
+                        auth_error = _error_response(
+                            401,
+                            "AUTHENTICATION_REQUIRED",
+                            "Authentication credentials are missing or invalid",
+                        )
+                    else:
+                        action = "read" if method == "GET" else ("dispatch" if path == "/v1/dispatch" else "write")
+                        if not eff_auth.authorize(auth_ctx, action, path):
+                            auth_error = _error_response(
+                                403,
+                                "FORBIDDEN",
+                                f"Caller is not authorized to execute '{action}' on '{path}'",
+                            )
+
+                if auth_error is not None:
+                    status, resp_headers, resp_body = auth_error
+                else:
+                    # Pre-check Content-Length header against max body size
+                    content_length_str = headers_dict.get("content-length")
+                    length_error: Optional[tuple[int, dict[str, str], bytes]] = None
+                    if content_length_str is not None:
+                        try:
+                            content_len = int(content_length_str)
+                            if content_len > eff_config.max_request_body_bytes:
+                                length_error = _error_response(
+                                    413,
+                                    "PAYLOAD_TOO_LARGE",
+                                    f"Request body exceeds maximum permitted size of {eff_config.max_request_body_bytes} bytes",
+                                )
+                        except ValueError:
                             length_error = _error_response(
+                                400, "VALIDATION_ERROR", "Invalid Content-Length header"
+                            )
+
+                    if length_error is not None:
+                        status, resp_headers, resp_body = length_error
+                    else:
+                        # Stream request body with size guarding and disconnect handling
+                        body_chunks: list[bytes] = []
+                        accumulated_bytes = 0
+                        payload_too_large = False
+                        client_disconnected = False
+                        more_body = True
+
+                        while more_body:
+                            msg = await receive()
+                            msg_type = msg.get("type")
+                            if msg_type == "http.disconnect":
+                                client_disconnected = True
+                                break
+                            elif msg_type == "http.request":
+                                chunk = msg.get("body", b"")
+                                if chunk:
+                                    accumulated_bytes += len(chunk)
+                                    if accumulated_bytes > eff_config.max_request_body_bytes:
+                                        payload_too_large = True
+                                        break
+                                    body_chunks.append(chunk)
+                                more_body = msg.get("more_body", False)
+                            else:
+                                break
+
+                        if client_disconnected:
+                            return
+
+                        if payload_too_large:
+                            status, resp_headers, resp_body = _error_response(
                                 413,
                                 "PAYLOAD_TOO_LARGE",
                                 f"Request body exceeds maximum permitted size of {eff_config.max_request_body_bytes} bytes",
                             )
-                    except ValueError:
-                        length_error = _error_response(
-                            400, "VALIDATION_ERROR", "Invalid Content-Length header"
-                        )
-
-                if length_error is not None:
-                    status, resp_headers, resp_body = length_error
-                else:
-                    # Stream request body with size guarding and disconnect handling
-                    body_chunks: list[bytes] = []
-                    accumulated_bytes = 0
-                    payload_too_large = False
-                    client_disconnected = False
-                    more_body = True
-
-                    while more_body:
-                        msg = await receive()
-                        msg_type = msg.get("type")
-                        if msg_type == "http.disconnect":
-                            client_disconnected = True
-                            break
-                        elif msg_type == "http.request":
-                            chunk = msg.get("body", b"")
-                            if chunk:
-                                accumulated_bytes += len(chunk)
-                                if accumulated_bytes > eff_config.max_request_body_bytes:
-                                    payload_too_large = True
-                                    break
-                                body_chunks.append(chunk)
-                            more_body = msg.get("more_body", False)
                         else:
-                            break
+                            full_body = b"".join(body_chunks)
 
-                    if client_disconnected:
-                        return
+                            # Invoke matched handler with strict error boundaries
+                            try:
+                                status, resp_headers, resp_body = await handler(
+                                    scope, full_body, headers_dict, path_params
+                                )
+                            except ServiceError as e:
+                                status, resp_headers, resp_body = _error_response(
+                                    e.status_code, e.code, e.message, e.details
+                                )
+                            except Exception as e:
+                                sanitized_detail = sanitize_sensitive_strings(str(e))
+                                logger.error(
+                                    "Unhandled internal error on %s %s: %s",
+                                    method,
+                                    path,
+                                    sanitized_detail,
+                                    exc_info=True,
+                                )
+                                # Never leak raw internal exception details or DSN secrets to the client
+                                status, resp_headers, resp_body = _error_response(
+                                    500,
+                                    "INTERNAL_SERVER_ERROR",
+                                    "An unexpected internal error occurred.",
+                                )
 
-                    if payload_too_large:
-                        status, resp_headers, resp_body = _error_response(
-                            413,
-                            "PAYLOAD_TOO_LARGE",
-                            f"Request body exceeds maximum permitted size of {eff_config.max_request_body_bytes} bytes",
-                        )
-                    else:
-                        full_body = b"".join(body_chunks)
+            # Record operational API telemetry metrics
+            duration_ms = (time.monotonic() - start_time) * 1000.0
+            eff_telemetry.record_api_request(
+                method=method,
+                path=path,
+                status_code=status,
+                duration_ms=duration_ms,
+            )
 
-                        # Invoke matched handler with strict error boundaries
-                        try:
-                            status, resp_headers, resp_body = await handler(
-                                scope, full_body, headers_dict, path_params
-                            )
-                        except ServiceError as e:
-                            status, resp_headers, resp_body = _error_response(
-                                e.status_code, e.code, e.message, e.details
-                            )
-                        except Exception as e:
-                            sanitized_detail = sanitize_sensitive_strings(str(e))
-                            logger.error(
-                                "Unhandled internal error on %s %s: %s",
-                                method,
-                                path,
-                                sanitized_detail,
-                                exc_info=True,
-                            )
-                            # Never leak raw internal exception details or DSN secrets to the client
-                            status, resp_headers, resp_body = _error_response(
-                                500,
-                                "INTERNAL_SERVER_ERROR",
-                                "An unexpected internal error occurred.",
-                            )
-
-        # Record operational API telemetry metrics
-        duration_ms = (time.monotonic() - start_time) * 1000.0
-        eff_telemetry.record_api_request(
-            method=method,
-            path=path,
-            status_code=status,
-            duration_ms=duration_ms,
-        )
-
-        # Send ASGI HTTP response
-        header_tuples = [
-            (k.encode("latin1"), v.encode("latin1")) for k, v in resp_headers.items()
-        ]
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status,
-                "headers": header_tuples,
-            }
-        )
-        await send(
-            {
-                "type": "http.response.body",
-                "body": resp_body,
-                "more_body": False,
-            }
-        )
+            # Send ASGI HTTP response
+            header_tuples = [
+                (k.encode("latin1"), v.encode("latin1")) for k, v in resp_headers.items()
+            ]
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": status,
+                    "headers": header_tuples,
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": resp_body,
+                    "more_body": False,
+                }
+            )
+        finally:
+            active_request_count -= 1
 
     return asgi_app

@@ -107,6 +107,23 @@ class DispatchOrchestrator:
             deadline if deadline is not None else start_monotonic + self.config.deadline_seconds
         )
 
+        # Monotonic interrupt check before snapshot retrieval
+        if time.monotonic() > effective_deadline - self.config.reserved_headroom_seconds:
+            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
+            return OrchestrationResult(
+                cycle_id=effective_cycle_id,
+                batch_id=effective_batch_id,
+                timestamp=current_time,
+                committed_assignments=(),
+                rejected_assignments=(),
+                unassigned_request_ids=(),
+                search_status=SearchStatus.INCOMPLETE_DEADLINE_EXPIRED,
+                is_approximated=True,
+                total_vmt_savings_meters=0,
+                cycle_duration_ms=round(elapsed_ms, 2),
+                routing_errors_count=0,
+            )
+
         # Stage 1: Snapshot Retrieval
         raw_requests = self.storage.get_pending_requests(limit=self.config.request_limit)
         active_vehicles = self.storage.get_active_vehicles(limit=self.config.vehicle_limit)
@@ -244,8 +261,8 @@ class DispatchOrchestrator:
             rejected_assignments=tuple(rejected_assignments),
             unassigned_request_ids=tuple(sorted(unassigned_ids_set)),
             search_status=match_result.search_status,
-            is_approximated=match_result.is_approximated,
-            total_vmt_savings_meters=match_result.total_vmt_savings_meters if committed_assignments else 0,
+            is_approximated=match_result.is_approximated or bool(rejected_assignments),
+            total_vmt_savings_meters=total_vmt_savings,
             cycle_duration_ms=round(elapsed_ms, 2),
             routing_errors_count=match_result.routing_errors_count,
         )

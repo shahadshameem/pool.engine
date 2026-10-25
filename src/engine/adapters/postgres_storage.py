@@ -50,11 +50,16 @@ class PostgresRideStorage(RideStorageProvider):
     def _get_connection(self) -> Connection[Any]:
         if self._external_conn is not None:
             return self._external_conn
-        if self._owned_conn is None or self._owned_conn.closed:
+        if self._owned_conn is None or self._owned_conn.closed or self._owned_conn.broken:
             if not self._dsn:
                 raise StorageProviderError(
                     "PostgresRideStorage requires a DSN or active psycopg Connection, but none was provided."
                 )
+            if self._owned_conn is not None:
+                try:
+                    self._owned_conn.close()
+                except Exception:
+                    pass
             self._owned_conn = psycopg.connect(self._dsn, autocommit=True)
         return self._owned_conn
 

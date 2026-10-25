@@ -56,9 +56,12 @@ class PoolEngineService:
         self.telemetry: EngineTelemetryProvider = telemetry or StructuredLoggerTelemetry()
         self._dispatch_cache: dict[str, DispatchCycleResponse] = {}
 
-    def check_readiness(self) -> dict[str, Any]:
+    def check_readiness(self, strict_routing: bool = False) -> dict[str, Any]:
         """
         Operational readiness probe verifying persistent storage and routing readiness.
+        Storage failure is an essential dependency outage and marks ready=False (503).
+        Routing outages are reported as degraded without making the entire service unready
+        unless strict_routing=True.
         Sanitizes connection strings so passwords or internal credentials are never leaked.
         """
         storage_status = "healthy"
@@ -69,18 +72,54 @@ class PoolEngineService:
             storage_status = "unreachable"
             storage_error = sanitize_sensitive_strings(str(exc))
 
-        ready = storage_status == "healthy"
+        routing_status = "healthy"
+        routing_error = None
+        try:
+            if hasattr(self.router, "check_health"):
+                is_healthy = self.router.check_health()
+                if not is_healthy:
+                    routing_status = "degraded"
+                    routing_error = "Routing backend health probe failed"
+        except Exception as exc:
+            routing_status = "degraded"
+            routing_error = sanitize_sensitive_strings(str(exc))
+
+        is_ready = storage_status == "healthy"
+        if strict_routing and routing_status != "healthy":
+            is_ready = False
+
         components: dict[str, Any] = {
             "storage": storage_status,
-            "routing": "configured",
+            "routing": routing_status,
         }
         if storage_error:
             components["storage_error"] = storage_error
+        if routing_error:
+            components["routing_error"] = routing_error
+
         return {
-            "ready": ready,
-            "status": "ready" if ready else "not_ready",
+            "ready": is_ready,
+            "status": "ready" if is_ready else "not_ready",
             "components": components,
         }
+
+    def close(self) -> None:
+        """Closes underlying storage connections and routing transports cleanly."""
+        if hasattr(self.storage, "close"):
+            try:
+                self.storage.close()
+            except Exception:
+                pass
+        if hasattr(self.router, "close"):
+            try:
+                self.router.close()
+            except Exception:
+                pass
+        if hasattr(self.router, "transport") and hasattr(self.router.transport, "close"):
+            try:
+                self.router.transport.close()
+            except Exception:
+                pass
 
     def create_request(self, input_data: CreateRideRequestInput) -> RideRequest:
         """

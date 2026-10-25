@@ -179,7 +179,7 @@ Kubernetes/container liveness probe verifying ASGI server process is responsive.
 
 #### `GET /v1/health/readiness`
 Readiness probe verifying persistent storage connectivity and routing readiness.
-* **Status**: `200 OK` (when healthy) or `503 Service Unavailable` (when dependencies unreachable).
+* **Status**: `200 OK` (when storage is healthy, even if routing is degraded) or `503 Service Unavailable` (when storage is unreachable, or routing degraded under `strict_routing_readiness=true`).
 * **Response**:
 ```json
 {
@@ -187,7 +187,7 @@ Readiness probe verifying persistent storage connectivity and routing readiness.
   "status": "ready",
   "components": {
     "storage": "healthy",
-    "routing": "configured"
+    "routing": "healthy"
   }
 }
 ```
@@ -225,6 +225,7 @@ All non-2xx responses return a uniform error envelope:
 | **422 Unprocessable Entity** | `LIFECYCLE_ERROR` | Illegal state transition (e.g. cancelling onboarded passenger or completed ride). |
 | **502 Bad Gateway** | `ROUTING_BACKEND_ERROR` | Road routing provider lookup failure or invalid leg geometry. |
 | **503 Service Unavailable** | `SERVICE_UNAVAILABLE` | Readiness check failure: essential dependency (database/storage) unreachable. |
+| **503 Service Unavailable** | `SERVICE_SHUTTING_DOWN` | Server is executing graceful shutdown and draining in-flight requests. |
 | **504 Gateway Timeout** | `ROUTING_TIMEOUT_ERROR` | Upstream routing backend exceeded query deadline. |
 | **500 Internal Error** | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception (generic sanitized message, zero stack trace/DSN leak). |
 
