@@ -15,6 +15,7 @@ from engine.contracts.routing import (
 )
 from engine.adapters.osrm_routing import (
     DefaultOsrmTransport,
+    LruLegCache,
     OsrmHttpTransport,
     OsrmRoutingAdapter,
 )
@@ -681,4 +682,85 @@ def test_osrm_adapter_get_distance_matrix_caches_valid_legs_before_raising() -> 
     hit, val = adapter._cache.lookup(adapter._cache_key(C_PHL, C_UPENN))
     assert hit is True
     assert val == (1200, 150)
+
+
+def test_lru_cache_get_missing_and_set_many() -> None:
+    """Verifies get_missing and set_many on LruLegCache operate correctly under lock."""
+    cache = LruLegCache(maxsize=5)
+    k1 = (40.1, -74.1, 40.2, -74.2)
+    k2 = (40.2, -74.2, 40.3, -74.3)
+    k3 = (40.3, -74.3, 40.4, -74.4)
+
+    # Initially all missing
+    missing = cache.get_missing([k1, k2, k3])
+    assert missing == [k1, k2, k3]
+
+    # set_many inserts atomically
+    cache.set_many({k1: (1000, 100), k2: (2000, 200)})
+    assert len(cache) == 2
+
+    missing_after = cache.get_missing([k1, k2, k3])
+    assert missing_after == [k3]
+
+    hit1, val1 = cache.lookup(k1)
+    assert hit1 is True
+    assert val1 == (1000, 100)
+
+
+def test_prefetch_matrix_chunking_across_max_table_size() -> None:
+    """Verifies prefetch_matrix correctly chunks requests when origins exceed max_table_size."""
+    transport = FakeOsrmTransport()
+    # 6 coordinates with max_table_size = 4 -> chunks of 4 and 2
+    coords = [
+        Coordinate(latitude=40.7100 + i * 0.01, longitude=-74.0000)
+        for i in range(6)
+    ]
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[1000.0] * 4 for _ in range(4)],
+            "durations": [[100.0] * 4 for _ in range(4)],
+        },
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_table_size=4)
+    cached = adapter.prefetch_matrix(origins=coords)
+
+    # 6x6 = 36 pairwise legs, chunked across 4 subqueries
+    assert cached > 0
+    assert len(transport.call_history) > 1
+
+    # Verify legs are cached
+    key = adapter._cache_key(coords[0], coords[1])
+    hit, val = adapter._cache.lookup(key)
+    assert hit is True
+    assert val == (1000, 100)
+
+
+def test_prefetch_matrix_compact_url_when_same_endpoints() -> None:
+    """Verifies prefetch_matrix generates compact URL without duplicate coordinates when origins == destinations."""
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, 1200.0], [1200.0, 0.0]],
+            "durations": [[0.0, 150.0], [150.0, 0.0]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+    adapter.prefetch_matrix(origins=[C_PHL, C_UPENN])
+
+    assert len(transport.call_history) == 1
+    url = transport.call_history[0]
+    # Should NOT have sources or destinations parameter
+    assert "sources=" not in url
+    assert "destinations=" not in url
+    # Should only list each coordinate once
+    assert url.count("-75.165200,39.952600") == 1
+    assert url.count("-75.193200,39.952200") == 1
 

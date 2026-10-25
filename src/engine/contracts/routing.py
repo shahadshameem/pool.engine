@@ -12,6 +12,10 @@ class Coordinate:
     latitude: float
     longitude: float
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "latitude", round(float(self.latitude), 6))
+        object.__setattr__(self, "longitude", round(float(self.longitude), 6))
+
 
 @dataclass(frozen=True)
 class MatrixResult:

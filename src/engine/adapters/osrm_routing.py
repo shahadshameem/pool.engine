@@ -7,7 +7,7 @@ import json
 import math
 import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 import urllib.parse
 
 from engine.contracts.routing import (
@@ -142,6 +142,24 @@ class LruLegCache:
             if len(self._data) > self.maxsize:
                 self._data.popitem(last=False)
 
+    def get_missing(
+        self, keys: Sequence[tuple[float, float, float, float]]
+    ) -> list[tuple[float, float, float, float]]:
+        """Returns the sublist of keys that are not present in the cache."""
+        with self._lock:
+            return [k for k in keys if k not in self._data]
+
+    def set_many(
+        self, items: Mapping[tuple[float, float, float, float], tuple[int, int] | None]
+    ) -> None:
+        """Batch inserts items into the cache under a single lock acquisition."""
+        with self._lock:
+            for key, value in items.items():
+                self._data[key] = value
+                self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
@@ -210,6 +228,13 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
             return False
 
     def _cache_key(self, origin: Coordinate, destination: Coordinate) -> tuple[float, float, float, float]:
+        if self.coord_precision == 6:
+            return (
+                origin.latitude,
+                origin.longitude,
+                destination.latitude,
+                destination.longitude,
+            )
         return (
             round(origin.latitude, self.coord_precision),
             round(origin.longitude, self.coord_precision),
@@ -509,6 +534,7 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         never raises if individual cells cannot be routed.
         Returns the count of new valid legs cached.
         """
+        same_endpoints = (destinations is None or destinations is origins or destinations == origins)
         if destinations is None:
             destinations = origins
         m = len(origins)
@@ -519,8 +545,10 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         if deadline is not None and time.monotonic() > deadline - reserved_headroom:
             return 0
 
-        max_origins_per_chunk = max(1, self.max_table_size // 2)
-        max_dest_per_chunk = max(1, self.max_table_size - max_origins_per_chunk)
+        max_origins_per_chunk = max(1, self.max_table_size // (1 if same_endpoints else 2))
+        max_dest_per_chunk = (
+            max_origins_per_chunk if same_endpoints else max(1, self.max_table_size - max_origins_per_chunk)
+        )
         cached_count = 0
 
         for o_start in range(0, m, max_origins_per_chunk):
@@ -535,32 +563,32 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                 d_end = min(n, d_start + max_dest_per_chunk)
                 chunk_destinations = destinations[d_start:d_end]
 
-                # Check if all cells in this chunk are already cached
-                all_cached = True
-                for o in chunk_origins:
-                    for d in chunk_destinations:
-                        hit, _ = self._cache.lookup(self._cache_key(o, d))
-                        if not hit:
-                            all_cached = False
-                            break
-                    if not all_cached:
-                        break
-                if all_cached:
+                chunk_same = (same_endpoints and o_start == d_start and o_end == d_end)
+                keys = [self._cache_key(o, d) for o in chunk_origins for d in chunk_destinations]
+                missing = self._cache.get_missing(keys)
+                if not missing:
                     continue
 
-                all_coords = list(chunk_origins) + list(chunk_destinations)
-                coords_str = ";".join(
-                    f"{c.longitude:.{self.coord_precision}f},{c.latitude:.{self.coord_precision}f}"
-                    for c in all_coords
-                )
-                sources_str = ";".join(str(i) for i in range(len(chunk_origins)))
-                dests_str = ";".join(
-                    str(len(chunk_origins) + j) for j in range(len(chunk_destinations))
-                )
-                path = (
-                    f"/table/v1/{self.profile}/{coords_str}"
-                    f"?sources={sources_str}&destinations={dests_str}&annotations=duration,distance"
-                )
+                if chunk_same:
+                    coords_str = ";".join(
+                        f"{c.longitude:.{self.coord_precision}f},{c.latitude:.{self.coord_precision}f}"
+                        for c in chunk_origins
+                    )
+                    path = f"/table/v1/{self.profile}/{coords_str}?annotations=duration,distance"
+                else:
+                    all_coords = list(chunk_origins) + list(chunk_destinations)
+                    coords_str = ";".join(
+                        f"{c.longitude:.{self.coord_precision}f},{c.latitude:.{self.coord_precision}f}"
+                        for c in all_coords
+                    )
+                    sources_str = ";".join(str(i) for i in range(len(chunk_origins)))
+                    dests_str = ";".join(
+                        str(len(chunk_origins) + j) for j in range(len(chunk_destinations))
+                    )
+                    path = (
+                        f"/table/v1/{self.profile}/{coords_str}"
+                        f"?sources={sources_str}&destinations={dests_str}&annotations=duration,distance"
+                    )
 
                 try:
                     data = self._execute_get(path)
@@ -572,6 +600,7 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                 if not isinstance(distances, list) or not isinstance(durations, list):
                     continue
 
+                batch_to_set: dict[tuple[float, float, float, float], tuple[int, int] | None] = {}
                 for r, orig in enumerate(chunk_origins):
                     if r >= len(distances) or not isinstance(distances[r], list):
                         continue
@@ -584,14 +613,17 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                         raw_dur = row_dur[c]
                         key = self._cache_key(orig, dest)
                         if raw_dist is None or raw_dur is None:
-                            self._cache.set(key, None)
+                            batch_to_set[key] = None
                             continue
                         try:
                             val = validate_route_leg(orig, dest, (raw_dist, raw_dur))
-                            self._cache.set(key, val)
+                            batch_to_set[key] = val
                             cached_count += 1
                         except InvalidRouteDataError:
-                            self._cache.set(key, None)
+                            batch_to_set[key] = None
+
+                if batch_to_set:
+                    self._cache.set_many(batch_to_set)
 
         return cached_count
 

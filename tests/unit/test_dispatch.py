@@ -246,3 +246,43 @@ def test_dispatch_prefetch_matrix_integration() -> None:
     p_c = Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
     d_c = Coordinate(req.dropoff_location.latitude, req.dropoff_location.longitude)
     assert spy_router._cache_key(p_c, d_c) in spy_router._cache
+
+
+def test_dispatch_batch_completeness_and_deadline_status() -> None:
+    """Verifies that dispatch marks search_status correctly and tracks completeness."""
+    import time
+    from engine.domain.enums import SearchStatus
+
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=MockRoutingProvider(),
+        spatial_index=H3SpatialIndexAdapter(),
+    )
+
+    req = _make_sample_request("req-compl-1", 40.7128, -74.0060, 40.7200, -74.0050)
+    veh = _make_sample_vehicle("veh-compl-1", 40.7130, -74.0055, capacity=4)
+
+    # 1. Normal run completes with APPROXIMATED or COMPLETE
+    res_normal = engine.dispatch_batch(
+        requests=[req],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-normal",
+        deadline=time.monotonic() + 10.0,
+    )
+    assert res_normal.search_status in (SearchStatus.COMPLETE, SearchStatus.APPROXIMATED)
+    assert res_normal.is_approximated is True  # default bounded mode
+    assert len(res_normal.selected_assignments) == 1
+
+    # 2. Expired deadline run flags INCOMPLETE_DEADLINE_EXPIRED
+    res_expired = engine.dispatch_batch(
+        requests=[req],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-expired",
+        deadline=time.monotonic() - 1.0,
+    )
+    assert res_expired.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+    assert res_expired.is_approximated is True
