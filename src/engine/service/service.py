@@ -2,7 +2,7 @@
 
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from engine.contracts.routing import (
     Coordinate,
@@ -33,6 +33,8 @@ from engine.service.schemas import (
     RegisterVehicleInput,
     StaleAssignmentDiagnosticResponse,
 )
+from engine.service.security import sanitize_sensitive_strings
+from engine.service.telemetry import EngineTelemetryProvider, StructuredLoggerTelemetry
 
 
 class PoolEngineService:
@@ -46,11 +48,39 @@ class PoolEngineService:
         storage: RideStorageProvider,
         orchestrator: DispatchOrchestrator,
         router: RoadNetworkRoutingProvider,
+        telemetry: Optional[EngineTelemetryProvider] = None,
     ) -> None:
         self.storage = storage
         self.orchestrator = orchestrator
         self.router = router
+        self.telemetry: EngineTelemetryProvider = telemetry or StructuredLoggerTelemetry()
         self._dispatch_cache: dict[str, DispatchCycleResponse] = {}
+
+    def check_readiness(self) -> dict[str, Any]:
+        """
+        Operational readiness probe verifying persistent storage and routing readiness.
+        Sanitizes connection strings so passwords or internal credentials are never leaked.
+        """
+        storage_status = "healthy"
+        storage_error = None
+        try:
+            _ = self.storage.get_active_rides(limit=1)
+        except Exception as exc:
+            storage_status = "unreachable"
+            storage_error = sanitize_sensitive_strings(str(exc))
+
+        ready = storage_status == "healthy"
+        components: dict[str, Any] = {
+            "storage": storage_status,
+            "routing": "configured",
+        }
+        if storage_error:
+            components["storage_error"] = storage_error
+        return {
+            "ready": ready,
+            "status": "ready" if ready else "not_ready",
+            "components": components,
+        }
 
     def create_request(self, input_data: CreateRideRequestInput) -> RideRequest:
         """
@@ -70,7 +100,9 @@ class PoolEngineService:
                 and existing.earliest_pickup_time == input_data.earliest_pickup_time
                 and existing.latest_dropoff_time == input_data.latest_dropoff_time
             ):
+                self.telemetry.record_idempotency_hit(req_id, "create_request")
                 return existing
+            self.telemetry.record_conflict("request_duplicate", req_id)
             raise ConflictError(f"RideRequest with ID '{req_id}' already exists with different attributes")
 
         direct_dist = input_data.direct_distance_meters
@@ -89,10 +121,12 @@ class PoolEngineService:
                 raw_leg = self.router.get_direct_leg(coord_from, coord_to)
                 valid_dist, valid_dur = validate_route_leg(coord_from, coord_to, raw_leg)
             except RouteTimeoutError as err:
+                self.telemetry.record_routing_failure("router", "timeout")
                 raise ApiRoutingTimeoutError(
                     f"Routing provider timed out calculating direct route leg: {err}"
                 ) from err
             except (RouteLookupError, InvalidRouteDataError, RoutingProviderError, TimeoutError, ConnectionError) as err:
+                self.telemetry.record_routing_failure("router", str(err))
                 raise RoutingError(
                     f"Failed to resolve direct road route from pickup to dropoff: {err}"
                 ) from err
@@ -155,6 +189,7 @@ class PoolEngineService:
             raise ResourceNotFoundError(f"RideRequest '{request_id}' not found")
 
         if req.status == RequestStatus.CANCELLED:
+            self.telemetry.record_idempotency_hit(request_id, "cancel_request")
             return req
 
         if req.status in (RequestStatus.COMPLETED, RequestStatus.EXPIRED):
@@ -163,12 +198,14 @@ class PoolEngineService:
         if req.status == RequestStatus.PENDING:
             cancelled_req = req.model_copy(update={"status": RequestStatus.CANCELLED})
             self.storage.save_request(cancelled_req)
+            self.telemetry.record_cancellation(request_id, None, was_matched=False)
             return cancelled_req
 
         if req.status == RequestStatus.MATCHED:
             if not req.matched_ride_id:
                 cancelled_req = req.model_copy(update={"status": RequestStatus.CANCELLED})
                 self.storage.save_request(cancelled_req)
+                self.telemetry.record_cancellation(request_id, None, was_matched=False)
                 return cancelled_req
 
             eff_time = current_time if current_time is not None else int(time.time())
@@ -214,9 +251,11 @@ class PoolEngineService:
                 )
 
                 if commit_res.success and commit_res.request is not None:
+                    self.telemetry.record_cancellation(request_id, ride.ride_id, was_matched=True)
                     return commit_res.request
 
                 if commit_res.rejection_reason == "VERSION_CONFLICT":
+                    self.telemetry.record_conflict("cancellation_version_conflict", request_id)
                     if attempt < max_attempts - 1:
                         continue  # retry with freshly fetched ride
                     raise ConflictError(
@@ -248,7 +287,9 @@ class PoolEngineService:
                 and existing.total_seat_capacity == input_data.total_seat_capacity
                 and existing.luggage_capacity_units == input_data.luggage_capacity_units
             ):
+                self.telemetry.record_idempotency_hit(input_data.vehicle_id, "register_vehicle")
                 return existing
+            self.telemetry.record_conflict("vehicle_duplicate", input_data.vehicle_id)
             raise ConflictError(
                 f"Vehicle '{input_data.vehicle_id}' already registered with different configuration"
             )
@@ -309,6 +350,7 @@ class PoolEngineService:
 
         # Idempotent replay: return cached cycle result without running solver again
         if eff_token in self._dispatch_cache:
+            self.telemetry.record_idempotency_hit(eff_token, "run_dispatch")
             return self._dispatch_cache[eff_token]
 
         deadline = (
@@ -348,6 +390,16 @@ class PoolEngineService:
         )
 
         self._dispatch_cache[eff_token] = response
+        self.telemetry.record_dispatch_cycle(
+            cycle_id=response.cycle_id,
+            duration_ms=response.cycle_duration_ms,
+            search_status=response.search_status,
+            committed_count=len(response.committed_assignments),
+            rejected_count=len(response.rejected_assignments),
+            unassigned_count=len(response.unassigned_request_ids),
+            routing_errors=response.routing_errors_count,
+            vmt_savings=response.total_vmt_savings_meters,
+        )
         return response
 
     def get_ride(self, ride_id: str) -> Ride:

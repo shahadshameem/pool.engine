@@ -2,12 +2,16 @@
 
 from engine.service.app import create_app
 from engine.service.client import AsgiResponse, AsgiTestClient
+from engine.service.config import ServiceConfig
 from engine.service.errors import (
+    AuthenticationRequiredError,
+    AuthorizationForbiddenError,
     ConflictError,
     ErrorBody,
     ErrorDetail,
     ErrorEnvelope,
     LifecycleError,
+    PayloadTooLargeError,
     ResourceNotFoundError,
     RoutingError,
     RoutingTimeoutError,
@@ -24,12 +28,35 @@ from engine.service.schemas import (
     UpdateLocationInput,
     UpdateVehicleStatusInput,
 )
+from engine.service.security import (
+    ApiKeyAuthProvider,
+    AuthContext,
+    AuthProvider,
+    NoOpAuthProvider,
+    sanitize_sensitive_strings,
+)
 from engine.service.service import PoolEngineService
+from engine.service.telemetry import (
+    EngineTelemetryProvider,
+    InMemoryTelemetry,
+    StructuredLoggerTelemetry,
+    mask_coordinate,
+)
 
 __all__ = [
     "create_app",
     "AsgiTestClient",
     "AsgiResponse",
+    "ServiceConfig",
+    "AuthContext",
+    "AuthProvider",
+    "NoOpAuthProvider",
+    "ApiKeyAuthProvider",
+    "sanitize_sensitive_strings",
+    "EngineTelemetryProvider",
+    "StructuredLoggerTelemetry",
+    "InMemoryTelemetry",
+    "mask_coordinate",
     "ServiceError",
     "ValidationError",
     "ResourceNotFoundError",
@@ -37,6 +64,9 @@ __all__ = [
     "LifecycleError",
     "RoutingError",
     "RoutingTimeoutError",
+    "AuthenticationRequiredError",
+    "AuthorizationForbiddenError",
+    "PayloadTooLargeError",
     "ErrorDetail",
     "ErrorBody",
     "ErrorEnvelope",

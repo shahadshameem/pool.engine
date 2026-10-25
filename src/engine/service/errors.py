@@ -100,3 +100,24 @@ class RoutingTimeoutError(RoutingError):
 
     status_code = 504
     code = "ROUTING_TIMEOUT_ERROR"
+
+
+class AuthenticationRequiredError(ServiceError):
+    """Raised when required authentication credentials are missing or invalid."""
+
+    status_code = 401
+    code = "AUTHENTICATION_REQUIRED"
+
+
+class AuthorizationForbiddenError(ServiceError):
+    """Raised when an authenticated caller lacks permissions for an operation."""
+
+    status_code = 403
+    code = "FORBIDDEN"
+
+
+class PayloadTooLargeError(ServiceError):
+    """Raised when a request payload exceeds the configured body size limit."""
+
+    status_code = 413
+    code = "PAYLOAD_TOO_LARGE"

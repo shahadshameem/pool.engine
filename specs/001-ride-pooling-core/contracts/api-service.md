@@ -9,15 +9,23 @@
 ## 1. Architectural Boundaries & Non-Negotiable Invariants
 
 1. **Framework Independence**:
-   - The API layer is implemented as a pure standard-library ASGI 3 application callable (`create_app(service)`).
+   - The API layer is implemented as a pure standard-library ASGI 3 application callable (`create_app(service, config, auth_provider, telemetry)`).
    - Zero required runtime dependencies on external web frameworks (no FastAPI or Starlette required).
-   - Native integration with any standard ASGI server (e.g. Uvicorn, Hypercorn) or embeddable in FastAPI/Starlette routing trees.
+   - Native integration with any standard ASGI server (e.g. Uvicorn, Hypercorn) or embeddable in external routing trees.
 2. **Separation of Concerns**:
    - The service layer delegates strictly to `DispatchOrchestrator` and `RideStorageProvider`.
    - Matching algorithms, seat capacity tracking, OCC version increments, and physical route validation are never duplicated in the API layer.
 3. **Provider-Agnostic Schema**:
    - DTOs operate purely on canonical WGS84 geographic coordinates, Unix epoch timestamps (seconds), and canonical domain enums.
    - No vendor SDK assumptions (no OSRM, Valhalla, PostgreSQL, or cloud-specific schemas).
+4. **Security & Input Guarding**:
+   - Explicit authentication/authorization boundary via `AuthProvider`. When unconfigured, does not invent synthetic identities.
+   - Strict body size limit (`ServiceConfig.max_request_body_bytes`, default 1 MB) enforced before and during streaming, rejecting oversized requests with `413 PAYLOAD_TOO_LARGE`.
+   - Streaming client disconnects (`http.disconnect`) handled gracefully without hanging or unhandled exceptions.
+   - Credential sanitization (`sanitize_sensitive_strings`) guarantees database passwords and DSN secrets are never exposed in error responses, readiness probes, or logs.
+5. **Operational Privacy & Telemetry**:
+   - Telemetry hooks via `EngineTelemetryProvider` track dispatch duration, search status, conflicts, cancellations, and API traffic.
+   - Coordinates logged to telemetry are coarsened using `mask_coordinate(lat, lon, precision=2)` (~1.1 km accuracy) satisfying Constitution Principle VIII.
 
 ---
 
@@ -28,6 +36,7 @@
 #### `POST /v1/requests`
 Submits a new passenger demand request.
 
+* **Headers**: Optional `Idempotency-Key: <token>`
 * **Request Body**:
 ```json
 {
@@ -58,12 +67,13 @@ Retrieves the current state of a ride request.
 #### `POST /v1/requests/{request_id}/cancel`
 Safely cancels a ride request while enforcing lifecycle invariants.
 
-* **Request Body**: Optional `{"reason": "passenger_cancelled"}`
+* **Headers**: Optional `Idempotency-Key: <token>`
+* **Request Body**: Optional `{"reason": "passenger_cancelled", "idempotency_token": "idemp-001"}`
 * **Behavior**:
   - `PENDING`: Transitions directly to `CANCELLED` in persistent storage.
-  - `MATCHED`: Invokes `cancel_en_route_request()` to remove stops from the active ride itinerary, recalculate downstream ETAs, and increment the ride's OCC version.
+  - `MATCHED`: Invokes `cancel_en_route_request()` to remove stops from the active ride itinerary, recalculate downstream ETAs, and commits the re-optimized ride and request status atomically via `RideStorageProvider.cancel_assigned_request_atomic()`.
   - `CANCELLED`: Idempotent `200 OK`.
-  - `COMPLETED`, `EXPIRED`, or `IN_TRANSIT`: Rejects with `422 LIFECYCLE_ERROR`.
+  - `COMPLETED`, `EXPIRED`, or `IN_TRANSIT` (boarded): Rejects with `422 LIFECYCLE_ERROR`.
 * **Status**: `200 OK` or `422 Unprocessable Entity`
 
 ---
@@ -153,11 +163,34 @@ Retrieves the complete pooled ride itinerary, ordered stops, passenger count, an
 * **Status**: `200 OK` or `404 Not Found`
 * **Response**: Serialized canonical `Ride` model.
 
-#### `GET /v1/health`
-Health and readiness probe.
+---
 
+### E. Health, Liveness, and Readiness Probes
+
+#### `GET /v1/health`
+General application health ping.
 * **Status**: `200 OK`
 * **Response**: `{"status": "ok", "service": "pool-engine"}`
+
+#### `GET /v1/health/liveness`
+Kubernetes/container liveness probe verifying ASGI server process is responsive.
+* **Status**: `200 OK`
+* **Response**: `{"status": "alive", "service": "pool-engine"}`
+
+#### `GET /v1/health/readiness`
+Readiness probe verifying persistent storage connectivity and routing readiness.
+* **Status**: `200 OK` (when healthy) or `503 Service Unavailable` (when dependencies unreachable).
+* **Response**:
+```json
+{
+  "ready": true,
+  "status": "ready",
+  "components": {
+    "storage": "healthy",
+    "routing": "configured"
+  }
+}
+```
 
 ---
 
@@ -183,13 +216,17 @@ All non-2xx responses return a uniform error envelope:
 | HTTP Status Code | Error Code | Trigger Condition |
 | :--- | :--- | :--- |
 | **400 Bad Request** | `VALIDATION_ERROR` | Schema failure, out-of-bounds coordinates, inverted time window, mismatched idempotency tokens. |
+| **401 Unauthorized** | `AUTHENTICATION_REQUIRED` | Missing or invalid API key / bearer token when `require_auth=True`. |
+| **403 Forbidden** | `FORBIDDEN` | Authenticated caller lacks permissions/role for the requested action. |
 | **404 Not Found** | `RESOURCE_NOT_FOUND` | Missing request, vehicle, ride, or route path. |
 | **405 Method Not Allowed** | `METHOD_NOT_ALLOWED` | HTTP verb not supported for the requested resource path. |
 | **409 Conflict** | `CONCURRENCY_CONFLICT` | OCC version mismatch, capacity exhaustion, or registration conflict. |
+| **413 Payload Too Large** | `PAYLOAD_TOO_LARGE` | Request body exceeds configured limit (`ServiceConfig.max_request_body_bytes`). |
 | **422 Unprocessable Entity** | `LIFECYCLE_ERROR` | Illegal state transition (e.g. cancelling onboarded passenger or completed ride). |
 | **502 Bad Gateway** | `ROUTING_BACKEND_ERROR` | Road routing provider lookup failure or invalid leg geometry. |
+| **503 Service Unavailable** | `SERVICE_UNAVAILABLE` | Readiness check failure: essential dependency (database/storage) unreachable. |
 | **504 Gateway Timeout** | `ROUTING_TIMEOUT_ERROR` | Upstream routing backend exceeded query deadline. |
-| **500 Internal Error** | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception. |
+| **500 Internal Error** | `INTERNAL_SERVER_ERROR` | Unhandled runtime exception (generic sanitized message, zero stack trace/DSN leak). |
 
 ---
 

@@ -65,11 +65,11 @@ class AsgiTestClient:
 
         if json_data is not None:
             req_body = json.dumps(json_data).encode("utf-8")
-            req_headers["content-type"] = "application/json"
-            req_headers["content-length"] = str(len(req_body))
+            req_headers.setdefault("content-type", "application/json")
+            req_headers.setdefault("content-length", str(len(req_body)))
         elif data is not None:
             req_body = data
-            req_headers["content-length"] = str(len(req_body))
+            req_headers.setdefault("content-length", str(len(req_body)))
 
         raw_headers = [
             (k.encode("latin1"), v.encode("latin1")) for k, v in req_headers.items()
