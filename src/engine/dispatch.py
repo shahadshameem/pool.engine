@@ -510,9 +510,36 @@ class DispatchEngine:
         effective_batch_id = batch_id or f"batch-{uuid.uuid4()}"
         effective_config = config or self.config
 
-        pending_requests = [r for r in requests if r.status == RequestStatus.PENDING]
-        eligible_vehicles = [v for v in vehicles if v.is_active]
-        all_req_ids = [r.request_id for r in pending_requests]
+        # Validate and deduplicate requests and vehicles by canonical entity ID
+        requests_by_id: dict[str, RideRequest] = {}
+        for r in requests:
+            if r.status != RequestStatus.PENDING:
+                continue
+            if r.request_id in requests_by_id:
+                existing_r = requests_by_id[r.request_id]
+                if r != existing_r:
+                    raise ValueError(
+                        f"Conflicting duplicate request detected for request_id '{r.request_id}'"
+                    )
+                continue
+            requests_by_id[r.request_id] = r
+
+        vehicles_by_id: dict[str, Vehicle] = {}
+        for v in vehicles:
+            if not v.is_active:
+                continue
+            if v.vehicle_id in vehicles_by_id:
+                existing_v = vehicles_by_id[v.vehicle_id]
+                if v != existing_v:
+                    raise ValueError(
+                        f"Conflicting duplicate vehicle detected for vehicle_id '{v.vehicle_id}'"
+                    )
+                continue
+            vehicles_by_id[v.vehicle_id] = v
+
+        pending_requests = list(requests_by_id.values())
+        eligible_vehicles = list(vehicles_by_id.values())
+        all_req_ids = tuple(sorted(requests_by_id.keys()))
 
         # Stage 1: Fast Input Validation
         if not pending_requests or not eligible_vehicles:
@@ -522,7 +549,7 @@ class DispatchEngine:
                 batch_id=effective_batch_id,
                 solver_timestamp=current_time,
                 selected_assignments=(),
-                unassigned_request_ids=tuple(all_req_ids),
+                unassigned_request_ids=all_req_ids,
                 total_vmt_savings_meters=0,
                 solve_duration_ms=solve_duration,
                 dispatch_mode=effective_config.mode,
@@ -538,7 +565,7 @@ class DispatchEngine:
                 batch_id=effective_batch_id,
                 solver_timestamp=current_time,
                 selected_assignments=(),
-                unassigned_request_ids=tuple(all_req_ids),
+                unassigned_request_ids=all_req_ids,
                 total_vmt_savings_meters=0,
                 solve_duration_ms=solve_duration,
                 dispatch_mode=effective_config.mode,
@@ -547,8 +574,8 @@ class DispatchEngine:
             )
 
         # Stage 2, 3, 4: Candidate Generation
-        # Reserve headroom for set packing solver (headroom + 20ms)
-        cand_headroom = reserved_headroom + 0.020
+        # Reserve headroom for set packing solver (headroom + 40ms)
+        cand_headroom = reserved_headroom + 0.040
         candidates = self.generate_candidates(
             requests=pending_requests,
             vehicles=eligible_vehicles,
@@ -575,8 +602,9 @@ class DispatchEngine:
         solve_duration_ms = (time.monotonic() - start_monotonic) * 1000.0
 
         if (
-            time.monotonic() >= effective_deadline - reserved_headroom
+            solver_result.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
             or candidates.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+            or time.monotonic() >= effective_deadline - reserved_headroom
         ):
             effective_search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
             effective_is_approximated = True

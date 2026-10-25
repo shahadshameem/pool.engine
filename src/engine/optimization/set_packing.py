@@ -5,7 +5,7 @@ import uuid
 from typing import Callable, Sequence
 
 from engine.domain.candidate import CandidateAssignment
-from engine.domain.enums import SearchStatus
+from engine.domain.enums import DispatchMode, SearchStatus
 from engine.domain.models import MatchResult
 from engine.optimization.tie_breaking import candidate_sort_key, compare_candidates_deterministic
 
@@ -57,7 +57,10 @@ def solve_set_packing_regret_k(
         # Filter candidates to only valid ones belonging to the request set
         valid_candidates = [
             c for c in candidates
-            if c.request_ids and set(c.request_ids).issubset(all_req_set)
+            if c.vehicle_id
+            and c.request_ids
+            and len(set(c.request_ids)) == len(c.request_ids)
+            and set(c.request_ids).issubset(all_req_set)
         ]
         # Sort candidates deterministically upfront to guarantee candidate input order invariance
         sort_key = candidate_sort_key()
@@ -188,12 +191,18 @@ def solve_set_packing_regret_k(
         # (Guaranteed 50ms reserved headroom)
         # =========================================================================
         deadline_expired = interrupted_by_deadline or (time.monotonic() >= cutoff_time)
-        effective_status = (
-            SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-            if deadline_expired
-            else SearchStatus.COMPLETE
-        )
-        effective_approx = True if deadline_expired else False
+        cand_status = getattr(candidates, "search_status", None)
+        cand_approx = getattr(candidates, "is_approximated", False)
+
+        if deadline_expired or cand_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
+            effective_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+            effective_approx = True
+        elif cand_status == SearchStatus.APPROXIMATED:
+            effective_status = SearchStatus.APPROXIMATED
+            effective_approx = True
+        else:
+            effective_status = SearchStatus.COMPLETE
+            effective_approx = cand_approx
 
         # 1. Conflict-free verification: vehicles
         if len(assigned_vehicles) != len(selected_assignments):
@@ -248,19 +257,47 @@ def solve_set_packing_regret_k(
         )
 
     except Exception:
-        # Documented Safe Fallback: return unassigned requests cleanly with zero partial assignments
+        # Documented Safe Fallback: verify and preserve conflict-free assignments if available,
+        # otherwise return all requests safely unassigned
         duration_ms = (time.monotonic() - start_time) * 1000.0
-        deadline_expired = time.monotonic() >= cutoff_time
+        deadline_expired = interrupted_by_deadline or (time.monotonic() >= cutoff_time)
+        cand_status = getattr(candidates, "search_status", None)
+        if not deadline_expired and cand_status != SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
+            raise
+
+        status_on_error = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+        safe_assignments: tuple[CandidateAssignment, ...] = ()
+        safe_unassigned: tuple[str, ...] = sorted_all_reqs
+        safe_savings = 0
+        try:
+            assigned_vehs = {c.vehicle_id for c in selected_assignments}
+            all_req_list = [r for c in selected_assignments for r in c.request_ids]
+            if (
+                len(assigned_vehs) == len(selected_assignments)
+                and len(set(all_req_list)) == len(all_req_list)
+                and set(all_req_list).issubset(all_req_set)
+            ):
+                safe_assignments = tuple(sorted(selected_assignments, key=candidate_sort_key()))
+                safe_unassigned = tuple(sorted(all_req_set - set(all_req_list)))
+                safe_savings = sum(
+                    int(round(c.vmt_meters * c.score_breakdown.vmt_savings_ratio))
+                    for c in safe_assignments
+                )
+        except Exception:
+            safe_assignments = ()
+            safe_unassigned = sorted_all_reqs
+            safe_savings = 0
+
         return MatchResult(
             match_id=match_id,
             batch_id=batch_id,
             solver_timestamp=int(time.time()),
-            selected_assignments=(),
-            unassigned_request_ids=sorted_all_reqs,
-            total_vmt_savings_meters=0,
+            selected_assignments=safe_assignments,
+            unassigned_request_ids=safe_unassigned,
+            total_vmt_savings_meters=safe_savings,
             solve_duration_ms=round(duration_ms, 2),
-            search_status=SearchStatus.INCOMPLETE_DEADLINE_EXPIRED if deadline_expired else SearchStatus.COMPLETE,
-            is_approximated=True if deadline_expired else False,
+            search_status=status_on_error,
+            is_approximated=True,
         )
 
 
@@ -275,9 +312,13 @@ def solve_exact_set_packing(
     """
     start_time = time.monotonic()
     all_req_set = set(all_request_ids)
+
     valid_cands = [
         c for c in candidates
-        if c.request_ids and set(c.request_ids).issubset(all_req_set)
+        if c.vehicle_id
+        and c.request_ids
+        and len(set(c.request_ids)) == len(c.request_ids)
+        and set(c.request_ids).issubset(all_req_set)
     ]
     # Sort descending by utility to prune subtrees faster
     valid_cands.sort(key=candidate_sort_key())
@@ -329,7 +370,7 @@ def solve_exact_set_packing(
     # Build MatchResult
     best_selection.sort(key=candidate_sort_key())
     assigned_reqs = {r for c in best_selection for r in c.request_ids}
-    unassigned = sorted(list(all_req_set - assigned_reqs))
+    unassigned = tuple(sorted(all_req_set - assigned_reqs))
     total_savings = sum(
         int(round(c.vmt_meters * c.score_breakdown.vmt_savings_ratio))
         for c in best_selection
@@ -341,7 +382,10 @@ def solve_exact_set_packing(
         batch_id=f"batch-{uuid.uuid4().hex[:8]}",
         solver_timestamp=int(time.time()),
         selected_assignments=tuple(best_selection),
-        unassigned_request_ids=tuple(unassigned),
+        unassigned_request_ids=unassigned,
         total_vmt_savings_meters=total_savings,
         solve_duration_ms=round(duration_ms, 2),
+        dispatch_mode=DispatchMode.EXACT,
+        search_status=SearchStatus.COMPLETE,
+        is_approximated=False,
     )
