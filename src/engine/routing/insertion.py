@@ -164,10 +164,33 @@ def generate_active_ride_insertions(
         stop_coords[p_stop.stop_id] = Coordinate(p_stop.location.latitude, p_stop.location.longitude)
         stop_coords[d_stop.stop_id] = Coordinate(d_stop.location.latitude, d_stop.location.longitude)
 
+    # Pre-index stop IDs, deadlines and bounds for all eligible requests once
+    req_p_deadlines: dict[str, int] = {
+        r.request_id: r.earliest_pickup_time + policy.max_pickup_delay_seconds
+        for r in eligible_requests
+    }
+    req_max_allowed_durs: dict[str, float] = {
+        r.request_id: float(r.direct_duration_seconds)
+        + min(
+            (policy.detour_relative_multiplier - 1.0) * float(r.direct_duration_seconds),
+            float(policy.detour_absolute_cap_seconds),
+        )
+        for r in eligible_requests
+    }
+    existing_detour_map: dict[str, tuple[str, int, int]] = {
+        ex_id: (p_id, orig_p, orig_dur)
+        for ex_id, p_id, orig_p, orig_dur in existing_dropoff_detour_data
+    }
+
+    deadline_hit = False
+
     # Evaluate bundles of size 1, 2, ..., max_bundle_size
     for bundle_size in range(1, min(max_bundle_size, len(eligible_requests)) + 1):
+        if deadline_hit:
+            break
         for req_subset in itertools.combinations(eligible_requests, bundle_size):
             if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                deadline_hit = True
                 break
 
             # DFS branch-and-bound with admissible temporal and capacity pruning
@@ -176,23 +199,8 @@ def generate_active_ride_insertions(
             req_list = list(req_subset)
 
             # Pre-index deadlines and stop pairs for fast lookup
-            p_deadlines = [
-                r.earliest_pickup_time + policy.max_pickup_delay_seconds
-                for r in req_list
-            ]
-            max_allowed_durs = [
-                float(r.direct_duration_seconds)
-                + min(
-                    (policy.detour_relative_multiplier - 1.0) * float(r.direct_duration_seconds),
-                    float(policy.detour_absolute_cap_seconds),
-                )
-                for r in req_list
-            ]
-
-            existing_detour_map: dict[str, tuple[str, int, int]] = {
-                ex_id: (p_id, orig_p, orig_dur)
-                for ex_id, p_id, orig_p, orig_dur in existing_dropoff_detour_data
-            }
+            p_deadlines = [req_p_deadlines[r.request_id] for r in req_list]
+            max_allowed_durs = [req_max_allowed_durs[r.request_id] for r in req_list]
 
             req_p_stops = [req_stops_dict[r.request_id][0] for r in req_list]
             req_d_stops = [req_stops_dict[r.request_id][1] for r in req_list]
@@ -210,9 +218,10 @@ def generate_active_ride_insertions(
                 prev_stop_id: str,
                 total_vmt: int,
             ) -> None:
-                nonlocal candidates
+                nonlocal candidates, deadline_hit
 
                 if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                    deadline_hit = True
                     return
 
                 # Admissible temporal check:
@@ -420,6 +429,8 @@ def generate_active_ride_insertions(
                 prev_stop_id=v_stop_id,
                 total_vmt=0,
             )
+            if deadline_hit:
+                break
 
     # Sort descending by objective value
     candidates.sort(key=lambda c: c.objective_value, reverse=True)

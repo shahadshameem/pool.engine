@@ -128,6 +128,7 @@ def _sort_requests_by_active_detour(
     requests: Sequence[RideRequest],
     vehicle: Vehicle,
     active_ride: Ride,
+    req_pickup_coords: dict[str, Coordinate] | None = None,
 ) -> list[RideRequest]:
     """
     Sorts candidate requests ascending by lower-bound detour distance relative to
@@ -142,6 +143,11 @@ def _sort_requests_by_active_detour(
     ]
 
     if not active_stops:
+        if req_pickup_coords is not None:
+            return sorted(
+                requests,
+                key=lambda r: haversine_distance_meters(v_loc, req_pickup_coords[r.request_id]),
+            )
         return sorted(
             requests,
             key=lambda r: haversine_distance_meters(
@@ -158,8 +164,10 @@ def _sort_requests_by_active_detour(
     ]
 
     def _req_detour_lower_bound(req: RideRequest) -> float:
-        p = Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
-        d = Coordinate(req.dropoff_location.latitude, req.dropoff_location.longitude)
+        if req_pickup_coords is not None and req.request_id in req_pickup_coords:
+            p = req_pickup_coords[req.request_id]
+        else:
+            p = Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
 
         # Min detour to insert pickup P into any consecutive segment
         min_p_detour = float("inf")
@@ -301,6 +309,15 @@ class DispatchEngine:
             v.vehicle_id: [] for v in eligible_vehicles
         }
 
+        # Precompute pickup coordinates for all pending requests once
+        req_pickup_coords: dict[str, Coordinate] = {
+            req.request_id: Coordinate(
+                latitude=req.pickup_location.latitude,
+                longitude=req.pickup_location.longitude,
+            )
+            for req in pending_requests
+        }
+
         # Exact vs Bounded spatial search configuration
         if effective_config.mode == DispatchMode.EXACT:
             for req in pending_requests:
@@ -309,10 +326,7 @@ class DispatchEngine:
                     is_approximated = True
                     break
 
-                pickup_coord = Coordinate(
-                    latitude=req.pickup_location.latitude,
-                    longitude=req.pickup_location.longitude,
-                )
+                pickup_coord = req_pickup_coords[req.request_id]
                 # Exact mode: examine full physically reachable radius with no candidate limit
                 spatial_candidates = spatial_coord.find_candidates_within_radius(
                     target=pickup_coord,
@@ -343,10 +357,7 @@ class DispatchEngine:
                     is_approximated = True
                     break
 
-                pickup_coord = Coordinate(
-                    latitude=req.pickup_location.latitude,
-                    longitude=req.pickup_location.longitude,
-                )
+                pickup_coord = req_pickup_coords[req.request_id]
 
                 if (
                     effective_config.exhaustive_fallback
@@ -414,17 +425,14 @@ class DispatchEngine:
 
             if active_ride is not None:
                 sorted_reqs = _sort_requests_by_active_detour(
-                    nearby_reqs, veh, active_ride
+                    nearby_reqs, veh, active_ride, req_pickup_coords=req_pickup_coords
                 )
             else:
                 sorted_reqs = sorted(
                     nearby_reqs,
                     key=lambda r: haversine_distance_meters(
                         v_loc,
-                        Coordinate(
-                            latitude=r.pickup_location.latitude,
-                            longitude=r.pickup_location.longitude,
-                        ),
+                        req_pickup_coords[r.request_id],
                     ),
                 )
 
@@ -461,8 +469,14 @@ class DispatchEngine:
                     policy=policy,
                     current_time=current_time,
                     max_bundle_size=effective_config.max_bundle_size,
+                    deadline=effective_deadline,
+                    reserved_headroom=reserved_headroom,
                 )
                 candidates.extend(bundle_cands)
+                if time.monotonic() > effective_deadline - reserved_headroom:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    is_approximated = True
+                    break
 
         return CandidateList(
             candidates=candidates,

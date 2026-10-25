@@ -1,6 +1,7 @@
 """Multi-request group trip bundle generator for available vehicles."""
 
 import itertools
+import time
 import uuid
 from typing import Sequence
 
@@ -80,119 +81,100 @@ def generate_group_bundles(
     policy: DispatchPolicy,
     current_time: int = 1700000000,
     max_bundle_size: int = 3,
+    deadline: float | None = None,
+    reserved_headroom: float = 0.050,
 ) -> list[CandidateAssignment]:
     """
     Forms multi-passenger group trip bundles for an available vehicle.
     Evaluates combinations of 1, 2, or 3 compatible requests and prunes
-    capacity, precedence, detour, and delay violations in Stage 1.
+    capacity, precedence, detour, and delay violations in Stage 1 using
+    local directed waypoint-leg memoization and admissible prefix branch-and-bound DFS.
     """
     valid_candidates: list[CandidateAssignment] = []
     eligible_requests = [r for r in requests if r.seat_count <= vehicle.total_seat_capacity]
+    if not eligible_requests:
+        return []
+
+    # Pre-compute coordinates and stable waypoint IDs for vehicle and all eligible stops
+    v_stop_id = f"veh:{vehicle.vehicle_id}"
+    v_coord = Coordinate(vehicle.current_location.latitude, vehicle.current_location.longitude)
+    stop_coords: dict[str, Coordinate] = {v_stop_id: v_coord}
+    for req in eligible_requests:
+        stop_coords[f"stop-p-{req.request_id}"] = Coordinate(
+            req.pickup_location.latitude, req.pickup_location.longitude
+        )
+        stop_coords[f"stop-d-{req.request_id}"] = Coordinate(
+            req.dropoff_location.latitude, req.dropoff_location.longitude
+        )
+
+    # Local per-invocation leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
+    # Keyed by stable waypoint identity; preserves directionality.
+    leg_cache: dict[tuple[str, str], tuple[int, int]] = {}
+
+    def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int]:
+        cache_key = (from_id, to_id)
+        cached = leg_cache.get(cache_key)
+        if cached is None:
+            cached = router.get_direct_leg(stop_coords[from_id], stop_coords[to_id])
+            leg_cache[cache_key] = cached
+        return cached
+
+    # Pre-index stop IDs, deadlines and bounds for all eligible requests once
+    req_p_id: dict[str, str] = {r.request_id: f"stop-p-{r.request_id}" for r in eligible_requests}
+    req_d_id: dict[str, str] = {r.request_id: f"stop-d-{r.request_id}" for r in eligible_requests}
+    req_p_deadlines: dict[str, int] = {
+        r.request_id: r.earliest_pickup_time + policy.max_pickup_delay_seconds
+        for r in eligible_requests
+    }
+    req_max_allowed_durs: dict[str, float] = {
+        r.request_id: float(r.direct_duration_seconds)
+        + min(
+            (policy.detour_relative_multiplier - 1.0) * float(r.direct_duration_seconds),
+            float(policy.detour_absolute_cap_seconds),
+        )
+        for r in eligible_requests
+    }
+
+    deadline_hit = False
 
     # Evaluate bundles of size 1, 2, ..., max_bundle_size
     for bundle_size in range(1, min(max_bundle_size, len(eligible_requests)) + 1):
+        if deadline_hit:
+            break
         for req_subset in itertools.combinations(eligible_requests, bundle_size):
-            # Generate all orderings where pickup precedes dropoff
-            orderings = _generate_valid_orderings(req_subset)
+            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                deadline_hit = True
+                break
 
-            for stops in orderings:
-                # Stage 1: Fast Capacity Check
-                if not check_capacity_profile(stops, capacity=vehicle.total_seat_capacity, initial_passengers=0):
+            req_list = list(req_subset)
+            num_reqs = len(req_list)
+
+            # Fast path for single-request bundles: deterministic 2-stop sequence (P -> D)
+            if num_reqs == 1:
+                r = req_list[0]
+                p_id = req_p_id[r.request_id]
+                d_id = req_d_id[r.request_id]
+                leg1_dist, leg1_dur = get_cached_leg(v_stop_id, p_id)
+                arr_p = current_time + leg1_dur
+                if arr_p > req_p_deadlines[r.request_id]:
+                    continue
+                leg2_dist, leg2_dur = get_cached_leg(p_id, d_id)
+                arr_d = arr_p + leg2_dur
+                if (arr_d - arr_p) > (req_max_allowed_durs[r.request_id] + 1e-6):
                     continue
 
-                # Stage 1: Precedence Check
-                if not check_precedence(stops):
-                    continue
-
-                # Road network routing evaluation
-                waypoints = [
-                    Coordinate(vehicle.current_location.latitude, vehicle.current_location.longitude)
-                ] + [
-                    Coordinate(s.location.latitude, s.location.longitude)
-                    for s in stops
-                ]
-
-                current_clock = current_time
-                total_vmt = 0
-                arrival_times: dict[str, int] = {}
-                updated_stops: list[RouteStop] = []
-                feasible = True
-
-                curr_occ = 0
-                peak_occ = 0
-
-                for idx, stop in enumerate(stops):
-                    leg_dist, leg_dur = router.get_direct_leg(waypoints[idx], waypoints[idx + 1])
-                    total_vmt += leg_dist
-                    current_clock += leg_dur
-
-                    curr_occ += stop.passenger_delta
-                    if curr_occ > peak_occ:
-                        peak_occ = curr_occ
-
-                    arrival_times[stop.stop_id] = current_clock
-                    current_clock += stop.dwell_duration_seconds
-
-                    updated_stops.append(
-                        RouteStop(
-                            stop_id=stop.stop_id,
-                            ride_id=stop.ride_id,
-                            request_id=stop.request_id,
-                            stop_type=stop.stop_type,
-                            location=stop.location,
-                            passenger_delta=stop.passenger_delta,
-                            scheduled_arrival_time=arrival_times[stop.stop_id],
-                            promised_window_start=stop.promised_window_start,
-                            promised_window_end=stop.promised_window_end,
-                            status=stop.status,
-                        )
-                    )
-
-                # Check temporal bounds for each request in the bundle
-                for req in req_subset:
-                    p_id = f"stop-p-{req.request_id}"
-                    d_id = f"stop-d-{req.request_id}"
-                    p_time = arrival_times[p_id]
-                    d_time = arrival_times[d_id]
-
-                    if not check_pickup_delay(
-                        actual_pickup_time=p_time,
-                        requested_pickup_time=req.earliest_pickup_time,
-                        max_delay=policy.max_pickup_delay_seconds,
-                    ):
-                        feasible = False
-                        break
-
-                    in_veh_dur = max(0, d_time - p_time)
-                    if not check_detour_bound(
-                        actual_duration=in_veh_dur,
-                        direct_duration=req.direct_duration_seconds,
-                        policy=policy,
-                    ):
-                        feasible = False
-                        break
-
-                if not feasible:
-                    continue
-
-                # Scoring calculation
+                total_vmt = leg1_dist + leg2_dist
                 baseline_vmt = calculate_unshared_vmt_baseline(req_subset)
                 vmt_savings = calculate_vmt_savings(baseline_vmt=baseline_vmt, shared_vmt=total_vmt)
                 s_vmt = float(vmt_savings) / float(baseline_vmt) if baseline_vmt > 0 else 0.0
 
-                total_detour = sum(
-                    max(0, (arrival_times[f"stop-d-{r.request_id}"] - arrival_times[f"stop-p-{r.request_id}"]) - r.direct_duration_seconds)
-                    for r in req_subset
+                p_detour = 0.0
+                total_wait = max(0, arr_p - r.earliest_pickup_time)
+                p_wait = (
+                    float(total_wait) / float(policy.max_pickup_delay_seconds)
+                    if policy.max_pickup_delay_seconds > 0
+                    else 0.0
                 )
-                total_direct_dur = sum(r.direct_duration_seconds for r in req_subset)
-                p_detour = float(total_detour) / float(total_direct_dur) if total_direct_dur > 0 else 0.0
-
-                total_wait = sum(
-                    max(0, arrival_times[f"stop-p-{r.request_id}"] - r.earliest_pickup_time)
-                    for r in req_subset
-                )
-                p_wait = float(total_wait) / float(len(req_subset) * policy.max_pickup_delay_seconds) if policy.max_pickup_delay_seconds > 0 else 0.0
-
                 p_idle = 0.0
 
                 j_raw = (
@@ -210,19 +192,261 @@ def generate_group_bundles(
                     driver_idle_penalty_ratio=round(p_idle, 6),
                 )
 
+                stop_p = RouteStop(
+                    stop_id=p_id,
+                    ride_id="ride-new",
+                    request_id=r.request_id,
+                    stop_type=StopType.PICKUP,
+                    location=r.pickup_location,
+                    passenger_delta=r.seat_count,
+                    scheduled_arrival_time=arr_p,
+                    promised_window_start=r.earliest_pickup_time,
+                    promised_window_end=r.earliest_pickup_time + policy.max_pickup_delay_seconds,
+                    status=StopStatus.SCHEDULED,
+                )
+                stop_d = RouteStop(
+                    stop_id=d_id,
+                    ride_id="ride-new",
+                    request_id=r.request_id,
+                    stop_type=StopType.DROPOFF,
+                    location=r.dropoff_location,
+                    passenger_delta=-r.seat_count,
+                    scheduled_arrival_time=arr_d,
+                    promised_window_start=r.earliest_pickup_time,
+                    promised_window_end=r.latest_dropoff_time,
+                    status=StopStatus.SCHEDULED,
+                )
+
                 candidate = CandidateAssignment(
                     candidate_id=f"cand-{uuid.uuid4().hex[:8]}",
                     vehicle_id=vehicle.vehicle_id,
                     existing_ride_id=None,
-                    request_ids=tuple(sorted([r.request_id for r in req_subset])),
-                    ordered_stops=tuple(updated_stops),
-                    peak_seat_load=peak_occ,
+                    request_ids=(r.request_id,),
+                    ordered_stops=(stop_p, stop_d),
+                    peak_seat_load=r.seat_count,
                     vmt_meters=total_vmt,
                     objective_value=round(j_raw, 6),
                     normalized_score=round(j_display, 4),
                     score_breakdown=score_breakdown,
                 )
                 valid_candidates.append(candidate)
+                continue
+
+            # Pre-index deadlines and bounds for fast lookup
+            p_deadlines = [req_p_deadlines[r.request_id] for r in req_list]
+            max_allowed_durs = [req_max_allowed_durs[r.request_id] for r in req_list]
+
+            p_ids = [req_p_id[r.request_id] for r in req_list]
+            d_ids = [req_d_id[r.request_id] for r in req_list]
+            p_deltas = [r.seat_count for r in req_list]
+            d_deltas = [-r.seat_count for r in req_list]
+            p_dwells = [0] * num_reqs
+            d_dwells = [0] * num_reqs
+
+            current_stops_encoded: list[int] = []  # +(idx+1) for pickup, -(idx+1) for dropoff
+            p_arr_times = [0] * num_reqs
+            d_arr_times = [0] * num_reqs
+            # req_status: 0 = not picked up, 1 = picked up, 2 = dropped off
+            req_status = [0] * num_reqs
+
+            def search_bundles(
+                current_occ: int,
+                peak_occ: int,
+                current_clock: int,
+                prev_stop_id: str,
+                total_vmt: int,
+            ) -> None:
+                nonlocal valid_candidates, deadline_hit
+
+                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                    deadline_hit = True
+                    return
+
+                # Admissible temporal lookahead pruning:
+                # 1. Unvisited pickups: arrival cannot be earlier than current_clock.
+                #    If current_clock > p_deadline, every continuation violates check_pickup_delay.
+                # 2. Picked-up requests: in-vehicle duration so far is (current_clock - p_arr).
+                #    If (current_clock - p_arr) > max_allowed_dur, dropoff in any continuation
+                #    arrives at or after current_clock, so in-vehicle detour strictly violates check_detour_bound.
+                for i in range(num_reqs):
+                    if req_status[i] == 0 and current_clock > p_deadlines[i]:
+                        return
+                    if req_status[i] == 1:
+                        p_arr = p_arr_times[i]
+                        if (current_clock - p_arr) > (max_allowed_durs[i] + 1e-6):
+                            return
+
+                # Base case: all requests picked up and dropped off
+                if all(st == 2 for st in req_status):
+                    baseline_vmt = calculate_unshared_vmt_baseline(req_subset)
+                    total_direct_dur = sum(r.direct_duration_seconds for r in req_subset)
+
+                    vmt_savings = calculate_vmt_savings(baseline_vmt=baseline_vmt, shared_vmt=total_vmt)
+                    s_vmt = float(vmt_savings) / float(baseline_vmt) if baseline_vmt > 0 else 0.0
+
+                    total_detour = sum(
+                        max(
+                            0,
+                            (d_arr_times[i] - p_arr_times[i])
+                            - req_list[i].direct_duration_seconds,
+                        )
+                        for i in range(num_reqs)
+                    )
+                    p_detour = (
+                        float(total_detour) / float(total_direct_dur)
+                        if total_direct_dur > 0
+                        else 0.0
+                    )
+
+                    total_wait = sum(
+                        max(0, p_arr_times[i] - req_list[i].earliest_pickup_time)
+                        for i in range(num_reqs)
+                    )
+                    p_wait = (
+                        float(total_wait) / float(num_reqs * policy.max_pickup_delay_seconds)
+                        if policy.max_pickup_delay_seconds > 0
+                        else 0.0
+                    )
+                    p_idle = 0.0
+
+                    j_raw = (
+                        policy.weight_vmt_reduction * s_vmt
+                        - policy.weight_passenger_detour * p_detour
+                        - policy.weight_passenger_wait * p_wait
+                        - policy.weight_driver_idle * p_idle
+                    )
+                    j_display = max(0.0, min(1.0, j_raw + (1.0 - policy.weight_vmt_reduction)))
+
+                    score_breakdown = ScoreBreakdown(
+                        vmt_savings_ratio=round(s_vmt, 6),
+                        detour_penalty_ratio=round(p_detour, 6),
+                        wait_penalty_ratio=round(p_wait, 6),
+                        driver_idle_penalty_ratio=round(p_idle, 6),
+                    )
+
+                    # Build updated RouteStop instances only for confirmed feasible candidates
+                    updated_stops: list[RouteStop] = []
+                    for code in current_stops_encoded:
+                        if code > 0:
+                            idx = code - 1
+                            r = req_list[idx]
+                            updated_stops.append(
+                                RouteStop(
+                                    stop_id=p_ids[idx],
+                                    ride_id="ride-new",
+                                    request_id=r.request_id,
+                                    stop_type=StopType.PICKUP,
+                                    location=r.pickup_location,
+                                    passenger_delta=p_deltas[idx],
+                                    scheduled_arrival_time=p_arr_times[idx],
+                                    promised_window_start=r.earliest_pickup_time,
+                                    promised_window_end=r.earliest_pickup_time,
+                                    status=StopStatus.SCHEDULED,
+                                )
+                            )
+                        else:
+                            idx = -code - 1
+                            r = req_list[idx]
+                            updated_stops.append(
+                                RouteStop(
+                                    stop_id=d_ids[idx],
+                                    ride_id="ride-new",
+                                    request_id=r.request_id,
+                                    stop_type=StopType.DROPOFF,
+                                    location=r.dropoff_location,
+                                    passenger_delta=d_deltas[idx],
+                                    scheduled_arrival_time=d_arr_times[idx],
+                                    promised_window_start=r.earliest_pickup_time,
+                                    promised_window_end=r.latest_dropoff_time,
+                                    status=StopStatus.SCHEDULED,
+                                )
+                            )
+
+                    candidate = CandidateAssignment(
+                        candidate_id=f"cand-{uuid.uuid4().hex[:8]}",
+                        vehicle_id=vehicle.vehicle_id,
+                        existing_ride_id=None,
+                        request_ids=tuple(sorted(r.request_id for r in req_list)),
+                        ordered_stops=tuple(updated_stops),
+                        peak_seat_load=peak_occ,
+                        vmt_meters=total_vmt,
+                        objective_value=round(j_raw, 6),
+                        normalized_score=round(j_display, 4),
+                        score_breakdown=score_breakdown,
+                    )
+                    valid_candidates.append(candidate)
+                    return
+
+                # Branch 1: Pickups for unvisited requests
+                for i in range(num_reqs):
+                    if req_status[i] == 0:
+                        new_occ = current_occ + p_deltas[i]
+                        if new_occ > vehicle.total_seat_capacity:
+                            continue
+
+                        p_id = p_ids[i]
+                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_id)
+                        arr = current_clock + leg_dur
+                        if not check_pickup_delay(
+                            arr, req_list[i].earliest_pickup_time, policy.max_pickup_delay_seconds
+                        ):
+                            continue
+
+                        dep = arr + p_dwells[i]
+                        req_status[i] = 1
+                        p_arr_times[i] = arr
+                        current_stops_encoded.append(i + 1)
+
+                        search_bundles(
+                            current_occ=new_occ,
+                            peak_occ=max(peak_occ, new_occ),
+                            current_clock=dep,
+                            prev_stop_id=p_id,
+                            total_vmt=total_vmt + leg_dist,
+                        )
+
+                        current_stops_encoded.pop()
+                        req_status[i] = 0
+
+                # Branch 2: Dropoffs for picked-up requests
+                for i in range(num_reqs):
+                    if req_status[i] == 1:
+                        new_occ = current_occ + d_deltas[i]
+                        d_id = d_ids[i]
+                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_id)
+                        arr = current_clock + leg_dur
+                        p_arr = p_arr_times[i]
+                        in_veh_dur = max(0, arr - p_arr)
+                        if not check_detour_bound(
+                            in_veh_dur, req_list[i].direct_duration_seconds, policy
+                        ):
+                            continue
+
+                        dep = arr + d_dwells[i]
+                        req_status[i] = 2
+                        d_arr_times[i] = arr
+                        current_stops_encoded.append(-(i + 1))
+
+                        search_bundles(
+                            current_occ=new_occ,
+                            peak_occ=peak_occ,
+                            current_clock=dep,
+                            prev_stop_id=d_id,
+                            total_vmt=total_vmt + leg_dist,
+                        )
+
+                        current_stops_encoded.pop()
+                        req_status[i] = 1
+
+            search_bundles(
+                current_occ=0,
+                peak_occ=0,
+                current_clock=current_time,
+                prev_stop_id=v_stop_id,
+                total_vmt=0,
+            )
+            if deadline_hit:
+                break
 
     # Sort descending by objective value
     valid_candidates.sort(key=lambda c: c.objective_value, reverse=True)
