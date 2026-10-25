@@ -1,9 +1,22 @@
 """Contract for ride storage and transactional concurrency control."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
+
+
+@dataclass(frozen=True)
+class SeatHold:
+    """Record of an active temporary seat hold."""
+    ride_id: str
+    request_id: str
+    join_request_id: str
+    seat_count: int
+    submitted_at: int
+    expires_at: int
+    idempotency_token: str
 
 
 class StorageProviderError(Exception):
@@ -113,4 +126,28 @@ class RideStorageProvider(ABC):
         reason: Optional[str] = None
     ) -> bool:
         """Atomically releases a temporary seat hold or cancels a reservation."""
+        pass
+
+    @abstractmethod
+    def get_active_seat_holds(
+        self,
+        ride_id: str,
+        current_time: Optional[int] = None,
+    ) -> Sequence[SeatHold]:
+        """
+        Retrieves all currently active (unexpired) temporary seat holds for the specified ride.
+
+        If current_time is provided, a hold is considered active if current_time <= hold.expires_at.
+        Expired holds (current_time > hold.expires_at) must not be returned.
+        """
+        pass
+
+    @abstractmethod
+    def sweep_expired_holds(self, current_time: int) -> Sequence[str]:
+        """
+        Sweeps and cleans up all temporary seat holds where current_time > hold.expires_at.
+
+        Returns the sequence of join_request_ids corresponding to the swept expired holds.
+        Repeated calls with the same or earlier current_time must be idempotent and safe.
+        """
         pass

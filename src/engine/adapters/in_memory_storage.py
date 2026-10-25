@@ -1,25 +1,12 @@
 """Thread-safe in-memory storage adapter implementing RideStorageProvider."""
 
-from dataclasses import dataclass
 import threading
 from typing import Any, Optional, Sequence
 
-from engine.contracts.storage import RideStorageProvider, VersionConflictError
+from engine.contracts.storage import RideStorageProvider, SeatHold, VersionConflictError
 from engine.domain.enums import RideStatus
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.routing.invariants import check_capacity_profile
-
-
-@dataclass(frozen=True)
-class SeatHold:
-    """Internal record of a temporary seat hold."""
-    ride_id: str
-    request_id: str
-    join_request_id: str
-    seat_count: int
-    submitted_at: int
-    expires_at: int
-    idempotency_token: str
 
 
 class InMemoryRideStorage(RideStorageProvider):
@@ -301,6 +288,27 @@ class InMemoryRideStorage(RideStorageProvider):
     def get_seat_hold(self, join_request_id: str) -> Optional[SeatHold]:
         with self._lock:
             return self._holds.get(join_request_id)
+
+    def get_active_seat_holds(
+        self,
+        ride_id: str,
+        current_time: Optional[int] = None,
+    ) -> Sequence[SeatHold]:
+        """Returns all active temporary seat holds for a ride."""
+        with self._lock:
+            active: list[SeatHold] = []
+            for hold in list(self._holds.values()):
+                if hold.ride_id != ride_id:
+                    continue
+                if current_time is not None:
+                    if current_time <= hold.expires_at:
+                        active.append(hold)
+                    else:
+                        # Auto-clean expired hold if observed
+                        del self._holds[hold.join_request_id]
+                else:
+                    active.append(hold)
+            return active
 
     def sweep_expired_holds(self, current_time: int) -> list[str]:
         """Auto-releases all holds where current_time > expires_at."""

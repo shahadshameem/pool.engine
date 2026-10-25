@@ -10,8 +10,20 @@
 
 ```python
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Sequence, Optional
 from engine.domain.models import Ride, RideRequest, JoinRequest, Vehicle, Driver
+
+@dataclass(frozen=True)
+class SeatHold:
+    """Record of an active temporary seat hold."""
+    ride_id: str
+    request_id: str
+    join_request_id: str
+    seat_count: int
+    submitted_at: int
+    expires_at: int
+    idempotency_token: str
 
 class RideStorageProvider(ABC):
     """
@@ -119,6 +131,28 @@ class RideStorageProvider(ABC):
     @abstractmethod
     def get_join_request(self, join_request_id: str) -> Optional[JoinRequest]:
         """Loads a JoinRequest by ID."""
+        pass
+
+    @abstractmethod
+    def get_active_seat_holds(
+        self,
+        ride_id: str,
+        current_time: Optional[int] = None,
+    ) -> Sequence[SeatHold]:
+        """
+        Retrieves all currently active (unexpired) temporary seat holds for the specified ride.
+        If current_time is provided, a hold is active if current_time <= hold.expires_at.
+        Expired holds (current_time > hold.expires_at) must not be returned.
+        """
+        pass
+
+    @abstractmethod
+    def sweep_expired_holds(self, current_time: int) -> Sequence[str]:
+        """
+        Sweeps and cleans up all temporary seat holds where current_time > hold.expires_at.
+        Returns the sequence of join_request_ids corresponding to swept expired holds.
+        Repeated calls with the same or earlier current_time must be safe and idempotent.
+        """
         pass
 ```
 

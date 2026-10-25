@@ -195,10 +195,10 @@ def submit_join_request(
                 curr_occ += stop.passenger_delta
                 if curr_occ > peak_occ:
                     peak_occ = curr_occ
-            holds = getattr(storage, "_holds", {})
+            active_holds = storage.get_active_seat_holds(ride_id, current_time=current_time)
             active_held_seats = sum(
-                h.seat_count for h in holds.values()
-                if h.ride_id == ride_id and current_time <= h.expires_at and h.join_request_id != join_req.join_request_id
+                h.seat_count for h in active_holds
+                if h.join_request_id != join_req.join_request_id
             )
             if peak_occ + active_held_seats + join_req.seat_count <= capacity:
                 continue
@@ -544,11 +544,9 @@ def expire_stale_holds(
     Sweeps storage and transitions all expired holds (current_time > expires_at)
     to EXPIRED status, freeing held seats.
     """
-    if hasattr(storage, "sweep_expired_holds"):
-        expired_ids: list[str] = getattr(storage, "sweep_expired_holds")(current_time)
-        for j_id in expired_ids:
-            jr = storage.get_join_request(j_id)
-            if jr is not None and jr.status == JoinStatus.PENDING:
-                storage.save_join_request(jr.model_copy(update={"status": JoinStatus.EXPIRED}))
-        return expired_ids
-    return []
+    expired_ids = list(storage.sweep_expired_holds(current_time))
+    for j_id in expired_ids:
+        jr = storage.get_join_request(j_id)
+        if jr is not None and jr.status == JoinStatus.PENDING:
+            storage.save_join_request(jr.model_copy(update={"status": JoinStatus.EXPIRED}))
+    return expired_ids
