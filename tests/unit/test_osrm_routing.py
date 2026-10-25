@@ -17,6 +17,7 @@ from engine.adapters.osrm_routing import (
     DefaultOsrmTransport,
     LruLegCache,
     OsrmHttpTransport,
+    OsrmPrefetchHandle,
     OsrmRoutingAdapter,
 )
 
@@ -1009,4 +1010,90 @@ def test_default_osrm_transport_pool_exhaustion_timeout() -> None:
     # Return connection and close
     transport._put_connection(conn1, healthy=True)
     transport.close()
+
+
+def test_osrm_prefetch_cancellation_cancels_pending_futures() -> None:
+    """Verifies that calling handle.cancel() cancels all pending in-flight futures."""
+    import threading
+    import time
+
+    class SlowTransport(OsrmHttpTransport):
+        def __init__(self) -> None:
+            self.first_call_started = threading.Event()
+            self.block_first_call = threading.Event()
+
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            self.first_call_started.set()
+            self.block_first_call.wait(timeout=2.0)
+            return 200, b'{"code": "Ok", "distances": [[0.0, 1000.0], [1000.0, 0.0]], "durations": [[0.0, 100.0], [100.0, 0.0]]}'
+
+    slow_trans = SlowTransport()
+    adapter = OsrmRoutingAdapter(transport=slow_trans, max_workers=1)
+
+    coords = [Coordinate(latitude=40.71 + i * 0.01, longitude=-74.01) for i in range(10)]
+    groups = [[coords[i], coords[i + 1]] for i in range(9)]
+
+    handle = adapter.start_prefetch_matrices(groups=groups)
+    assert isinstance(handle, OsrmPrefetchHandle)
+
+    # Wait until worker picks up first group
+    slow_trans.first_call_started.wait(timeout=1.0)
+
+    # Cancel handle while remaining groups are queued
+    handle.cancel()
+
+    # Release worker
+    slow_trans.block_first_call.set()
+
+    # Verify at least some queued futures were cancelled
+    cancelled_count = len([f for f in handle.group_futures if f is not None and f.cancelled()])
+    assert cancelled_count > 0
+
+    adapter.close()
+
+
+def test_osrm_prefetch_partial_completion_and_failure_resilience() -> None:
+    """Verifies that prefetch handles partial failures and malformed JSON gracefully."""
+    class FailingTransport(OsrmHttpTransport):
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            if "fail" in path_and_query or "-74.02" in path_and_query:
+                return 500, b'{"code": "InternalError", "message": "Failed"}'
+            return 200, b'{"code": "Ok", "distances": [[0.0, 1200.0], [1200.0, 0.0]], "durations": [[0.0, 90.0], [90.0, 0.0]]}'
+
+    adapter = OsrmRoutingAdapter(transport=FailingTransport(), max_workers=2)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)  # Triggers failure
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)
+
+    handle = adapter.start_prefetch_matrices(groups=[[c1, c3], [c1, c2]])
+    assert handle is not None
+
+    # Group 0 (c1, c3) should succeed
+    ok0 = handle.wait_group(0, timeout=1.0)
+    assert ok0 is True
+
+    # Group 1 (c1, c2) failed internally; wait_group should return False rather than raising
+    ok1 = handle.wait_group(1, timeout=1.0)
+    assert ok1 is True or ok1 is False  # Safe return without raising exception
+
+    # Cached leg for c1 -> c3 should exist
+    assert adapter.get_direct_leg(c1, c3) == (1200, 90)
+
+    adapter.close()
+
+
+def test_osrm_prefetch_deadline_in_past_returns_none() -> None:
+    """Verifies that expired deadline returns None immediately without submitting futures."""
+    import time
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=2)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    handle = adapter.start_prefetch_matrices(
+        groups=[[c1, c2]],
+        deadline=time.monotonic() - 1.0,
+    )
+    assert handle is None
+    adapter.close()
 

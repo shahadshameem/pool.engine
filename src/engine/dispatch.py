@@ -546,93 +546,94 @@ class DispatchEngine:
                 reserved_headroom=prefetch_headroom,
             )
 
-        # Stage 3 & 4: Route Insertion & Group Bundling
-        for idx, (veh, active_ride, eval_reqs, v_wps) in enumerate(vehicle_eval_plan):
-            if time.monotonic() > effective_deadline - reserved_headroom:
-                search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                is_approximated = True
-                break
+        try:
+            # Stage 3 & 4: Route Insertion & Group Bundling
+            for idx, (veh, active_ride, eval_reqs, v_wps) in enumerate(vehicle_eval_plan):
+                if time.monotonic() > effective_deadline - reserved_headroom:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    is_approximated = True
+                    break
 
-            # If pipelined prefetch is active, wait for this specific vehicle's group
+                # If pipelined prefetch is active, wait for this specific vehicle's group
+                if prefetch_handle is not None:
+                    rem_budget = max(0.001, (effective_deadline - reserved_headroom) - time.monotonic())
+                    try:
+                        prefetch_handle.wait_group(idx, timeout=rem_budget)
+                    except TimeoutError:
+                        search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                        is_approximated = True
+                        break
+                    except Exception:
+                        pass
+
+                if time.monotonic() > effective_deadline - reserved_headroom:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    is_approximated = True
+                    break
+
+                max_bundle_reqs = (
+                    effective_config.max_requests_per_vehicle
+                    if effective_config.mode != DispatchMode.EXACT
+                    else None
+                )
+
+                # Defensive per-vehicle fallback prefetch (instant O(1) no-op if already cached)
+                if (
+                    prefetch_handle is None
+                    and type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
+                    and eval_reqs
+                ):
+                    self.routing_provider.prefetch_matrix(
+                        origins=v_wps,
+                        destinations=v_wps,
+                        deadline=effective_deadline,
+                        reserved_headroom=reserved_headroom,
+                    )
+
+                if active_ride is not None:
+                    ins_cands = generate_active_ride_insertions(
+                        active_ride=active_ride,
+                        requests=eval_reqs,
+                        vehicle=veh,
+                        router=self.routing_provider,
+                        policy=policy,
+                        current_time=current_time,
+                        max_bundle_size=effective_config.max_bundle_size,
+                        deadline=effective_deadline,
+                        reserved_headroom=reserved_headroom,
+                        max_bundle_requests=max_bundle_reqs,
+                        shared_leg_cache=shared_leg_cache,
+                        shared_routing_errors=shared_routing_errors,
+                        propagate_routing_errors=effective_config.propagate_routing_errors,
+                    )
+                    candidates.extend(ins_cands)
+                    if time.monotonic() > effective_deadline - reserved_headroom:
+                        search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                        is_approximated = True
+                        break
+                else:
+                    bundle_cands = generate_group_bundles(
+                        requests=eval_reqs,
+                        vehicle=veh,
+                        router=self.routing_provider,
+                        policy=policy,
+                        current_time=current_time,
+                        max_bundle_size=effective_config.max_bundle_size,
+                        deadline=effective_deadline,
+                        reserved_headroom=reserved_headroom,
+                        max_bundle_requests=max_bundle_reqs,
+                        shared_leg_cache=shared_leg_cache,
+                        shared_routing_errors=shared_routing_errors,
+                        propagate_routing_errors=effective_config.propagate_routing_errors,
+                    )
+                    candidates.extend(bundle_cands)
+                    if time.monotonic() > effective_deadline - reserved_headroom:
+                        search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                        is_approximated = True
+                        break
+        finally:
             if prefetch_handle is not None:
-                rem_budget = max(0.001, (effective_deadline - reserved_headroom) - time.monotonic())
-                try:
-                    prefetch_handle.wait_group(idx, timeout=rem_budget)
-                except TimeoutError:
-                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                    is_approximated = True
-                    break
-                except Exception:
-                    pass
-
-            if time.monotonic() > effective_deadline - reserved_headroom:
-                search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                is_approximated = True
-                break
-
-            max_bundle_reqs = (
-                effective_config.max_requests_per_vehicle
-                if effective_config.mode != DispatchMode.EXACT
-                else None
-            )
-
-            # Defensive per-vehicle fallback prefetch (instant O(1) no-op if already cached)
-            if (
-                prefetch_handle is None
-                and type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
-                and eval_reqs
-            ):
-                self.routing_provider.prefetch_matrix(
-                    origins=v_wps,
-                    destinations=v_wps,
-                    deadline=effective_deadline,
-                    reserved_headroom=reserved_headroom,
-                )
-
-            if active_ride is not None:
-                ins_cands = generate_active_ride_insertions(
-                    active_ride=active_ride,
-                    requests=eval_reqs,
-                    vehicle=veh,
-                    router=self.routing_provider,
-                    policy=policy,
-                    current_time=current_time,
-                    max_bundle_size=effective_config.max_bundle_size,
-                    deadline=effective_deadline,
-                    reserved_headroom=reserved_headroom,
-                    max_bundle_requests=max_bundle_reqs,
-                    shared_leg_cache=shared_leg_cache,
-                    shared_routing_errors=shared_routing_errors,
-                    propagate_routing_errors=effective_config.propagate_routing_errors,
-                )
-                candidates.extend(ins_cands)
-                if time.monotonic() > effective_deadline - reserved_headroom:
-                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                    is_approximated = True
-                    break
-            else:
-                bundle_cands = generate_group_bundles(
-                    requests=eval_reqs,
-                    vehicle=veh,
-                    router=self.routing_provider,
-                    policy=policy,
-                    current_time=current_time,
-                    max_bundle_size=effective_config.max_bundle_size,
-                    deadline=effective_deadline,
-                    reserved_headroom=reserved_headroom,
-                    max_bundle_requests=max_bundle_reqs,
-                    shared_leg_cache=shared_leg_cache,
-                    shared_routing_errors=shared_routing_errors,
-                    propagate_routing_errors=effective_config.propagate_routing_errors,
-                )
-                candidates.extend(bundle_cands)
-                if time.monotonic() > effective_deadline - reserved_headroom:
-                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                    is_approximated = True
-                    break
-
-        if prefetch_handle is not None:
-            prefetch_handle.cancel()
+                prefetch_handle.cancel()
 
         if shared_routing_errors and search_status != SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
             if effective_config.mode == DispatchMode.EXACT:

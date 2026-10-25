@@ -1,6 +1,7 @@
 """Unit tests for top-level unified dispatch engine facade (T051)."""
 
 import time
+from typing import Sequence
 import pytest
 
 from engine.adapters.default_policy import DefaultPolicyProvider
@@ -437,3 +438,67 @@ def test_dispatch_batch_candidate_vehicle_capping_and_prioritization() -> None:
     assert len(res.selected_assignments) == 1
     # Verify the closest vehicle was selected because it was prioritized
     assert res.selected_assignments[0].vehicle_id == "veh-close"
+
+
+def test_dispatch_batch_prefetch_leak_prevention_on_exception() -> None:
+    """Verifies that prefetch handle is cancelled even when candidate generation raises an exception."""
+    from unittest.mock import patch
+    from engine.contracts.routing import Coordinate, RoutingPrefetchHandle
+
+    class DummyHandle(RoutingPrefetchHandle):
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def wait_group(self, index: int, timeout: float | None = None) -> bool:
+            return True
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class FailingSpyRouter(MockRoutingProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.handle = DummyHandle()
+
+        def start_prefetch_matrices(
+            self,
+            groups: Sequence[Sequence[Coordinate]],
+            deadline: float | None = None,
+            reserved_headroom: float = 0.050,
+        ) -> RoutingPrefetchHandle | None:
+            return self.handle
+
+    spy = FailingSpyRouter()
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=spy,
+        spatial_index=H3SpatialIndexAdapter(),
+    )
+
+    req1 = _make_sample_request("req-fail-1", 40.7128, -74.0060, 40.7200, -74.0050)
+    veh1 = _make_sample_vehicle("veh-fail-1", 40.7130, -74.0055, capacity=4)
+
+    with patch("engine.dispatch.generate_group_bundles", side_effect=RuntimeError("Simulated solver crash")):
+        with pytest.raises(RuntimeError, match="Simulated solver crash"):
+            engine.dispatch_batch(
+                requests=[req1],
+                vehicles=[veh1],
+                active_rides=[],
+                current_time=1000,
+            )
+
+    # Invariant: handle must have been cancelled via finally block
+    assert spy.handle.cancelled is True
+
+
+def test_exact_mode_preserves_untruncated_candidate_vehicles() -> None:
+    """Verifies that DispatchMode.EXACT does not truncate candidate vehicles to 32."""
+    from engine.dispatch import CandidateGenerationConfig
+    from engine.domain.enums import DispatchMode
+
+    cfg = CandidateGenerationConfig.exact()
+    assert cfg.mode == DispatchMode.EXACT
+    assert cfg.max_candidate_vehicles is None
+    assert cfg.max_vehicles_per_request is None
+    assert cfg.max_requests_per_vehicle is None
+    assert cfg.max_search_radius_meters is None
