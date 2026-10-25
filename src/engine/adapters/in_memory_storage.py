@@ -125,8 +125,13 @@ class InMemoryRideStorage(RideStorageProvider):
                     and rec.get("request_id") == request_id
                     and rec.get("ride_id") == ride_id
                 ):
-                    if join_request_id in self._holds:
-                        return True
+                    hold = self._holds.get(join_request_id)
+                    if hold is not None:
+                        if submitted_at <= hold.expires_at:
+                            return True
+                        else:
+                            del self._holds[join_request_id]
+                            return False
                     return False
                 return False
 

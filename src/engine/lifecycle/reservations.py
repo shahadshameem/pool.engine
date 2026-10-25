@@ -8,6 +8,7 @@ from engine.contracts.routing import RoadNetworkRoutingProvider
 from engine.contracts.storage import RideStorageProvider
 from engine.domain.enums import JoinStatus, RequestStatus, StopType
 from engine.domain.models import JoinRequest, Ride, RideRequest, Vehicle
+from engine.lifecycle.transitions import LifecycleTransitionError
 from engine.optimization.tie_breaking import candidate_sort_key
 from engine.routing.invariants import check_detour_bound
 from engine.routing.insertion import generate_single_request_insertions
@@ -31,6 +32,7 @@ def submit_join_request(
     idempotency_token: str,
     user_id: Optional[str] = None,
     join_request_id: Optional[str] = None,
+    max_retries: int = 5,
 ) -> ReservationResult:
     """
     Submits a new join request and attempts to acquire an atomic temporary seat hold.
@@ -43,29 +45,8 @@ def submit_join_request(
         else f"join-{idempotency_token}"
     )
 
-    # Replay check
-    existing = storage.get_join_request(effective_join_id)
-    if existing is not None:
-        if (
-            existing.request_id != request.request_id
-            or existing.ride_id != ride_id
-            or (existing.idempotency_token is not None and existing.idempotency_token != idempotency_token)
-        ):
-            return ReservationResult(
-                success=False,
-                join_request=existing,
-                rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
-            )
-        ride_snapshot = storage.get_ride(ride_id)
-        return ReservationResult(
-            success=(existing.status in (JoinStatus.PENDING, JoinStatus.APPROVED)),
-            join_request=existing,
-            ride=ride_snapshot,
-            rejection_reason="OVER_CAPACITY" if existing.status == JoinStatus.REJECTED else None,
-        )
-
-    ride = storage.get_ride(ride_id)
-    if ride is None:
+    # Validate request status and expiry
+    if request.status in (RequestStatus.CANCELLED, RequestStatus.EXPIRED):
         dummy_jr = JoinRequest(
             join_request_id=effective_join_id,
             ride_id=ride_id,
@@ -80,10 +61,68 @@ def submit_join_request(
         return ReservationResult(
             success=False,
             join_request=dummy_jr,
-            rejection_reason="RIDE_NOT_FOUND",
+            rejection_reason="REQUEST_CANCELLED" if request.status == RequestStatus.CANCELLED else "REQUEST_EXPIRED",
         )
 
-    expires_at = current_time + policy.join_request_expiry_seconds
+    if current_time > request.latest_dropoff_time:
+        dummy_jr = JoinRequest(
+            join_request_id=effective_join_id,
+            ride_id=ride_id,
+            request_id=request.request_id,
+            user_id=user_id if user_id is not None else request.user_id,
+            seat_count=request.seat_count,
+            submitted_at=current_time,
+            expires_at=current_time + policy.join_request_expiry_seconds,
+            status=JoinStatus.REJECTED,
+            idempotency_token=idempotency_token,
+        )
+        return ReservationResult(
+            success=False,
+            join_request=dummy_jr,
+            rejection_reason="REQUEST_EXPIRED",
+        )
+
+    # Replay check
+    existing = storage.get_join_request(effective_join_id)
+    if existing is not None:
+        if (
+            existing.request_id != request.request_id
+            or existing.ride_id != ride_id
+            or (existing.idempotency_token is not None and existing.idempotency_token != idempotency_token)
+        ):
+            return ReservationResult(
+                success=False,
+                join_request=existing,
+                rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
+            )
+        # Check if the existing pending join request has expired by current_time
+        if existing.status == JoinStatus.PENDING and current_time > existing.expires_at:
+            storage.release_seats_atomic(
+                ride_id=existing.ride_id,
+                join_request_id=existing.join_request_id,
+                reason="EXPIRED",
+            )
+            expired_jr = existing.model_copy(update={"status": JoinStatus.EXPIRED})
+            storage.save_join_request(expired_jr)
+            return ReservationResult(
+                success=False,
+                join_request=expired_jr,
+                rejection_reason="EXPIRED",
+            )
+        ride_snapshot = storage.get_ride(ride_id)
+        rejection_reason = None
+        if existing.status == JoinStatus.REJECTED:
+            rejection_reason = "OVER_CAPACITY"
+        elif existing.status == JoinStatus.EXPIRED:
+            rejection_reason = "EXPIRED"
+        return ReservationResult(
+            success=(existing.status in (JoinStatus.PENDING, JoinStatus.APPROVED)),
+            join_request=existing,
+            ride=ride_snapshot,
+            rejection_reason=rejection_reason,
+        )
+
+    # Attempt atomic temporary seat hold with OCC retry
     join_req = JoinRequest(
         join_request_id=effective_join_id,
         ride_id=ride_id,
@@ -91,25 +130,44 @@ def submit_join_request(
         user_id=user_id if user_id is not None else request.user_id,
         seat_count=request.seat_count,
         submitted_at=current_time,
-        expires_at=expires_at,
+        expires_at=current_time + policy.join_request_expiry_seconds,
         status=JoinStatus.PENDING,
         idempotency_token=idempotency_token,
     )
 
-    # Attempt atomic temporary seat hold
-    acquired = storage.acquire_seat_hold_atomic(
-        ride_id=ride.ride_id,
-        request_id=request.request_id,
-        join_request_id=join_req.join_request_id,
-        seat_count=join_req.seat_count,
-        submitted_at=current_time,
-        expires_at=expires_at,
-        expected_version=ride.version,
-        idempotency_token=idempotency_token,
-    )
+    for _ in range(max_retries):
+        ride = storage.get_ride(ride_id)
+        if ride is None:
+            dummy_jr = join_req.model_copy(update={"status": JoinStatus.REJECTED})
+            return ReservationResult(
+                success=False,
+                join_request=dummy_jr,
+                rejection_reason="RIDE_NOT_FOUND",
+            )
 
-    if not acquired:
-        rejection_reason = "OVER_CAPACITY"
+        expires_at = current_time + policy.join_request_expiry_seconds
+        join_req = join_req.model_copy(update={"expires_at": expires_at})
+
+        acquired = storage.acquire_seat_hold_atomic(
+            ride_id=ride.ride_id,
+            request_id=request.request_id,
+            join_request_id=join_req.join_request_id,
+            seat_count=join_req.seat_count,
+            submitted_at=current_time,
+            expires_at=expires_at,
+            expected_version=ride.version,
+            idempotency_token=idempotency_token,
+        )
+
+        if acquired:
+            storage.save_join_request(join_req)
+            updated_ride = storage.get_ride(ride_id)
+            return ReservationResult(
+                success=True,
+                join_request=join_req,
+                ride=updated_ride,
+            )
+
         if hasattr(storage, "_idempotency_records"):
             records = getattr(storage, "_idempotency_records", {})
             rec = records.get(idempotency_token)
@@ -118,21 +176,41 @@ def submit_join_request(
                 or rec.get("request_id") != request.request_id
                 or rec.get("ride_id") != ride.ride_id
             ):
-                rejection_reason = "IDEMPOTENCY_TOKEN_CONFLICT"
-        rejected_jr = join_req.model_copy(update={"status": JoinStatus.REJECTED})
-        storage.save_join_request(rejected_jr)
-        return ReservationResult(
-            success=False,
-            join_request=rejected_jr,
-            rejection_reason=rejection_reason,
-        )
+                rejected_jr = join_req.model_copy(update={"status": JoinStatus.REJECTED})
+                storage.save_join_request(rejected_jr)
+                return ReservationResult(
+                    success=False,
+                    join_request=rejected_jr,
+                    rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
+                )
 
-    storage.save_join_request(join_req)
-    updated_ride = storage.get_ride(ride_id)
+        # Check if failure was an optimistic concurrency version mismatch
+        latest_ride = storage.get_ride(ride_id)
+        if latest_ride is not None and latest_ride.version != ride.version:
+            vehicle = storage.get_vehicle(latest_ride.vehicle_id)
+            capacity = vehicle.total_seat_capacity if vehicle is not None else 4
+            curr_occ = latest_ride.active_passenger_count
+            peak_occ = curr_occ
+            for stop in latest_ride.stops:
+                curr_occ += stop.passenger_delta
+                if curr_occ > peak_occ:
+                    peak_occ = curr_occ
+            holds = getattr(storage, "_holds", {})
+            active_held_seats = sum(
+                h.seat_count for h in holds.values()
+                if h.ride_id == ride_id and current_time <= h.expires_at and h.join_request_id != join_req.join_request_id
+            )
+            if peak_occ + active_held_seats + join_req.seat_count <= capacity:
+                continue
+
+        break
+
+    rejected_jr = join_req.model_copy(update={"status": JoinStatus.REJECTED})
+    storage.save_join_request(rejected_jr)
     return ReservationResult(
-        success=True,
-        join_request=join_req,
-        ride=updated_ride,
+        success=False,
+        join_request=rejected_jr,
+        rejection_reason="OVER_CAPACITY",
     )
 
 
@@ -298,26 +376,36 @@ def confirm_join_request(
     # Pick best candidate using deterministic tie-breaking sort key
     best_candidate = sorted(candidates, key=candidate_sort_key())[0]
 
-    # 4. Atomic Commit
-    committed = storage.reserve_seats_atomic(
-        ride_id=ride.ride_id,
-        request_id=request.request_id,
-        join_request_id=join_request.join_request_id,
-        seat_count=join_request.seat_count,
-        expected_version=ride.version,
-        idempotency_token=token,
-        new_stops=best_candidate.ordered_stops,
-        current_time=current_time,
-    )
-
-    if not committed:
-        storage.release_seats_atomic(
+    # 4. Atomic Commit with OCC retry
+    max_commit_retries = 3
+    for _ in range(max_commit_retries):
+        committed = storage.reserve_seats_atomic(
             ride_id=ride.ride_id,
+            request_id=request.request_id,
             join_request_id=join_request.join_request_id,
-            reason="OVER_CAPACITY",
+            seat_count=join_request.seat_count,
+            expected_version=ride.version,
+            idempotency_token=token,
+            new_stops=best_candidate.ordered_stops,
+            current_time=current_time,
         )
-        rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
-        rejection_reason = "OVER_CAPACITY"
+
+        if committed:
+            approved_jr = join_request.model_copy(update={"status": JoinStatus.APPROVED})
+            storage.save_join_request(approved_jr)
+
+            updated_req = request.model_copy(
+                update={"status": RequestStatus.MATCHED, "matched_ride_id": ride.ride_id}
+            )
+            storage.save_request(updated_req)
+
+            updated_ride = storage.get_ride(ride.ride_id)
+            return ReservationResult(
+                success=True,
+                join_request=approved_jr,
+                ride=updated_ride,
+            )
+
         if hasattr(storage, "_idempotency_records"):
             records = getattr(storage, "_idempotency_records", {})
             rec = records.get(token)
@@ -326,27 +414,81 @@ def confirm_join_request(
                 or rec.get("request_id") != request.request_id
                 or rec.get("ride_id") != ride.ride_id
             ):
-                rejection_reason = "IDEMPOTENCY_TOKEN_CONFLICT"
-        storage.save_join_request(rejected_jr)
-        return ReservationResult(
-            success=False,
-            join_request=rejected_jr,
-            rejection_reason=rejection_reason,
-        )
+                storage.release_seats_atomic(
+                    ride_id=ride.ride_id,
+                    join_request_id=join_request.join_request_id,
+                    reason="IDEMPOTENCY_TOKEN_CONFLICT",
+                )
+                rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
+                storage.save_join_request(rejected_jr)
+                return ReservationResult(
+                    success=False,
+                    join_request=rejected_jr,
+                    rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
+                )
 
-    approved_jr = join_request.model_copy(update={"status": JoinStatus.APPROVED})
-    storage.save_join_request(approved_jr)
+        # Check if failure was an optimistic concurrency version mismatch
+        latest_ride = storage.get_ride(ride.ride_id)
+        if latest_ride is not None and latest_ride.version != ride.version:
+            ride = latest_ride
+            raw_candidates = generate_single_request_insertions(
+                active_ride=ride,
+                request=request,
+                vehicle=vehicle,
+                router=router,
+                policy=active_policy,
+                current_time=current_time,
+            )
+            candidates = []
+            for cand in raw_candidates:
+                cand_feasible = True
+                for s in cand.ordered_stops:
+                    if s.stop_type == StopType.DROPOFF:
+                        stored_req = storage.get_request(s.request_id)
+                        if stored_req is not None:
+                            p_stop = next(
+                                (p for p in cand.ordered_stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
+                                None,
+                            )
+                            p_time = (
+                                p_stop.scheduled_arrival_time
+                                if p_stop is not None
+                                else (
+                                    next(
+                                        (p.actual_arrival_time or p.scheduled_arrival_time
+                                         for p in ride.stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
+                                        ride.scheduled_departure_time,
+                                    )
+                                )
+                            )
+                            d_time = s.scheduled_arrival_time
+                            dur = max(0, d_time - p_time)
+                            if not check_detour_bound(
+                                actual_duration=dur,
+                                direct_duration=stored_req.direct_duration_seconds,
+                                policy=active_policy,
+                            ):
+                                cand_feasible = False
+                                break
+                if cand_feasible:
+                    candidates.append(cand)
+            if candidates:
+                best_candidate = sorted(candidates, key=candidate_sort_key())[0]
+                continue
 
-    updated_req = request.model_copy(
-        update={"status": RequestStatus.MATCHED, "matched_ride_id": ride.ride_id}
+        break
+
+    storage.release_seats_atomic(
+        ride_id=ride.ride_id,
+        join_request_id=join_request.join_request_id,
+        reason="OVER_CAPACITY",
     )
-    storage.save_request(updated_req)
-
-    updated_ride = storage.get_ride(ride.ride_id)
+    rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
+    storage.save_join_request(rejected_jr)
     return ReservationResult(
-        success=True,
-        join_request=approved_jr,
-        ride=updated_ride,
+        success=False,
+        join_request=rejected_jr,
+        rejection_reason="OVER_CAPACITY",
     )
 
 
@@ -359,6 +501,25 @@ def reject_join_request(
     join_request = storage.get_join_request(join_request_id)
     if join_request is None:
         raise ValueError(f"JoinRequest {join_request_id} not found in storage")
+
+    if join_request.status == JoinStatus.APPROVED:
+        raise LifecycleTransitionError(
+            f"Cannot reject join request {join_request_id}: already APPROVED. Use cancel_en_route_request instead."
+        )
+
+    if join_request.status == JoinStatus.REJECTED:
+        return ReservationResult(
+            success=False,
+            join_request=join_request,
+            rejection_reason=reason,
+        )
+
+    if join_request.status == JoinStatus.EXPIRED:
+        return ReservationResult(
+            success=False,
+            join_request=join_request,
+            rejection_reason="EXPIRED",
+        )
 
     storage.release_seats_atomic(
         ride_id=join_request.ride_id,

@@ -11,6 +11,7 @@ from engine.adapters.mock_routing import MockRoutingProvider
 from engine.contracts.policy import DispatchPolicy
 from engine.domain.enums import JoinStatus, RequestStatus, RideStatus, StopStatus, StopType
 from engine.domain.models import GeoCoordinate, JoinRequest, Ride, RideRequest, RouteStop, Vehicle
+from engine.lifecycle.transitions import LifecycleTransitionError
 from engine.lifecycle.reservations import (
     ReservationResult,
     confirm_join_request,
@@ -876,4 +877,257 @@ def test_acquire_seat_hold_atomic_token_reuse_different_join_fails() -> None:
     )
     assert hold2_conflict is False
 
+
+def test_concurrent_submissions_multi_capacity_occ_retry() -> None:
+    """
+    Verifies that multiple concurrent join request submissions on a multi-capacity
+    vehicle succeed via optimistic concurrency retries without false OVER_CAPACITY rejections.
+    """
+    vehicle, ride, storage = _create_test_entities(vehicle_capacity=4)
+    policy = DispatchPolicy(join_request_expiry_seconds=300)
+
+    requests = [
+        RideRequest(
+            request_id=f"req-multi-{i}",
+            user_id=f"user-multi-{i}",
+            pickup_location=GeoCoordinate(latitude=40.7128 + i * 0.001, longitude=-74.0060),
+            dropoff_location=GeoCoordinate(latitude=40.7589 + i * 0.001, longitude=-73.9851),
+            seat_count=1,
+            earliest_pickup_time=1000,
+            latest_dropoff_time=4000,
+            direct_distance_meters=5000,
+            direct_duration_seconds=600,
+            status=RequestStatus.PENDING,
+        )
+        for i in range(4)
+    ]
+    for r in requests:
+        storage.save_request(r)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [
+            ex.submit(submit_join_request, req, ride.ride_id, storage, policy, 1000, f"token-multi-{req.request_id}")
+            for req in requests
+        ]
+        results = [f.result() for f in futures]
+
+    approved = [r for r in results if r.success]
+    rejected = [r for r in results if not r.success]
+    assert len(approved) == 4, f"Expected 4 approved holds, got {len(approved)}"
+    assert len(rejected) == 0, f"Expected 0 rejected, got {len(rejected)}"
+
+
+def test_concurrent_confirmations_multi_capacity_occ_retry() -> None:
+    """
+    Verifies that concurrent confirmations on a multi-capacity vehicle succeed
+    via OCC retries when capacity and detour bounds remain satisfied.
+    """
+    vehicle, ride, storage = _create_test_entities(vehicle_capacity=4)
+    policy_provider = DefaultPolicyProvider()
+    router = MockRoutingProvider(average_speed_kmh=40.0)
+
+    req1 = RideRequest(
+        request_id="req-conf-race-1",
+        user_id="user-conf-1",
+        pickup_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        dropoff_location=GeoCoordinate(latitude=40.7589, longitude=-73.9851),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=4000,
+        direct_distance_meters=5000,
+        direct_duration_seconds=600,
+        status=RequestStatus.PENDING,
+    )
+    req2 = RideRequest(
+        request_id="req-conf-race-2",
+        user_id="user-conf-2",
+        pickup_location=GeoCoordinate(latitude=40.7130, longitude=-74.0062),
+        dropoff_location=GeoCoordinate(latitude=40.7590, longitude=-73.9850),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=4000,
+        direct_distance_meters=5000,
+        direct_duration_seconds=600,
+        status=RequestStatus.PENDING,
+    )
+    storage.save_request(req1)
+    storage.save_request(req2)
+
+    sub1 = submit_join_request(req1, ride.ride_id, storage, policy_provider.get_policy(), 1000, "token-conf-1")
+    sub2 = submit_join_request(req2, ride.ride_id, storage, policy_provider.get_policy(), 1000, "token-conf-2")
+    assert sub1.success and sub2.success
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(
+            confirm_join_request,
+            sub1.join_request.join_request_id,
+            storage,
+            policy_provider,
+            router,
+            1010,
+            "token-conf-1",
+        )
+        f2 = ex.submit(
+            confirm_join_request,
+            sub2.join_request.join_request_id,
+            storage,
+            policy_provider,
+            router,
+            1010,
+            "token-conf-2",
+        )
+        res1 = f1.result()
+        res2 = f2.result()
+
+    assert res1.success is True
+    assert res2.success is True
+    updated_ride = storage.get_ride(ride.ride_id)
+    assert updated_ride is not None
+    assert len(updated_ride.stops) == 4
+
+
+def test_submit_join_request_replay_past_expiry_releases_hold() -> None:
+    """
+    Verifies that replaying submit_join_request after the 300s expiry period
+    detects expiry, releases the hold, marks status EXPIRED, and returns failure.
+    """
+    vehicle, ride, storage = _create_test_entities(vehicle_capacity=1)
+    policy = DispatchPolicy(join_request_expiry_seconds=300)
+
+    req = RideRequest(
+        request_id="req-exp-replay",
+        user_id="user-exp",
+        pickup_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        dropoff_location=GeoCoordinate(latitude=40.7589, longitude=-73.9851),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=4000,
+        direct_distance_meters=5000,
+        direct_duration_seconds=600,
+        status=RequestStatus.PENDING,
+    )
+    storage.save_request(req)
+
+    sub = submit_join_request(req, ride.ride_id, storage, policy, 1000, "token-exp-replay")
+    assert sub.success is True
+    assert sub.join_request.status == JoinStatus.PENDING
+    assert sub.join_request.expires_at == 1300
+
+    # Replay at t = 1301 (past 1300 expiry)
+    replay = submit_join_request(req, ride.ride_id, storage, policy, 1301, "token-exp-replay")
+    assert replay.success is False
+    assert replay.join_request.status == JoinStatus.EXPIRED
+    assert replay.rejection_reason == "EXPIRED"
+
+    # Verify hold is freed in storage
+    hold = storage.get_seat_hold(sub.join_request.join_request_id)
+    assert hold is None
+
+
+def test_acquire_seat_hold_atomic_replay_past_expiry_returns_false() -> None:
+    """
+    Verifies that acquire_seat_hold_atomic cleans up and rejects replayed tokens
+    when current submitted_at exceeds hold.expires_at.
+    """
+    _, ride, storage = _create_test_entities(vehicle_capacity=1)
+
+    acquired = storage.acquire_seat_hold_atomic(
+        ride_id=ride.ride_id,
+        request_id="req-hold-exp",
+        join_request_id="join-hold-exp",
+        seat_count=1,
+        submitted_at=1000,
+        expires_at=1300,
+        expected_version=1,
+        idempotency_token="token-hold-exp",
+    )
+    assert acquired is True
+
+    # Replay at t = 1301
+    replayed = storage.acquire_seat_hold_atomic(
+        ride_id=ride.ride_id,
+        request_id="req-hold-exp",
+        join_request_id="join-hold-exp",
+        seat_count=1,
+        submitted_at=1301,
+        expires_at=1601,
+        expected_version=2,
+        idempotency_token="token-hold-exp",
+    )
+    assert replayed is False
+    assert storage.get_seat_hold("join-hold-exp") is None
+
+
+def test_submit_join_request_rejects_cancelled_and_expired_requests() -> None:
+    """
+    Verifies that requests with CANCELLED status or where current_time > latest_dropoff_time
+    cannot acquire seat holds.
+    """
+    _, ride, storage = _create_test_entities(vehicle_capacity=4)
+    policy = DispatchPolicy(join_request_expiry_seconds=300)
+
+    req_cancelled = RideRequest(
+        request_id="req-canc",
+        user_id="user-c",
+        pickup_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        dropoff_location=GeoCoordinate(latitude=40.7589, longitude=-73.9851),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=4000,
+        direct_distance_meters=5000,
+        direct_duration_seconds=600,
+        status=RequestStatus.CANCELLED,
+    )
+    res_canc = submit_join_request(req_cancelled, ride.ride_id, storage, policy, 1000, "token-canc")
+    assert res_canc.success is False
+    assert res_canc.rejection_reason == "REQUEST_CANCELLED"
+    assert storage.get_seat_hold(res_canc.join_request.join_request_id) is None
+
+    req_expired = RideRequest(
+        request_id="req-past-drop",
+        user_id="user-e",
+        pickup_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        dropoff_location=GeoCoordinate(latitude=40.7589, longitude=-73.9851),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=1500,
+        direct_distance_meters=5000,
+        direct_duration_seconds=600,
+        status=RequestStatus.PENDING,
+    )
+    res_exp = submit_join_request(req_expired, ride.ride_id, storage, policy, 1501, "token-past")
+    assert res_exp.success is False
+    assert res_exp.rejection_reason == "REQUEST_EXPIRED"
+    assert storage.get_seat_hold(res_exp.join_request.join_request_id) is None
+
+
+def test_reject_already_approved_join_request_fails() -> None:
+    """
+    Verifies that attempting to reject an already APPROVED join request raises LifecycleTransitionError.
+    """
+    _, ride, storage = _create_test_entities(vehicle_capacity=4)
+    policy_provider = DefaultPolicyProvider()
+    router = MockRoutingProvider()
+
+    req = RideRequest(
+        request_id="req-approved-rej",
+        user_id="user-appr",
+        pickup_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        dropoff_location=GeoCoordinate(latitude=40.7589, longitude=-73.9851),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=4000,
+        direct_distance_meters=5000,
+        direct_duration_seconds=600,
+        status=RequestStatus.PENDING,
+    )
+    storage.save_request(req)
+
+    sub = submit_join_request(req, ride.ride_id, storage, policy_provider.get_policy(), 1000, "token-appr")
+    assert sub.success is True
+    conf = confirm_join_request(sub.join_request.join_request_id, storage, policy_provider, router, 1010, "token-appr")
+    assert conf.success is True
+
+    with pytest.raises(LifecycleTransitionError, match="already APPROVED"):
+        reject_join_request(sub.join_request.join_request_id, storage)
 

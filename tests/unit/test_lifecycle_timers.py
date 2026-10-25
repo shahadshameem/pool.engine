@@ -338,3 +338,50 @@ def test_confirm_passenger_boarding_rejects_dropoff_stop() -> None:
     assert ride.active_passenger_count == 1
     assert dropoff_stop.status == StopStatus.ARRIVED
 
+
+def test_confirm_ride_departure_rejects_terminal_rides() -> None:
+    """
+    Verifies that calling confirm_ride_departure on a ride in terminal state
+    (CANCELLED, DRIVER_NO_SHOW, or COMPLETED) raises LifecycleTransitionError.
+    """
+    for status in (RideStatus.CANCELLED, RideStatus.DRIVER_NO_SHOW, RideStatus.COMPLETED):
+        ride = _create_sample_ride(status=status)
+        with pytest.raises(LifecycleTransitionError, match="terminal state"):
+            confirm_ride_departure(ride, departure_time=1050)
+
+
+def test_process_ride_timers_completes_ride_when_all_stops_no_show() -> None:
+    """
+    Verifies that when a pickup stop expires to NO_SHOW and its downstream dropoff
+    is marked SKIPPED, leaving all stops in terminal status with zero active passengers,
+    the ride transitions from ACTIVE to COMPLETED.
+    """
+    p_stop = _create_sample_stop(
+        stop_id="stop-p-ns",
+        request_id="req-ns-1",
+        stop_type=StopType.PICKUP,
+        status=StopStatus.IN_GRACE_PERIOD,
+        actual_arrival_time=1000,
+    )
+    d_stop = _create_sample_stop(
+        stop_id="stop-d-ns",
+        request_id="req-ns-1",
+        stop_type=StopType.DROPOFF,
+        status=StopStatus.SCHEDULED,
+        scheduled_arrival_time=1500,
+    )
+    ride = _create_sample_ride(
+        departure_time=1000,
+        status=RideStatus.ACTIVE,
+        stops=(p_stop, d_stop),
+    )
+
+    policy = DispatchPolicy(boarding_grace_period_seconds=180)
+    # At t = 1000 + 181 = 1181: boarding grace expires
+    timed_out_ride = process_ride_timers(ride, current_time=1181, policy=policy)
+
+    assert timed_out_ride.stops[0].status == StopStatus.NO_SHOW
+    assert timed_out_ride.stops[1].status == StopStatus.SKIPPED
+    assert timed_out_ride.active_passenger_count == 0
+    assert timed_out_ride.lifecycle_status == RideStatus.COMPLETED
+

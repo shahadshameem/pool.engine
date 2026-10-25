@@ -252,6 +252,15 @@ def confirm_ride_departure(ride: Ride, departure_time: int) -> Ride:
     if ride.actual_departure_time is not None:
         return ride
 
+    if ride.lifecycle_status in (
+        RideStatus.CANCELLED,
+        RideStatus.DRIVER_NO_SHOW,
+        RideStatus.COMPLETED,
+    ):
+        raise LifecycleTransitionError(
+            f"Cannot depart ride in terminal state {ride.lifecycle_status.value}"
+        )
+
     new_status = RideStatus.ACTIVE if ride.lifecycle_status == RideStatus.SCHEDULED else ride.lifecycle_status
     return ride.model_copy(
         update={
@@ -395,9 +404,19 @@ def process_ride_timers(
         new_stops = final_stops
 
     if stops_mutated:
+        all_stops_done = all(
+            s.status in (StopStatus.COMPLETED, StopStatus.SKIPPED, StopStatus.NO_SHOW)
+            for s in new_stops
+        )
+        new_lifecycle_status = (
+            RideStatus.COMPLETED
+            if all_stops_done and updated_ride.active_passenger_count == 0
+            else updated_ride.lifecycle_status
+        )
         updated_ride = updated_ride.model_copy(
             update={
                 "stops": tuple(new_stops),
+                "lifecycle_status": new_lifecycle_status,
                 "version": updated_ride.version + 1,
             }
         )
