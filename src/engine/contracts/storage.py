@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+from engine.domain.candidate import CandidateAssignment
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 
 
@@ -23,12 +24,23 @@ class SeatHold:
 class IdempotencyRecord:
     """Canonical idempotency record tracking operation outcome and ownership."""
     token: str
-    record_type: str  # "hold" | "reservation"
+    record_type: str  # "hold" | "reservation" | "dispatch_assignment"
     join_request_id: str
     request_id: str
     ride_id: str
     version: int
     created_at: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class AssignmentCommitResult:
+    """Outcome of attempting to atomically commit a single dispatch assignment."""
+    success: bool
+    candidate_id: str
+    ride_id: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    ride: Optional[Ride] = None
+    committed_request_ids: tuple[str, ...] = ()
 
 
 class StorageProviderError(Exception):
@@ -169,5 +181,52 @@ class RideStorageProvider(ABC):
         """
         Retrieves an idempotency record by token.
         Used to verify token ownership and detect idempotency conflicts without reflection.
+        """
+        pass
+
+    @abstractmethod
+    def get_pending_requests(self, limit: Optional[int] = None) -> Sequence[RideRequest]:
+        """Loads all ride requests currently in PENDING status."""
+        pass
+
+    @abstractmethod
+    def get_active_vehicles(self, limit: Optional[int] = None) -> Sequence[Vehicle]:
+        """Loads all currently active vehicles (is_active == True)."""
+        pass
+
+    @abstractmethod
+    def get_active_rides(self, limit: Optional[int] = None) -> Sequence[Ride]:
+        """Loads all rides currently in SCHEDULED or ACTIVE lifecycle status."""
+        pass
+
+    @abstractmethod
+    def commit_dispatch_assignment_atomic(
+        self,
+        assignment: CandidateAssignment,
+        idempotency_token: str,
+        current_time: int,
+        expected_ride_version: Optional[int] = None,
+        new_ride_id: Optional[str] = None,
+    ) -> AssignmentCommitResult:
+        """
+        Atomically commits a single dispatch candidate assignment to storage.
+
+        Guarantees:
+        - If existing_ride_id is None (new ride for idle vehicle):
+          - Verifies the vehicle is active and has no currently active/scheduled ride.
+          - Verifies all request_ids in the assignment exist and have status == PENDING.
+          - Persists the new Ride and RouteStops.
+          - Transitions all request_ids to status == MATCHED with matched_ride_id.
+        - If existing_ride_id is set (active ride insertion):
+          - Verifies the ride exists and ride.version == expected_ride_version (OCC).
+          - Verifies vehicle seat capacity profile is preserved.
+          - Verifies newly inserted request_ids exist and have status == PENDING.
+          - Updates Ride stops and total_vmt_meters, incrementing ride.version.
+          - Transitions newly inserted request_ids to status == MATCHED with matched_ride_id.
+        - Replay Safety & Idempotency:
+          - If idempotency_token was already committed for this candidate, returns success=True with the committed Ride.
+          - If idempotency_token conflicts with a different candidate or request, returns success=False with rejection_reason="IDEMPOTENCY_CONFLICT".
+        - Isolation:
+          - If any check fails, the transaction is completely rolled back and storage is left unmutated.
         """
         pass

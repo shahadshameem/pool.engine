@@ -162,17 +162,49 @@ class RideStorageProvider(ABC):
         Used to verify token ownership and detect idempotency conflicts without reflection.
         """
         pass
+
+    @abstractmethod
+    def get_pending_requests(self, limit: Optional[int] = None) -> Sequence[RideRequest]:
+        """Loads all ride requests currently in PENDING status."""
+        pass
+
+    @abstractmethod
+    def get_active_vehicles(self, limit: Optional[int] = None) -> Sequence[Vehicle]:
+        """Loads all currently active vehicles (is_active == True)."""
+        pass
+
+    @abstractmethod
+    def get_active_rides(self, limit: Optional[int] = None) -> Sequence[Ride]:
+        """Loads all rides currently in SCHEDULED or ACTIVE lifecycle status."""
+        pass
+
+    @abstractmethod
+    def commit_dispatch_assignment_atomic(
+        self,
+        assignment: CandidateAssignment,
+        idempotency_token: str,
+        current_time: int,
+        expected_ride_version: Optional[int] = None,
+        new_ride_id: Optional[str] = None,
+    ) -> AssignmentCommitResult:
+        """
+        Atomically commits a single dispatch candidate assignment to storage.
+        """
+        pass
 ```
 
 ## 2. Invariants & Concurrency Contract
-- **Serializable Isolation & Race Resolution**: `acquire_seat_hold_atomic` and `reserve_seats_atomic` MUST guarantee serializable isolation for concurrent seat requests on the same ride. When two concurrent requests compete for the last available seat, atomic transactional locks serialize execution: the first transaction commits and increments `Ride.version`, and the second transaction fails version or capacity checks and is cleanly rejected.
+- **Serializable Isolation & Race Resolution**: `acquire_seat_hold_atomic`, `reserve_seats_atomic`, and `commit_dispatch_assignment_atomic` MUST guarantee serializable isolation for concurrent seat requests and batch dispatch commits.
+- **Per-Assignment Atomic Commits**: In batch dispatch orchestration, each candidate assignment is committed in an independent, atomic database transaction with row-level locks (`SELECT ... FOR UPDATE`) on the vehicle, ride, and requests:
+  - If a concurrent collision occurs (e.g. `VERSION_CONFLICT` on an existing active ride, or a request was cancelled), only that specific assignment fails and rolls back.
+  - Other valid assignments in the same batch continue to commit without interruption or data corruption.
 - **Unified Seat-Hold Lifecycle**:
   - The seat hold expiration and join request expiration are governed by a single unified timestamp: $T_{\text{expires}} = T_{\text{submitted}} + \text{join\_request\_expiry\_seconds}$.
   - The hold is strictly valid while $t \le T_{\text{expires}}$ and expires when $t > T_{\text{expires}}$.
   - The hold is directly owned by `join_request_id` and `request_id`.
   - Automatic release: If $t > T_{\text{expires}}$ or the creator declines, the hold is freed immediately via `release_seats_atomic`.
-- **Idempotency & Replay Safety**: Every reservation hold or commit includes an `idempotency_token`. Duplicate submissions within the hold window return success with the existing status without consuming additional seat capacity.
-- **Optimistic Concurrency Control (OCC)**: Any update to an existing `Ride` must verify that the stored version matches `expected_version`. If another process modified the ride concurrently, a `ConcurrencyConflictError` is raised and caught for double-revalidation.
+- **Idempotency & Replay Safety**: Every reservation hold or dispatch commit includes an `idempotency_token`. Duplicate submissions return success with the existing status without consuming additional seat capacity or creating duplicate rides/stops.
+- **Optimistic Concurrency Control (OCC)**: Any update to an existing `Ride` must verify that the stored version matches `expected_version`. If another process modified the ride concurrently, a version conflict is safely detected and the commit is rejected or retried within a bounded policy.
 - **Stateless Read Snapshots**: Reads for batch optimization solvers provide immutable point-in-time snapshots, completely decoupled from active database transactions.
 
 ---

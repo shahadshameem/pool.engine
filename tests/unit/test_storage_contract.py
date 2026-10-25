@@ -6,7 +6,13 @@ from typing import Optional, Sequence
 import pytest
 
 from engine.adapters.in_memory_storage import InMemoryRideStorage
-from engine.contracts.storage import IdempotencyRecord, RideStorageProvider, SeatHold
+from engine.contracts.storage import (
+    AssignmentCommitResult,
+    IdempotencyRecord,
+    RideStorageProvider,
+    SeatHold,
+)
+from engine.domain.candidate import CandidateAssignment
 from engine.domain.enums import JoinStatus, RequestStatus, RideStatus
 from engine.domain.models import GeoCoordinate, JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.lifecycle.reservations import expire_stale_holds, submit_join_request
@@ -46,6 +52,10 @@ def test_storage_contract_defines_abstract_methods() -> None:
     assert "get_active_seat_holds" in RideStorageProvider.__abstractmethods__
     assert "sweep_expired_holds" in RideStorageProvider.__abstractmethods__
     assert "get_idempotency_record" in RideStorageProvider.__abstractmethods__
+    assert "get_pending_requests" in RideStorageProvider.__abstractmethods__
+    assert "get_active_vehicles" in RideStorageProvider.__abstractmethods__
+    assert "get_active_rides" in RideStorageProvider.__abstractmethods__
+    assert "commit_dispatch_assignment_atomic" in RideStorageProvider.__abstractmethods__
 
     class IncompleteStorage(RideStorageProvider):
         pass
@@ -370,6 +380,27 @@ def test_submit_join_request_occ_retry_uses_contract_without_private_holds_acces
 
         def get_idempotency_record(self, idempotency_token: str) -> Optional[IdempotencyRecord]:
             return self._target.get_idempotency_record(idempotency_token)
+
+        def get_pending_requests(self, limit: Optional[int] = None) -> Sequence[RideRequest]:
+            return self._target.get_pending_requests(limit)
+
+        def get_active_vehicles(self, limit: Optional[int] = None) -> Sequence[Vehicle]:
+            return self._target.get_active_vehicles(limit)
+
+        def get_active_rides(self, limit: Optional[int] = None) -> Sequence[Ride]:
+            return self._target.get_active_rides(limit)
+
+        def commit_dispatch_assignment_atomic(
+            self,
+            assignment: CandidateAssignment,
+            idempotency_token: str,
+            current_time: int,
+            expected_ride_version: Optional[int] = None,
+            new_ride_id: Optional[str] = None,
+        ) -> AssignmentCommitResult:
+            return self._target.commit_dispatch_assignment_atomic(
+                assignment, idempotency_token, current_time, expected_ride_version, new_ride_id
+            )
 
     proxy_storage = ContractOnlyStorageProxy(raw_storage)
     policy = DispatchPolicy(join_request_expiry_seconds=300)

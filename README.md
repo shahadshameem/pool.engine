@@ -92,6 +92,16 @@ pytest tests/integration/test_postgres_integration.py -v
 pytest tests/unit/test_routing_fault_isolation.py -v
 ```
 
+### 10. Dispatch Orchestration & Atomic Commits
+```powershell
+# Unit tests (in-memory, OCC version conflicts, retry isolation, race prevention):
+pytest tests/unit/test_dispatch_orchestrator.py -v
+
+# Live PostgreSQL integration tests (transactional row locks, OCC rollback, persistence across instances):
+$env:TEST_DATABASE_URL = "postgresql://postgres@localhost:5433/pool_engine_test"
+pytest tests/integration/test_orchestrator_postgres.py -v
+```
+
 ## Static Analysis & Testing
 
 Run all unit, scenario, property, concurrency, and benchmark tests:

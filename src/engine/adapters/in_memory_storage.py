@@ -4,12 +4,14 @@ import threading
 from typing import Any, Optional, Sequence
 
 from engine.contracts.storage import (
+    AssignmentCommitResult,
     IdempotencyRecord,
     RideStorageProvider,
     SeatHold,
     VersionConflictError,
 )
-from engine.domain.enums import RideStatus
+from engine.domain.candidate import CandidateAssignment
+from engine.domain.enums import RequestStatus, RideStatus
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.routing.invariants import check_capacity_profile
 
@@ -339,4 +341,227 @@ class InMemoryRideStorage(RideStorageProvider):
                 ride_id=rec.get("ride_id", ""),
                 version=rec.get("version", 1),
                 created_at=rec.get("created_at"),
+            )
+
+    def get_pending_requests(self, limit: Optional[int] = None) -> Sequence[RideRequest]:
+        with self._lock:
+            pending = [r for r in self._requests.values() if r.status == RequestStatus.PENDING]
+            if limit is not None:
+                return pending[:limit]
+            return pending
+
+    def get_active_vehicles(self, limit: Optional[int] = None) -> Sequence[Vehicle]:
+        with self._lock:
+            active = [v for v in self._vehicles.values() if v.is_active]
+            if limit is not None:
+                return active[:limit]
+            return active
+
+    def get_active_rides(self, limit: Optional[int] = None) -> Sequence[Ride]:
+        with self._lock:
+            active = [
+                r for r in self._rides.values()
+                if r.lifecycle_status in (RideStatus.SCHEDULED, RideStatus.ACTIVE)
+            ]
+            if limit is not None:
+                return active[:limit]
+            return active
+
+    def commit_dispatch_assignment_atomic(
+        self,
+        assignment: CandidateAssignment,
+        idempotency_token: str,
+        current_time: int,
+        expected_ride_version: Optional[int] = None,
+        new_ride_id: Optional[str] = None,
+    ) -> AssignmentCommitResult:
+        with self._lock:
+            # 1. Idempotency Check
+            rec = self._idempotency_records.get(idempotency_token)
+            if rec is not None:
+                if rec.get("type") == "dispatch_assignment":
+                    if rec.get("candidate_id") == assignment.candidate_id:
+                        committed_ride = self._rides.get(rec.get("ride_id", ""))
+                        return AssignmentCommitResult(
+                            success=True,
+                            candidate_id=assignment.candidate_id,
+                            ride_id=rec.get("ride_id"),
+                            ride=committed_ride,
+                            committed_request_ids=assignment.request_ids,
+                        )
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="IDEMPOTENCY_CONFLICT",
+                    )
+                return AssignmentCommitResult(
+                    success=False,
+                    candidate_id=assignment.candidate_id,
+                    rejection_reason="IDEMPOTENCY_CONFLICT",
+                )
+
+            # 2. Check Vehicle
+            vehicle = self._vehicles.get(assignment.vehicle_id)
+            if vehicle is None or not vehicle.is_active:
+                return AssignmentCommitResult(
+                    success=False,
+                    candidate_id=assignment.candidate_id,
+                    rejection_reason="VEHICLE_NOT_AVAILABLE",
+                )
+
+            # 3. Handle Case A: New Ride for Idle Vehicle
+            if assignment.existing_ride_id is None:
+                # Vehicle must not already have an active/scheduled ride
+                for r in self._rides.values():
+                    if (
+                        r.vehicle_id == assignment.vehicle_id
+                        and r.lifecycle_status in (RideStatus.SCHEDULED, RideStatus.ACTIVE)
+                    ):
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="VEHICLE_BUSY",
+                        )
+
+                # All requests must exist and have status == PENDING
+                reqs_to_update: list[RideRequest] = []
+                for req_id in assignment.request_ids:
+                    req = self._requests.get(req_id)
+                    if req is None or req.status != RequestStatus.PENDING:
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="REQUEST_NOT_PENDING",
+                        )
+                    reqs_to_update.append(req)
+
+                effective_ride_id = new_ride_id or f"ride-{assignment.candidate_id}"
+
+                # Check capacity profile on ordered stops
+                if not check_capacity_profile(assignment.ordered_stops, vehicle.total_seat_capacity, 0):
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="CAPACITY_EXCEEDED",
+                    )
+
+                # Ensure stops reference effective_ride_id
+                updated_stops = tuple(
+                    s.model_copy(update={"ride_id": effective_ride_id}) if s.ride_id != effective_ride_id else s
+                    for s in assignment.ordered_stops
+                )
+
+                dep_time = updated_stops[0].scheduled_arrival_time if updated_stops else current_time
+                new_ride = Ride(
+                    ride_id=effective_ride_id,
+                    vehicle_id=assignment.vehicle_id,
+                    driver_id=vehicle.driver_id,
+                    lifecycle_status=RideStatus.SCHEDULED,
+                    stops=updated_stops,
+                    scheduled_departure_time=dep_time,
+                    active_passenger_count=0,
+                    total_vmt_meters=assignment.vmt_meters,
+                    version=1,
+                )
+                self._rides[effective_ride_id] = new_ride
+
+                # Update requests to MATCHED
+                for req in reqs_to_update:
+                    self._requests[req.request_id] = req.model_copy(
+                        update={"status": RequestStatus.MATCHED, "matched_ride_id": effective_ride_id}
+                    )
+
+                # Record idempotency
+                self._idempotency_records[idempotency_token] = {
+                    "type": "dispatch_assignment",
+                    "candidate_id": assignment.candidate_id,
+                    "ride_id": effective_ride_id,
+                    "version": 1,
+                }
+
+                return AssignmentCommitResult(
+                    success=True,
+                    candidate_id=assignment.candidate_id,
+                    ride_id=effective_ride_id,
+                    ride=new_ride,
+                    committed_request_ids=assignment.request_ids,
+                )
+
+            # 4. Handle Case B: Active Ride Insertion
+            existing_ride = self._rides.get(assignment.existing_ride_id)
+            if existing_ride is None or existing_ride.lifecycle_status not in (RideStatus.SCHEDULED, RideStatus.ACTIVE):
+                return AssignmentCommitResult(
+                    success=False,
+                    candidate_id=assignment.candidate_id,
+                    rejection_reason="RIDE_NOT_ACTIVE",
+                )
+
+            # OCC Check
+            if expected_ride_version is not None and existing_ride.version != expected_ride_version:
+                return AssignmentCommitResult(
+                    success=False,
+                    candidate_id=assignment.candidate_id,
+                    rejection_reason="VERSION_CONFLICT",
+                )
+
+            # Capacity Check
+            if not check_capacity_profile(
+                assignment.ordered_stops, vehicle.total_seat_capacity, existing_ride.active_passenger_count
+            ):
+                return AssignmentCommitResult(
+                    success=False,
+                    candidate_id=assignment.candidate_id,
+                    rejection_reason="CAPACITY_EXCEEDED",
+                )
+
+            # Find newly inserted requests (not already in existing ride's stops)
+            existing_req_ids = {s.request_id for s in existing_ride.stops}
+            newly_added_req_ids = [r_id for r_id in assignment.request_ids if r_id not in existing_req_ids]
+
+            reqs_to_update = []
+            for req_id in newly_added_req_ids:
+                req = self._requests.get(req_id)
+                if req is None or req.status != RequestStatus.PENDING:
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="REQUEST_NOT_PENDING",
+                    )
+                reqs_to_update.append(req)
+
+            # Ensure all stops reference existing_ride.ride_id
+            updated_stops = tuple(
+                s.model_copy(update={"ride_id": existing_ride.ride_id}) if s.ride_id != existing_ride.ride_id else s
+                for s in assignment.ordered_stops
+            )
+
+            updated_ride = existing_ride.model_copy(
+                update={
+                    "stops": updated_stops,
+                    "total_vmt_meters": assignment.vmt_meters,
+                    "version": existing_ride.version + 1,
+                }
+            )
+            self._rides[existing_ride.ride_id] = updated_ride
+
+            # Update newly added requests to MATCHED
+            for req in reqs_to_update:
+                self._requests[req.request_id] = req.model_copy(
+                    update={"status": RequestStatus.MATCHED, "matched_ride_id": existing_ride.ride_id}
+                )
+
+            # Record idempotency
+            self._idempotency_records[idempotency_token] = {
+                "type": "dispatch_assignment",
+                "candidate_id": assignment.candidate_id,
+                "ride_id": existing_ride.ride_id,
+                "version": updated_ride.version,
+            }
+
+            return AssignmentCommitResult(
+                success=True,
+                candidate_id=assignment.candidate_id,
+                ride_id=existing_ride.ride_id,
+                ride=updated_ride,
+                committed_request_ids=assignment.request_ids,
             )

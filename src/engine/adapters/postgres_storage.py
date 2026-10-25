@@ -9,12 +9,14 @@ from psycopg import Connection
 from psycopg.rows import dict_row
 
 from engine.contracts.storage import (
+    AssignmentCommitResult,
     IdempotencyRecord,
     RideStorageProvider,
     SeatHold,
     StorageProviderError,
     VersionConflictError,
 )
+from engine.domain.candidate import CandidateAssignment
 from engine.domain.enums import JoinStatus, RequestStatus, RideStatus, StopStatus, StopType
 from engine.domain.models import GeoCoordinate, JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.routing.invariants import check_capacity_profile
@@ -874,3 +876,387 @@ class PostgresRideStorage(RideStorageProvider):
             if row is None:
                 return None
             return self._row_to_idempotency_record(row)
+
+    def get_pending_requests(self, limit: Optional[int] = None) -> Sequence[RideRequest]:
+        conn = self._get_connection()
+        with conn.cursor(row_factory=dict_row) as cur:
+            if limit is not None:
+                cur.execute(
+                    "SELECT * FROM ride_requests WHERE status = %s ORDER BY earliest_pickup_time ASC LIMIT %s",
+                    (RequestStatus.PENDING.value, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM ride_requests WHERE status = %s ORDER BY earliest_pickup_time ASC",
+                    (RequestStatus.PENDING.value,),
+                )
+            return [self._row_to_request(row) for row in cur.fetchall()]
+
+    def get_active_vehicles(self, limit: Optional[int] = None) -> Sequence[Vehicle]:
+        conn = self._get_connection()
+        with conn.cursor(row_factory=dict_row) as cur:
+            if limit is not None:
+                cur.execute(
+                    "SELECT * FROM vehicles WHERE is_active = TRUE ORDER BY vehicle_id ASC LIMIT %s",
+                    (limit,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM vehicles WHERE is_active = TRUE ORDER BY vehicle_id ASC"
+                )
+            return [self._row_to_vehicle(row) for row in cur.fetchall()]
+
+    def get_active_rides(self, limit: Optional[int] = None) -> Sequence[Ride]:
+        conn = self._get_connection()
+        with conn.cursor(row_factory=dict_row) as cur:
+            if limit is not None:
+                cur.execute(
+                    """
+                    SELECT ride_id FROM rides
+                    WHERE lifecycle_status IN (%s, %s)
+                    ORDER BY scheduled_departure_time ASC
+                    LIMIT %s
+                    """,
+                    (RideStatus.SCHEDULED.value, RideStatus.ACTIVE.value, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT ride_id FROM rides
+                    WHERE lifecycle_status IN (%s, %s)
+                    ORDER BY scheduled_departure_time ASC
+                    """,
+                    (RideStatus.SCHEDULED.value, RideStatus.ACTIVE.value),
+                )
+            ride_ids = [row["ride_id"] for row in cur.fetchall()]
+
+        rides: list[Ride] = []
+        for r_id in ride_ids:
+            r = self.get_ride(r_id)
+            if r is not None:
+                rides.append(r)
+        return rides
+
+    def commit_dispatch_assignment_atomic(
+        self,
+        assignment: CandidateAssignment,
+        idempotency_token: str,
+        current_time: int,
+        expected_ride_version: Optional[int] = None,
+        new_ride_id: Optional[str] = None,
+    ) -> AssignmentCommitResult:
+        conn = self._get_connection()
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Idempotency Check
+                cur.execute(
+                    "SELECT * FROM idempotency_records WHERE idempotency_token = %s FOR UPDATE",
+                    (idempotency_token,),
+                )
+                rec = cur.fetchone()
+                if rec is not None:
+                    if rec["record_type"] == "dispatch_assignment":
+                        if rec["join_request_id"] == assignment.candidate_id:
+                            committed_ride = self.get_ride(rec["ride_id"])
+                            return AssignmentCommitResult(
+                                success=True,
+                                candidate_id=assignment.candidate_id,
+                                ride_id=rec["ride_id"],
+                                ride=committed_ride,
+                                committed_request_ids=assignment.request_ids,
+                            )
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="IDEMPOTENCY_CONFLICT",
+                        )
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="IDEMPOTENCY_CONFLICT",
+                    )
+
+                # 2. Check and lock vehicle
+                cur.execute(
+                    "SELECT * FROM vehicles WHERE vehicle_id = %s FOR UPDATE",
+                    (assignment.vehicle_id,),
+                )
+                veh_row = cur.fetchone()
+                if veh_row is None or not veh_row["is_active"]:
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="VEHICLE_NOT_AVAILABLE",
+                    )
+                vehicle_capacity = veh_row["total_seat_capacity"]
+                driver_id = veh_row["driver_id"]
+
+                # 3. Case A: New Ride (idle vehicle)
+                if assignment.existing_ride_id is None:
+                    cur.execute(
+                        """
+                        SELECT ride_id FROM rides
+                        WHERE vehicle_id = %s AND lifecycle_status IN (%s, %s)
+                        FOR UPDATE
+                        """,
+                        (assignment.vehicle_id, RideStatus.SCHEDULED.value, RideStatus.ACTIVE.value),
+                    )
+                    if cur.fetchone() is not None:
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="VEHICLE_BUSY",
+                        )
+
+                    # Lock and verify all requests are PENDING
+                    if not assignment.request_ids:
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="NO_REQUESTS",
+                        )
+                    cur.execute(
+                        "SELECT request_id, status FROM ride_requests WHERE request_id = ANY(%s) FOR UPDATE",
+                        (list(assignment.request_ids),),
+                    )
+                    rows = cur.fetchall()
+                    if len(rows) != len(assignment.request_ids) or any(
+                        r["status"] != RequestStatus.PENDING.value for r in rows
+                    ):
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="REQUEST_NOT_PENDING",
+                        )
+
+                    # Check capacity profile
+                    if not check_capacity_profile(assignment.ordered_stops, vehicle_capacity, 0):
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="CAPACITY_EXCEEDED",
+                        )
+
+                    effective_ride_id = new_ride_id or f"ride-{assignment.candidate_id}"
+                    dep_time = (
+                        assignment.ordered_stops[0].scheduled_arrival_time
+                        if assignment.ordered_stops
+                        else current_time
+                    )
+
+                    # Insert new ride
+                    cur.execute(
+                        """
+                        INSERT INTO rides (
+                            ride_id, vehicle_id, driver_id, lifecycle_status,
+                            scheduled_departure_time, active_passenger_count, total_vmt_meters, version
+                        ) VALUES (%s, %s, %s, %s, %s, 0, %s, 1)
+                        """,
+                        (
+                            effective_ride_id,
+                            assignment.vehicle_id,
+                            driver_id,
+                            RideStatus.SCHEDULED.value,
+                            dep_time,
+                            assignment.vmt_meters,
+                        ),
+                    )
+
+                    # Insert route stops
+                    for idx, stop in enumerate(assignment.ordered_stops):
+                        cur.execute(
+                            """
+                            INSERT INTO route_stops (
+                                stop_id, ride_id, stop_order, request_id, stop_type,
+                                latitude, longitude, passenger_delta, scheduled_arrival_time,
+                                promised_window_start, promised_window_end, dwell_duration_seconds, status
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                stop.stop_id,
+                                effective_ride_id,
+                                idx,
+                                stop.request_id,
+                                stop.stop_type.value,
+                                stop.location.latitude,
+                                stop.location.longitude,
+                                stop.passenger_delta,
+                                stop.scheduled_arrival_time,
+                                stop.promised_window_start,
+                                stop.promised_window_end,
+                                stop.dwell_duration_seconds,
+                                stop.status.value,
+                            ),
+                        )
+
+                    # Update ride requests
+                    cur.execute(
+                        """
+                        UPDATE ride_requests
+                        SET status = %s, matched_ride_id = %s, updated_at = NOW()
+                        WHERE request_id = ANY(%s)
+                        """,
+                        (RequestStatus.MATCHED.value, effective_ride_id, list(assignment.request_ids)),
+                    )
+
+                    # Insert idempotency record
+                    cur.execute(
+                        """
+                        INSERT INTO idempotency_records (
+                            idempotency_token, record_type, join_request_id, request_id, ride_id, version, created_at
+                        ) VALUES (%s, 'dispatch_assignment', %s, %s, %s, 1, %s)
+                        """,
+                        (
+                            idempotency_token,
+                            assignment.candidate_id,
+                            assignment.request_ids[0],
+                            effective_ride_id,
+                            current_time,
+                        ),
+                    )
+
+                    new_ride = self.get_ride(effective_ride_id)
+                    return AssignmentCommitResult(
+                        success=True,
+                        candidate_id=assignment.candidate_id,
+                        ride_id=effective_ride_id,
+                        ride=new_ride,
+                        committed_request_ids=assignment.request_ids,
+                    )
+
+                # 4. Case B: Active Ride Insertion
+                cur.execute(
+                    """
+                    SELECT version, active_passenger_count, lifecycle_status
+                    FROM rides
+                    WHERE ride_id = %s
+                    FOR UPDATE
+                    """,
+                    (assignment.existing_ride_id,),
+                )
+                ride_row = cur.fetchone()
+                if ride_row is None or ride_row["lifecycle_status"] not in (
+                    RideStatus.SCHEDULED.value,
+                    RideStatus.ACTIVE.value,
+                ):
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="RIDE_NOT_ACTIVE",
+                    )
+
+                if expected_ride_version is not None and ride_row["version"] != expected_ride_version:
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="VERSION_CONFLICT",
+                    )
+
+                # Check capacity profile
+                if not check_capacity_profile(
+                    assignment.ordered_stops, vehicle_capacity, ride_row["active_passenger_count"]
+                ):
+                    return AssignmentCommitResult(
+                        success=False,
+                        candidate_id=assignment.candidate_id,
+                        rejection_reason="CAPACITY_EXCEEDED",
+                    )
+
+                # Determine newly added requests
+                cur.execute(
+                    "SELECT DISTINCT request_id FROM route_stops WHERE ride_id = %s",
+                    (assignment.existing_ride_id,),
+                )
+                existing_req_ids = {r["request_id"] for r in cur.fetchall()}
+                newly_added_req_ids = [r_id for r_id in assignment.request_ids if r_id not in existing_req_ids]
+
+                if newly_added_req_ids:
+                    cur.execute(
+                        "SELECT request_id, status FROM ride_requests WHERE request_id = ANY(%s) FOR UPDATE",
+                        (newly_added_req_ids,),
+                    )
+                    rows = cur.fetchall()
+                    if len(rows) != len(newly_added_req_ids) or any(
+                        r["status"] != RequestStatus.PENDING.value for r in rows
+                    ):
+                        return AssignmentCommitResult(
+                            success=False,
+                            candidate_id=assignment.candidate_id,
+                            rejection_reason="REQUEST_NOT_PENDING",
+                        )
+
+                # Replace route stops
+                cur.execute("DELETE FROM route_stops WHERE ride_id = %s", (assignment.existing_ride_id,))
+                for idx, stop in enumerate(assignment.ordered_stops):
+                    cur.execute(
+                        """
+                        INSERT INTO route_stops (
+                            stop_id, ride_id, stop_order, request_id, stop_type,
+                            latitude, longitude, passenger_delta, scheduled_arrival_time,
+                            promised_window_start, promised_window_end, dwell_duration_seconds, status
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            stop.stop_id,
+                            assignment.existing_ride_id,
+                            idx,
+                            stop.request_id,
+                            stop.stop_type.value,
+                            stop.location.latitude,
+                            stop.location.longitude,
+                            stop.passenger_delta,
+                            stop.scheduled_arrival_time,
+                            stop.promised_window_start,
+                            stop.promised_window_end,
+                            stop.dwell_duration_seconds,
+                            stop.status.value,
+                        ),
+                    )
+
+                # Update ride
+                new_version = ride_row["version"] + 1
+                cur.execute(
+                    """
+                    UPDATE rides
+                    SET total_vmt_meters = %s, version = %s, updated_at = NOW()
+                    WHERE ride_id = %s
+                    """,
+                    (assignment.vmt_meters, new_version, assignment.existing_ride_id),
+                )
+
+                # Update newly added requests
+                if newly_added_req_ids:
+                    cur.execute(
+                        """
+                        UPDATE ride_requests
+                        SET status = %s, matched_ride_id = %s, updated_at = NOW()
+                        WHERE request_id = ANY(%s)
+                        """,
+                        (RequestStatus.MATCHED.value, assignment.existing_ride_id, newly_added_req_ids),
+                    )
+
+                # Insert idempotency record
+                cur.execute(
+                    """
+                    INSERT INTO idempotency_records (
+                        idempotency_token, record_type, join_request_id, request_id, ride_id, version, created_at
+                    ) VALUES (%s, 'dispatch_assignment', %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        idempotency_token,
+                        assignment.candidate_id,
+                        assignment.request_ids[0] if assignment.request_ids else "",
+                        assignment.existing_ride_id,
+                        new_version,
+                        current_time,
+                    ),
+                )
+
+                updated_ride = self.get_ride(assignment.existing_ride_id)
+                return AssignmentCommitResult(
+                    success=True,
+                    candidate_id=assignment.candidate_id,
+                    ride_id=assignment.existing_ride_id,
+                    ride=updated_ride,
+                    committed_request_ids=assignment.request_ids,
+                )
