@@ -34,6 +34,7 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
         self._lon_step = 0.0055 * (2 ** (8 - self.resolution))
         # Internal indexed storage: cell_id -> list of (entity_id, Coordinate, lat_rad, lon_rad, cos_lat)
         self._cells: dict[str, list[tuple[str, Coordinate, float, float, float]]] = {}
+        self._occupied_cells: set[str] = set()
         self._all_entities: list[tuple[str, Coordinate]] = []
         self._ring_cache: dict[tuple[str, int], set[str]] = _GLOBAL_H3_RING_CACHE
 
@@ -67,6 +68,8 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
             lon_rad = math.radians(location.longitude)
             cos_lat = math.cos(lat_rad)
             self._cells[cell_id].append((entity_id, location, lat_rad, lon_rad, cos_lat))
+
+        self._occupied_cells = set(self._cells.keys())
 
     def _get_h3_k_ring_cells(self, origin_cell: str, k: int) -> set[str]:
         """Queries concentric cell rings using H3."""
@@ -136,7 +139,7 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
         towards the candidate limit.
         """
         center_cell = self.get_cell_id(target)
-        candidates_found: dict[str, SpatialCandidate] = {}
+        candidates_found: dict[str, tuple[float, Coordinate, str]] = {}
 
         target_lat_rad = math.radians(target.latitude)
         target_lon_rad = math.radians(target.longitude)
@@ -149,6 +152,8 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
         min_cell_step_meters = max(50.0, min(lat_step_m, lon_step_m))
 
         max_k = max(2, int(math.ceil(max_radius_meters / min_cell_step_meters)) + 2)
+        max_c = max_radius_meters / DEFAULT_EARTH_RADIUS_METERS
+        max_a = math.sin(max_c * 0.5) ** 2
 
         for k in range(max_k + 1):
             if _H3_MODULE is not None and not center_cell.startswith("grid_"):
@@ -156,29 +161,29 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
             else:
                 cell_ring = self._get_grid_k_ring_cells(target, k)
 
-            for cell_id in cell_ring:
-                if cell_id in self._cells:
-                    for ent_id, ent_loc, ent_lat_rad, ent_lon_rad, ent_cos_lat in self._cells[cell_id]:
-                        if entity_filter is not None and not entity_filter(ent_id):
+            active_cells = cell_ring.intersection(self._occupied_cells)
+            for cell_id in active_cells:
+                for ent_id, ent_loc, ent_lat_rad, ent_lon_rad, ent_cos_lat in self._cells[cell_id]:
+                    if entity_filter is not None and not entity_filter(ent_id):
+                        continue
+                    if ent_id not in candidates_found:
+                        dlat = ent_lat_rad - target_lat_rad
+                        sin_half_dlat = math.sin(dlat * 0.5)
+                        lat_term = sin_half_dlat * sin_half_dlat
+                        if lat_term > max_a:
                             continue
-                        if ent_id not in candidates_found:
-                            dlat = ent_lat_rad - target_lat_rad
-                            dlon = ent_lon_rad - target_lon_rad
-                            sin_half_dlat = math.sin(dlat * 0.5)
-                            sin_half_dlon = math.sin(dlon * 0.5)
-                            a = (
-                                sin_half_dlat * sin_half_dlat
-                                + cos_target_lat * ent_cos_lat * sin_half_dlon * sin_half_dlon
-                            )
-                            c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
-                            d = DEFAULT_EARTH_RADIUS_METERS * c
-                            if d <= max_radius_meters:
-                                candidates_found[ent_id] = SpatialCandidate(
-                                    entity_id=ent_id,
-                                    location=ent_loc,
-                                    haversine_distance_meters=d,
-                                    cell_id=cell_id,
-                                )
+                        dlon = ent_lon_rad - target_lon_rad
+                        sin_half_dlon = math.sin(dlon * 0.5)
+                        a = (
+                            lat_term
+                            + cos_target_lat * ent_cos_lat * sin_half_dlon * sin_half_dlon
+                        )
+                        if a > max_a:
+                            continue
+                        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+                        d = DEFAULT_EARTH_RADIUS_METERS * c
+                        if d <= max_radius_meters:
+                            candidates_found[ent_id] = (d, ent_loc, cell_id)
 
             # Termination condition 1: full physical radius covered
             min_inner_radius = max(0.0, (k - 1) * min_cell_step_meters)
@@ -189,8 +194,16 @@ class H3SpatialIndexAdapter(SpatialIndexProvider):
             if max_candidates is not None and len(candidates_found) >= max_candidates:
                 break
 
-        # Sort ascending by distance
-        sorted_candidates = sorted(candidates_found.values(), key=lambda c: c.haversine_distance_meters)
+        # Sort ascending by distance and construct SpatialCandidate models only for retained candidates
+        sorted_items = sorted(candidates_found.items(), key=lambda it: it[1][0])
         if max_candidates is not None:
-            return sorted_candidates[:max_candidates]
-        return sorted_candidates
+            sorted_items = sorted_items[:max_candidates]
+        return [
+            SpatialCandidate(
+                entity_id=ent_id,
+                location=loc,
+                haversine_distance_meters=d,
+                cell_id=cid,
+            )
+            for ent_id, (d, loc, cid) in sorted_items
+        ]

@@ -107,7 +107,12 @@ def solve_set_packing_regret_k(
 
         for r in sorted_all_reqs:
             if r not in unassignable_requests:
-                _update_request(r)
+                cands_r = req_to_cands[r]
+                c1 = cands_r[0]
+                alt_idx = min(k - 1, len(cands_r) - 1)
+                ck = cands_r[alt_idx]
+                regret = c1.objective_value - ck.objective_value
+                req_info[r] = (round(regret, 6), regret, c1)
 
         # Active request list maintained in deterministic sorted order
         active_reqs = [r for r in sorted_all_reqs if r in req_info]
@@ -194,7 +199,7 @@ def solve_set_packing_regret_k(
         # Stage 6: Final Verification, Deterministic Tie-Breaking & Serialization
         # (Guaranteed 50ms reserved headroom)
         # =========================================================================
-        deadline_expired = interrupted_by_deadline or (time.monotonic() >= cutoff_time)
+        deadline_expired = interrupted_by_deadline or (time.monotonic() >= effective_deadline)
         cand_status = getattr(candidates, "search_status", None)
         cand_approx = getattr(candidates, "is_approximated", False)
 
@@ -264,7 +269,7 @@ def solve_set_packing_regret_k(
         # Documented Safe Fallback: verify and preserve conflict-free assignments if available,
         # otherwise return all requests safely unassigned
         duration_ms = (time.monotonic() - start_time) * 1000.0
-        deadline_expired = interrupted_by_deadline or (time.monotonic() >= cutoff_time)
+        deadline_expired = interrupted_by_deadline or (time.monotonic() >= effective_deadline)
         cand_status = getattr(candidates, "search_status", None)
         if not deadline_expired and cand_status != SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
             raise

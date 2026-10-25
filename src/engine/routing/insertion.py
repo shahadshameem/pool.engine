@@ -116,57 +116,14 @@ def generate_active_ride_insertions(
 
     candidates: list[CandidateAssignment] = []
 
-    def make_req_stops(req: RideRequest) -> tuple[RouteStop, RouteStop]:
-        p = RouteStop(
-            stop_id=f"stop-p-{req.request_id}",
-            ride_id=active_ride.ride_id,
-            request_id=req.request_id,
-            stop_type=StopType.PICKUP,
-            location=req.pickup_location,
-            passenger_delta=+req.seat_count,
-            scheduled_arrival_time=0,
-            promised_window_start=req.earliest_pickup_time,
-            promised_window_end=req.earliest_pickup_time + policy.max_pickup_delay_seconds,
-            status=StopStatus.SCHEDULED,
-        )
-        d = RouteStop(
-            stop_id=f"stop-d-{req.request_id}",
-            ride_id=active_ride.ride_id,
-            request_id=req.request_id,
-            stop_type=StopType.DROPOFF,
-            location=req.dropoff_location,
-            passenger_delta=-req.seat_count,
-            scheduled_arrival_time=0,
-            promised_window_start=req.earliest_pickup_time,
-            promised_window_end=req.latest_dropoff_time,
-            status=StopStatus.SCHEDULED,
-        )
-        return p, d
-
-    # Precompute existing dropoff detour baseline data outside loops
-    existing_dropoff_detour_data: list[tuple[str, str, int, int]] = []
-    for existing_stop in existing_stops:
-        if existing_stop.stop_type == StopType.DROPOFF:
-            p_match = next(
-                (s for s in active_ride.stops if s.request_id == existing_stop.request_id and s.stop_type == StopType.PICKUP),
-                None,
-            )
-            if p_match is not None:
-                orig_p_time = p_match.actual_arrival_time or p_match.scheduled_arrival_time
-                orig_duration = max(0, existing_stop.scheduled_arrival_time - orig_p_time)
-                if orig_duration > 0:
-                    existing_dropoff_detour_data.append(
-                        (existing_stop.stop_id, p_match.stop_id, orig_p_time, orig_duration)
-                    )
-
-    # Pre-compute request stops and coordinates
-    req_stops_dict: dict[str, tuple[RouteStop, RouteStop]] = {
-        r.request_id: make_req_stops(r) for r in eligible_requests
-    }
+    # Pre-compute request stop coordinates and stable waypoint IDs
     for r in eligible_requests:
-        p_stop, d_stop = req_stops_dict[r.request_id]
-        stop_coords[p_stop.stop_id] = Coordinate(p_stop.location.latitude, p_stop.location.longitude)
-        stop_coords[d_stop.stop_id] = Coordinate(d_stop.location.latitude, d_stop.location.longitude)
+        stop_coords[f"stop-p-{r.request_id}"] = Coordinate(
+            r.pickup_location.latitude, r.pickup_location.longitude
+        )
+        stop_coords[f"stop-d-{r.request_id}"] = Coordinate(
+            r.dropoff_location.latitude, r.dropoff_location.longitude
+        )
 
     # Pre-index stop IDs, deadlines and bounds for all eligible requests once
     req_p_ids: dict[str, str] = {r.request_id: f"stop-p-{r.request_id}" for r in eligible_requests}
@@ -195,6 +152,7 @@ def generate_active_ride_insertions(
     ex_p_match_idx: list[int | None] = []
     ex_orig_p_times: list[int] = []
     ex_orig_durations: list[int] = []
+    ex_max_allowed_durs: list[float] = []
     for ex_idx, s in enumerate(existing_stops):
         if s.stop_type == StopType.DROPOFF:
             p_match = next(
@@ -208,14 +166,21 @@ def generate_active_ride_insertions(
                 ex_p_match_idx.append(p_in_ex)
                 ex_orig_p_times.append(orig_p)
                 ex_orig_durations.append(orig_dur)
+                max_det = min(
+                    (policy.detour_relative_multiplier - 1.0) * float(orig_dur),
+                    float(policy.detour_absolute_cap_seconds),
+                )
+                ex_max_allowed_durs.append(float(orig_dur) + max_det)
             else:
                 ex_p_match_idx.append(None)
                 ex_orig_p_times.append(0)
                 ex_orig_durations.append(0)
+                ex_max_allowed_durs.append(0.0)
         else:
             ex_p_match_idx.append(None)
             ex_orig_p_times.append(0)
             ex_orig_durations.append(0)
+            ex_max_allowed_durs.append(0.0)
 
     deadline_hit = False
 
@@ -440,7 +405,7 @@ def generate_active_ride_insertions(
                                     else ex_orig_p_times[ex_idx]
                                 )
                                 actual_dur = max(0, arr - p_time)
-                                if not check_detour_bound(actual_dur, ex_orig_durations[ex_idx], policy):
+                                if actual_dur > (ex_max_allowed_durs[ex_idx] + 1e-6):
                                     feasible = False
 
                         if feasible:

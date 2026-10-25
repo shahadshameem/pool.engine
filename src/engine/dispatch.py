@@ -1,6 +1,8 @@
 """Unified Dispatch Engine entry point coordinating spatial filtering, routing, and optimization (T051)."""
 
 from dataclasses import dataclass
+import math
+import operator
 import time
 import uuid
 from typing import Optional, Sequence
@@ -26,6 +28,7 @@ from engine.routing.insertion import (
 )
 from engine.spatial.index import SpatialIndexCoordinator
 from engine.spatial.lower_bounds import (
+    DEFAULT_EARTH_RADIUS_METERS,
     DEFAULT_V_MAX_MPS,
     haversine_distance_meters,
 )
@@ -136,6 +139,7 @@ def _sort_requests_by_active_detour(
     vehicle: Vehicle,
     active_ride: Ride,
     req_pickup_coords: dict[str, Coordinate] | None = None,
+    req_pickup_rad: dict[str, tuple[float, float, float]] | None = None,
 ) -> list[RideRequest]:
     """
     Sorts candidate requests ascending by lower-bound detour distance relative to
@@ -149,44 +153,56 @@ def _sort_requests_by_active_detour(
         in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
     ]
 
-    if not active_stops:
-        if req_pickup_coords is not None:
-            return sorted(
-                requests,
-                key=lambda r: haversine_distance_meters(v_loc, req_pickup_coords[r.request_id]),
-            )
-        return sorted(
-            requests,
-            key=lambda r: haversine_distance_meters(
-                v_loc, Coordinate(r.pickup_location.latitude, r.pickup_location.longitude)
-            ),
-        )
+    v_lat_rad = math.radians(vehicle.current_location.latitude)
+    v_lon_rad = math.radians(vehicle.current_location.longitude)
+    v_cos_lat = math.cos(v_lat_rad)
+    v_rad = (v_lat_rad, v_lon_rad, v_cos_lat)
 
-    coords = [v_loc] + [
-        Coordinate(s.location.latitude, s.location.longitude) for s in active_stops
+    def _fast_hav(r1: tuple[float, float, float], r2: tuple[float, float, float]) -> float:
+        dlat = r2[0] - r1[0]
+        dlon = r2[1] - r1[1]
+        sin_half_dlat = math.sin(dlat * 0.5)
+        sin_half_dlon = math.sin(dlon * 0.5)
+        a = sin_half_dlat * sin_half_dlat + r1[2] * r2[2] * sin_half_dlon * sin_half_dlon
+        return (2.0 * DEFAULT_EARTH_RADIUS_METERS) * math.asin(math.sqrt(min(1.0, a)))
+
+    def _get_p_rad(req: RideRequest) -> tuple[float, float, float]:
+        if req_pickup_rad is not None and req.request_id in req_pickup_rad:
+            return req_pickup_rad[req.request_id]
+        p_lat = math.radians(req.pickup_location.latitude)
+        p_lon = math.radians(req.pickup_location.longitude)
+        return (p_lat, p_lon, math.cos(p_lat))
+
+    if not active_stops:
+        return sorted(requests, key=lambda r: _fast_hav(v_rad, _get_p_rad(r)))
+
+    coords_rad = [v_rad] + [
+        (
+            math.radians(s.location.latitude),
+            math.radians(s.location.longitude),
+            math.cos(math.radians(s.location.latitude)),
+        )
+        for s in active_stops
     ]
     segment_lengths = [
-        haversine_distance_meters(coords[i], coords[i + 1])
-        for i in range(len(coords) - 1)
+        _fast_hav(coords_rad[i], coords_rad[i + 1])
+        for i in range(len(coords_rad) - 1)
     ]
 
     def _req_detour_lower_bound(req: RideRequest) -> float:
-        if req_pickup_coords is not None and req.request_id in req_pickup_coords:
-            p = req_pickup_coords[req.request_id]
-        else:
-            p = Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
+        p = _get_p_rad(req)
 
         # Min detour to insert pickup P into any consecutive segment
         min_p_detour = float("inf")
-        for i in range(len(coords) - 1):
+        for i in range(len(coords_rad) - 1):
             det = (
-                haversine_distance_meters(coords[i], p)
-                + haversine_distance_meters(p, coords[i + 1])
+                _fast_hav(coords_rad[i], p)
+                + _fast_hav(p, coords_rad[i + 1])
                 - segment_lengths[i]
             )
             if det < min_p_detour:
                 min_p_detour = det
-        append_detour = haversine_distance_meters(coords[-1], p)
+        append_detour = _fast_hav(coords_rad[-1], p)
         if append_detour < min_p_detour:
             min_p_detour = append_detour
 
@@ -318,11 +334,19 @@ class DispatchEngine:
             v.vehicle_id: [] for v in eligible_vehicles
         }
 
-        # Precompute pickup coordinates for all pending requests once
+        # Precompute pickup coordinates and radians for all pending requests once
         req_pickup_coords: dict[str, Coordinate] = {
             req.request_id: Coordinate(
                 latitude=req.pickup_location.latitude,
                 longitude=req.pickup_location.longitude,
+            )
+            for req in pending_requests
+        }
+        req_pickup_rad: dict[str, tuple[float, float, float]] = {
+            req.request_id: (
+                math.radians(req.pickup_location.latitude),
+                math.radians(req.pickup_location.longitude),
+                math.cos(math.radians(req.pickup_location.latitude)),
             )
             for req in pending_requests
         }
@@ -426,10 +450,14 @@ class DispatchEngine:
             if active_ride is not None:
                 plain_reqs = [r for _, r in nearby_reqs]
                 sorted_reqs = _sort_requests_by_active_detour(
-                    plain_reqs, veh, active_ride, req_pickup_coords=req_pickup_coords
+                    plain_reqs,
+                    veh,
+                    active_ride,
+                    req_pickup_coords=req_pickup_coords,
+                    req_pickup_rad=req_pickup_rad,
                 )
             else:
-                sorted_reqs = [r for _, r in sorted(nearby_reqs, key=lambda pair: pair[0])]
+                sorted_reqs = [r for _, r in sorted(nearby_reqs, key=operator.itemgetter(0))]
 
             # Request slicing: strictly controlled by explicit configuration
             if effective_config.mode == DispatchMode.EXACT:
@@ -580,8 +608,8 @@ class DispatchEngine:
             )
 
         # Stage 2, 3, 4: Candidate Generation
-        # Reserve headroom for set packing solver (headroom + 40ms)
-        cand_headroom = reserved_headroom + 0.040
+        # Reserve headroom for set packing solver (headroom + 25ms)
+        cand_headroom = reserved_headroom + 0.025
         candidates = self.generate_candidates(
             requests=pending_requests,
             vehicles=eligible_vehicles,
@@ -598,20 +626,24 @@ class DispatchEngine:
         effective_dispatch_mode = candidates.dispatch_mode
 
         # Stage 5: Fleet Assignment Solver (Regret-K Heuristic)
+        # Reserve 25ms headroom for Stage 6 validation and serialization
+        solver_reserved_headroom = min(reserved_headroom, 0.025)
         solver_result = solve_set_packing_regret_k(
             candidates=candidates,
             all_request_ids=all_req_ids,
             deadline=effective_deadline,
-            reserved_headroom=reserved_headroom,
+            reserved_headroom=solver_reserved_headroom,
         )
 
         solve_duration_ms = (time.monotonic() - start_monotonic) * 1000.0
 
-        if (
-            solver_result.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-            or candidates.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-            or time.monotonic() >= effective_deadline - reserved_headroom
-        ):
+        if solver_result.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
+            effective_search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+            effective_is_approximated = True
+        elif candidates.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
+            effective_search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+            effective_is_approximated = True
+        elif time.monotonic() >= effective_deadline:
             effective_search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
             effective_is_approximated = True
 
