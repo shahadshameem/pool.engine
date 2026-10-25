@@ -3,7 +3,12 @@
 import threading
 from typing import Any, Optional, Sequence
 
-from engine.contracts.storage import RideStorageProvider, SeatHold, VersionConflictError
+from engine.contracts.storage import (
+    IdempotencyRecord,
+    RideStorageProvider,
+    SeatHold,
+    VersionConflictError,
+)
 from engine.domain.enums import RideStatus
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.routing.invariants import check_capacity_profile
@@ -319,3 +324,19 @@ class InMemoryRideStorage(RideStorageProvider):
                     expired_ids.append(hold.join_request_id)
                     del self._holds[hold.join_request_id]
             return expired_ids
+
+    def get_idempotency_record(self, idempotency_token: str) -> Optional[IdempotencyRecord]:
+        """Retrieves an idempotency record by token."""
+        with self._lock:
+            rec = self._idempotency_records.get(idempotency_token)
+            if rec is None:
+                return None
+            return IdempotencyRecord(
+                token=idempotency_token,
+                record_type=rec.get("type", "unknown"),
+                join_request_id=rec.get("join_request_id", ""),
+                request_id=rec.get("request_id", ""),
+                ride_id=rec.get("ride_id", ""),
+                version=rec.get("version", 1),
+                created_at=rec.get("created_at"),
+            )

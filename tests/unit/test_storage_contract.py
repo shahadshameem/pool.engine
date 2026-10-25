@@ -6,7 +6,7 @@ from typing import Optional, Sequence
 import pytest
 
 from engine.adapters.in_memory_storage import InMemoryRideStorage
-from engine.contracts.storage import RideStorageProvider, SeatHold
+from engine.contracts.storage import IdempotencyRecord, RideStorageProvider, SeatHold
 from engine.domain.enums import JoinStatus, RequestStatus, RideStatus
 from engine.domain.models import GeoCoordinate, JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.lifecycle.reservations import expire_stale_holds, submit_join_request
@@ -42,9 +42,10 @@ def _setup_test_ride_and_storage(
 
 
 def test_storage_contract_defines_abstract_methods() -> None:
-    """Verifies that RideStorageProvider requires get_active_seat_holds and sweep_expired_holds."""
+    """Verifies that RideStorageProvider requires get_active_seat_holds, sweep_expired_holds, and get_idempotency_record."""
     assert "get_active_seat_holds" in RideStorageProvider.__abstractmethods__
     assert "sweep_expired_holds" in RideStorageProvider.__abstractmethods__
+    assert "get_idempotency_record" in RideStorageProvider.__abstractmethods__
 
     class IncompleteStorage(RideStorageProvider):
         pass
@@ -367,6 +368,9 @@ def test_submit_join_request_occ_retry_uses_contract_without_private_holds_acces
         def sweep_expired_holds(self, current_time: int) -> Sequence[str]:
             return self._target.sweep_expired_holds(current_time)
 
+        def get_idempotency_record(self, idempotency_token: str) -> Optional[IdempotencyRecord]:
+            return self._target.get_idempotency_record(idempotency_token)
+
     proxy_storage = ContractOnlyStorageProxy(raw_storage)
     policy = DispatchPolicy(join_request_expiry_seconds=300)
 
@@ -419,3 +423,32 @@ def test_submit_join_request_occ_retry_uses_contract_without_private_holds_acces
     )
     assert res2.success
     assert proxy_storage.get_active_seat_holds_called, "Expected formal get_active_seat_holds to be invoked on OCC retry"
+
+
+def test_get_idempotency_record_and_conflict_detection() -> None:
+    """Verifies get_idempotency_record stores and returns canonical records, detecting token reuse conflicts."""
+    storage, ride, _ = _setup_test_ride_and_storage("ride-idem", vehicle_capacity=4)
+
+    assert storage.get_idempotency_record("nonexistent-token") is None
+
+    # Acquire hold
+    ok = storage.acquire_seat_hold_atomic(
+        ride_id="ride-idem",
+        request_id="req-1",
+        join_request_id="join-1",
+        seat_count=1,
+        submitted_at=1000,
+        expires_at=1300,
+        expected_version=1,
+        idempotency_token="token-hold-1",
+    )
+    assert ok
+
+    rec = storage.get_idempotency_record("token-hold-1")
+    assert rec is not None
+    assert rec.token == "token-hold-1"
+    assert rec.record_type == "hold"
+    assert rec.join_request_id == "join-1"
+    assert rec.request_id == "req-1"
+    assert rec.ride_id == "ride-idem"
+    assert rec.version == 2

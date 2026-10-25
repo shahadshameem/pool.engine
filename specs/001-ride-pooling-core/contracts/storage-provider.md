@@ -154,6 +154,14 @@ class RideStorageProvider(ABC):
         Repeated calls with the same or earlier current_time must be safe and idempotent.
         """
         pass
+
+    @abstractmethod
+    def get_idempotency_record(self, idempotency_token: str) -> Optional[IdempotencyRecord]:
+        """
+        Retrieves an idempotency record by token.
+        Used to verify token ownership and detect idempotency conflicts without reflection.
+        """
+        pass
 ```
 
 ## 2. Invariants & Concurrency Contract
@@ -166,3 +174,35 @@ class RideStorageProvider(ABC):
 - **Idempotency & Replay Safety**: Every reservation hold or commit includes an `idempotency_token`. Duplicate submissions within the hold window return success with the existing status without consuming additional seat capacity.
 - **Optimistic Concurrency Control (OCC)**: Any update to an existing `Ride` must verify that the stored version matches `expected_version`. If another process modified the ride concurrently, a `ConcurrencyConflictError` is raised and caught for double-revalidation.
 - **Stateless Read Snapshots**: Reads for batch optimization solvers provide immutable point-in-time snapshots, completely decoupled from active database transactions.
+
+---
+
+## 3. Implementations & Operational Setup
+
+### 3.1. In-Memory Adapter (`InMemoryRideStorage`)
+- **Namespace**: `engine.adapters.in_memory_storage`
+- **Use Case**: In-process development, fast unit tests, deterministic simulation replays.
+- **Concurrency**: Thread-safe with `threading.RLock()`.
+- **Limitation**: Volatile; does not survive process termination and cannot coordinate across multiple container instances or OS processes.
+
+### 3.2. PostgreSQL / PostGIS Persistent Adapter (`PostgresRideStorage`)
+- **Namespace**: `engine.adapters.postgres_storage`
+- **Use Case**: Durable, multi-process, distributed production persistence.
+- **Database Schema**: Managed via [`src/engine/adapters/schema.sql`](file:///C:/Users/shaha/pool%20engine/src/engine/adapters/schema.sql). Initialize programmatically via `storage.create_schema()`.
+  - Canonical relational tables: `vehicles`, `rides`, `route_stops`, `ride_requests`, `join_requests`, `seat_holds`, `idempotency_records`.
+  - Indexes: B-Tree coordinates on `vehicles` and `route_stops`, expiry index on `seat_holds(expires_at, ride_id)`, idempotency token lookups on `idempotency_records(idempotency_token)`.
+  - PostGIS Support: Automatically creates the `postgis` extension when PostGIS is installed on PostgreSQL; falls back to standard indexed coordinate bounding boxes if PostGIS extension is unavailable.
+- **Concurrency Model**:
+  - **Pessimistic Row Locking**: Uses `SELECT ... FOR UPDATE` on `rides` and `seat_holds` during `acquire_seat_hold_atomic` and `reserve_seats_atomic` transactions.
+  - **Optimistic Version Checks**: Verifies `rides.version == expected_version` and atomically increments version upon every state or stop mutation.
+  - **Multi-Process Contention**: Multiple processes or service replicas safely contend without double-booking or capacity over-allocation.
+- **Environment Configuration**:
+  - `DATABASE_URL`: PostgreSQL connection DSN for production or development (e.g. `postgresql://user:pass@localhost:5432/pool_engine`).
+  - `TEST_DATABASE_URL`: Dedicated database connection DSN for running integration tests against a live database.
+- **Integration Test Execution**:
+  ```powershell
+  # When PostgreSQL is running:
+  $env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/pool_engine_test"
+  python -m pytest tests/integration/test_postgres_integration.py -v
+  ```
+  If neither `TEST_DATABASE_URL` nor `DATABASE_URL` is set (or the PostgreSQL server is unreachable), integration tests are cleanly and explicitly skipped with a message detailing the missing environment. No silent fallback to in-memory storage is permitted.

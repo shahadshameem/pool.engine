@@ -19,6 +19,18 @@ class SeatHold:
     idempotency_token: str
 
 
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    """Canonical idempotency record tracking operation outcome and ownership."""
+    token: str
+    record_type: str  # "hold" | "reservation"
+    join_request_id: str
+    request_id: str
+    ride_id: str
+    version: int
+    created_at: Optional[int] = None
+
+
 class StorageProviderError(Exception):
     """Raised on database/storage operational failure."""
     pass
@@ -149,5 +161,13 @@ class RideStorageProvider(ABC):
 
         Returns the sequence of join_request_ids corresponding to the swept expired holds.
         Repeated calls with the same or earlier current_time must be idempotent and safe.
+        """
+        pass
+
+    @abstractmethod
+    def get_idempotency_record(self, idempotency_token: str) -> Optional[IdempotencyRecord]:
+        """
+        Retrieves an idempotency record by token.
+        Used to verify token ownership and detect idempotency conflicts without reflection.
         """
         pass

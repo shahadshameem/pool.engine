@@ -168,21 +168,19 @@ def submit_join_request(
                 ride=updated_ride,
             )
 
-        if hasattr(storage, "_idempotency_records"):
-            records = getattr(storage, "_idempotency_records", {})
-            rec = records.get(idempotency_token)
-            if rec is not None and (
-                rec.get("join_request_id") != join_req.join_request_id
-                or rec.get("request_id") != request.request_id
-                or rec.get("ride_id") != ride.ride_id
-            ):
-                rejected_jr = join_req.model_copy(update={"status": JoinStatus.REJECTED})
-                storage.save_join_request(rejected_jr)
-                return ReservationResult(
-                    success=False,
-                    join_request=rejected_jr,
-                    rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
-                )
+        rec = storage.get_idempotency_record(idempotency_token)
+        if rec is not None and (
+            rec.join_request_id != join_req.join_request_id
+            or rec.request_id != request.request_id
+            or rec.ride_id != ride.ride_id
+        ):
+            rejected_jr = join_req.model_copy(update={"status": JoinStatus.REJECTED})
+            storage.save_join_request(rejected_jr)
+            return ReservationResult(
+                success=False,
+                join_request=rejected_jr,
+                rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
+            )
 
         # Check if failure was an optimistic concurrency version mismatch
         latest_ride = storage.get_ride(ride_id)
@@ -406,26 +404,24 @@ def confirm_join_request(
                 ride=updated_ride,
             )
 
-        if hasattr(storage, "_idempotency_records"):
-            records = getattr(storage, "_idempotency_records", {})
-            rec = records.get(token)
-            if rec is not None and (
-                rec.get("join_request_id") != join_request.join_request_id
-                or rec.get("request_id") != request.request_id
-                or rec.get("ride_id") != ride.ride_id
-            ):
-                storage.release_seats_atomic(
-                    ride_id=ride.ride_id,
-                    join_request_id=join_request.join_request_id,
-                    reason="IDEMPOTENCY_TOKEN_CONFLICT",
-                )
-                rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
-                storage.save_join_request(rejected_jr)
-                return ReservationResult(
-                    success=False,
-                    join_request=rejected_jr,
-                    rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
-                )
+        rec = storage.get_idempotency_record(token)
+        if rec is not None and (
+            rec.join_request_id != join_request.join_request_id
+            or rec.request_id != request.request_id
+            or rec.ride_id != ride.ride_id
+        ):
+            storage.release_seats_atomic(
+                ride_id=ride.ride_id,
+                join_request_id=join_request.join_request_id,
+                reason="IDEMPOTENCY_TOKEN_CONFLICT",
+            )
+            rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
+            storage.save_join_request(rejected_jr)
+            return ReservationResult(
+                success=False,
+                join_request=rejected_jr,
+                rejection_reason="IDEMPOTENCY_TOKEN_CONFLICT",
+            )
 
         # Check if failure was an optimistic concurrency version mismatch
         latest_ride = storage.get_ride(ride.ride_id)

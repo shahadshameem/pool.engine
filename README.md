@@ -77,6 +77,16 @@ pytest tests/benchmark/test_solver_optimality.py -v -k "test_ilp_reference_gap"
 pytest tests/scenario/test_dispatch_modes.py -v
 ```
 
+### 8. PostgreSQL / PostGIS Persistent Storage & Integration
+```powershell
+# Unit tests (mocked & DDL validation):
+pytest tests/unit/test_postgres_storage.py -v
+
+# Live integration tests (requires PostgreSQL; set TEST_DATABASE_URL):
+$env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/pool_engine_test"
+pytest tests/integration/test_postgres_integration.py -v
+```
+
 ## Static Analysis & Testing
 
 Run all unit, scenario, property, concurrency, and benchmark tests:
@@ -99,6 +109,6 @@ src/engine/
   ├── routing/         # Stop insertion permutations, group bundling, invariant gates
   ├── optimization/    # Multi-objective utility, quantized tie-breaking, Regret-K set packing
   ├── lifecycle/       # Reservation protocol, transitions, timers, dwell verification
-  ├── adapters/        # H3 / grid spatial adapter, mock router, in-memory storage
+  ├── adapters/        # H3 / grid spatial adapter, mock router, in-memory & Postgres storage
   └── dispatch.py      # Unified DispatchEngine facade
 ```
