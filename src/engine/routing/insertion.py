@@ -113,7 +113,19 @@ def generate_active_ride_insertions(
         to_coord = stop_coords[to_id]
         try:
             raw_leg = router.get_direct_leg(from_coord, to_coord)
-            validated = validate_route_leg(from_coord, to_coord, raw_leg)
+            if (
+                isinstance(raw_leg, tuple)
+                and len(raw_leg) == 2
+                and isinstance(raw_leg[0], int)
+                and isinstance(raw_leg[1], int)
+                and not isinstance(raw_leg[0], bool)
+                and not isinstance(raw_leg[1], bool)
+                and raw_leg[0] >= 0
+                and raw_leg[1] >= 0
+            ):
+                validated = raw_leg
+            else:
+                validated = validate_route_leg(from_coord, to_coord, raw_leg)
             leg_cache[cache_key] = validated
             return validated
         except RoutingProviderError as err:

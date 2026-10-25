@@ -102,6 +102,23 @@ def validate_route_leg(
     return int(round(dist)), int(round(dur))
 
 
+class RoutingPrefetchHandle(ABC):
+    """Abstract handle for an in-flight or completed asynchronous prefetch session."""
+
+    @abstractmethod
+    def wait_group(self, group_index: int, timeout: float | None = None) -> bool:
+        """
+        Wait for group at group_index to finish prefetching and populating cache.
+        Returns True if completed. Raises TimeoutError if timeout expires.
+        """
+        pass
+
+    @abstractmethod
+    def cancel(self) -> None:
+        """Cancel any remaining in-flight prefetch queries."""
+        pass
+
+
 class RoadNetworkRoutingProvider(ABC):
     """
     Vendor-independent road network routing contract.
@@ -182,6 +199,19 @@ class RoadNetworkRoutingProvider(ABC):
                 reserved_headroom=reserved_headroom,
             )
         return total
+
+    def start_prefetch_matrices(
+        self,
+        groups: Sequence[Sequence[Coordinate]],
+        deadline: float | None = None,
+        reserved_headroom: float = 0.050,
+    ) -> "RoutingPrefetchHandle | None":
+        """
+        Optional performance hint to initiate asynchronous prefetching of pairwise legs
+        for multiple waypoint groups, allowing caller to overlap I/O with evaluation.
+        Default implementation returns None (indicating synchronous or no prefetch).
+        """
+        return None
 
     def check_health(self) -> bool:
         """

@@ -20,6 +20,7 @@ from engine.contracts.routing import (
     RouteGeometry,
     RouteLookupError,
     RouteTimeoutError,
+    RoutingPrefetchHandle,
     validate_route_leg,
 )
 
@@ -49,7 +50,7 @@ class DefaultOsrmTransport(OsrmHttpTransport):
     def __init__(
         self,
         base_url: str = "http://localhost:5000",
-        max_connections: int = 8,
+        max_connections: int = 12,
     ) -> None:
         parsed = urllib.parse.urlsplit(base_url)
         self.scheme = parsed.scheme.lower() if parsed.scheme else "http"
@@ -225,6 +226,35 @@ class LruLegCache:
             return len(self._data)
 
 
+class OsrmPrefetchHandle(RoutingPrefetchHandle):
+    """Concrete handle for an in-flight asynchronous OSRM prefetch session."""
+
+    def __init__(
+        self,
+        group_futures: list[concurrent.futures.Future[int] | None],
+    ) -> None:
+        self.group_futures = group_futures
+
+    def wait_group(self, group_index: int, timeout: float | None = None) -> bool:
+        if group_index >= len(self.group_futures):
+            return True
+        fut = self.group_futures[group_index]
+        if fut is None or fut.done():
+            return True
+        try:
+            fut.result(timeout=timeout)
+            return True
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"OSRM prefetch timed out for group {group_index}")
+        except Exception:
+            return False
+
+    def cancel(self) -> None:
+        for fut in self.group_futures:
+            if fut is not None and not fut.done():
+                fut.cancel()
+
+
 class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
     """
     High-performance, provider-independent routing adapter backed by OSRM.
@@ -241,7 +271,7 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         max_table_size: int = 100,
         cache_maxsize: int = 50000,
         coord_precision: int = 6,
-        max_workers: int = 8,
+        max_workers: int = 12,
         transport: OsrmHttpTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -723,6 +753,64 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
 
         return cached_count
 
+    def start_prefetch_matrices(
+        self,
+        groups: Sequence[Sequence[Coordinate]],
+        deadline: float | None = None,
+        reserved_headroom: float = 0.050,
+    ) -> RoutingPrefetchHandle | None:
+        """
+        Initiates asynchronous bounded prefetching for multiple waypoint groups.
+        Returns an OsrmPrefetchHandle allowing callers to stream/pipeline evaluation.
+        """
+        if not groups:
+            return None
+        if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+            return None
+
+        executor = self._get_executor()
+        group_futures: list[concurrent.futures.Future[int] | None] = []
+        submitted_by_key: dict[tuple[tuple[float, float], ...], concurrent.futures.Future[int]] = {}
+
+        def _fetch_group(grp: Sequence[Coordinate]) -> int:
+            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                return 0
+            return self.prefetch_matrix(
+                origins=grp,
+                destinations=grp,
+                deadline=deadline,
+                reserved_headroom=reserved_headroom,
+            )
+
+        for group in groups:
+            if len(group) < 2:
+                group_futures.append(None)
+                continue
+
+            group_key = tuple(sorted(set((c.latitude, c.longitude) for c in group)))
+            if group_key in submitted_by_key:
+                # Share in-flight future for identical coordinate groups
+                group_futures.append(submitted_by_key[group_key])
+                continue
+
+            # Check if all non-self legs are already in cache
+            keys = [
+                self._cache_key(o, d)
+                for o in group
+                for d in group
+                if (o.latitude, o.longitude) != (d.latitude, d.longitude)
+            ]
+            missing = self._cache.get_missing(keys)
+            if not missing:
+                group_futures.append(None)
+                continue
+
+            fut = executor.submit(_fetch_group, group)
+            submitted_by_key[group_key] = fut
+            group_futures.append(fut)
+
+        return OsrmPrefetchHandle(group_futures)
+
     def prefetch_matrices(
         self,
         groups: Sequence[Sequence[Coordinate]],
@@ -735,64 +823,9 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         Handles deduplication, missing key detection, and negative caching.
         Returns the count of new valid legs cached.
         """
-        if not groups:
+        handle = self.start_prefetch_matrices(groups=groups, deadline=deadline, reserved_headroom=reserved_headroom)
+        if not isinstance(handle, OsrmPrefetchHandle):
             return 0
-        if deadline is not None and time.monotonic() > deadline - reserved_headroom:
-            return 0
-
-        # Filter and deduplicate groups that actually have missing keys
-        needed_groups: list[Sequence[Coordinate]] = []
-        seen_group_coords: set[tuple[tuple[float, float], ...]] = set()
-
-        for group in groups:
-            if len(group) < 2:
-                continue
-            # Deduplicate groups with identical coordinate sets (prevent duplicate in-flight requests)
-            group_key = tuple(sorted(set((c.latitude, c.longitude) for c in group)))
-            if group_key in seen_group_coords:
-                continue
-            seen_group_coords.add(group_key)
-
-            # Check if all legs in this group are already in cache (excluding self-to-self)
-            keys = [
-                self._cache_key(o, d)
-                for o in group
-                for d in group
-                if (o.latitude, o.longitude) != (d.latitude, d.longitude)
-            ]
-            missing = self._cache.get_missing(keys)
-            if missing:
-                needed_groups.append(group)
-
-        if not needed_groups:
-            return 0
-
-        # If only 1 group or max_workers <= 1, execute sequentially
-        if len(needed_groups) == 1 or self.max_workers <= 1:
-            total = 0
-            for g in needed_groups:
-                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
-                    break
-                total += self.prefetch_matrix(
-                    origins=g,
-                    destinations=g,
-                    deadline=deadline,
-                    reserved_headroom=reserved_headroom,
-                )
-            return total
-
-        # Concurrent execution with bounded worker pool
-        executor = self._get_executor()
-
-        def _fetch_group(grp: Sequence[Coordinate]) -> int:
-            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
-                return 0
-            return self.prefetch_matrix(
-                origins=grp,
-                destinations=grp,
-                deadline=deadline,
-                reserved_headroom=reserved_headroom,
-            )
 
         timeout = (
             max(0.001, (deadline - reserved_headroom) - time.monotonic())
@@ -800,23 +833,21 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
             else None
         )
 
-        futures = [executor.submit(_fetch_group, g) for g in needed_groups]
-        done, not_done = concurrent.futures.wait(
-            futures,
-            timeout=timeout,
-            return_when=concurrent.futures.ALL_COMPLETED,
-        )
-
         total_cached = 0
-        for f in done:
-            try:
-                total_cached += f.result()
-            except Exception:
-                pass
-
-        # Cancel any pending futures that did not complete within the deadline
-        for f in not_done:
-            f.cancel()
+        unique_futures = {f for f in handle.group_futures if f is not None}
+        if unique_futures:
+            done, not_done = concurrent.futures.wait(
+                unique_futures,
+                timeout=timeout,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
+            for f in done:
+                try:
+                    total_cached += f.result()
+                except Exception:
+                    pass
+            for f in not_done:
+                f.cancel()
 
         return total_cached
 

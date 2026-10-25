@@ -97,6 +97,7 @@ class CandidateGenerationConfig:
     mode: DispatchMode = DispatchMode.BOUNDED
     max_search_radius_meters: Optional[float] = 5000.0
     max_vehicles_per_request: Optional[int] = 8
+    max_candidate_vehicles: Optional[int] = 32
     max_requests_per_vehicle: Optional[int] = 3
     max_single_requests_per_vehicle: Optional[int] = 6
     max_bundle_size: int = 2
@@ -115,6 +116,7 @@ class CandidateGenerationConfig:
             mode=DispatchMode.EXACT,
             max_search_radius_meters=None,
             max_vehicles_per_request=None,
+            max_candidate_vehicles=None,
             max_requests_per_vehicle=None,
             max_single_requests_per_vehicle=None,
             max_bundle_size=max_bundle_size,
@@ -128,6 +130,7 @@ class CandidateGenerationConfig:
         cls,
         max_search_radius_meters: Optional[float] = 5000.0,
         max_vehicles_per_request: Optional[int] = 8,
+        max_candidate_vehicles: Optional[int] = 32,
         max_requests_per_vehicle: Optional[int] = 3,
         max_single_requests_per_vehicle: Optional[int] = 6,
         max_bundle_size: int = 2,
@@ -140,6 +143,7 @@ class CandidateGenerationConfig:
             mode=DispatchMode.BOUNDED,
             max_search_radius_meters=max_search_radius_meters,
             max_vehicles_per_request=max_vehicles_per_request,
+            max_candidate_vehicles=max_candidate_vehicles,
             max_requests_per_vehicle=max_requests_per_vehicle,
             max_single_requests_per_vehicle=max_single_requests_per_vehicle,
             max_bundle_size=max_bundle_size,
@@ -453,16 +457,30 @@ class DispatchEngine:
         shared_leg_cache: dict[tuple[str, str], tuple[int, int] | None] = {}
         shared_routing_errors: list[RoutingProviderError] = []
 
-        # Stage 3 Pre-pass: Prepare evaluation requests and waypoint groups for candidate vehicles
-        vehicle_eval_plan: list[tuple[Vehicle, Ride | None, list[RideRequest], list[Coordinate]]] = []
-        waypoint_groups_to_prefetch: list[list[Coordinate]] = []
-
+        # Stage 3 Pre-pass: Prioritize candidate vehicles by closest candidate pickup distance
+        candidate_vehicles_with_min_dist: list[tuple[float, Vehicle, list[tuple[float, RideRequest]]]] = []
         for veh_id, nearby_reqs in nearby_requests_by_vehicle.items():
             if not nearby_reqs:
                 continue
+            min_d = min(d for d, _ in nearby_reqs)
+            candidate_vehicles_with_min_dist.append((min_d, vehicles_by_id[veh_id], nearby_reqs))
 
-            veh = vehicles_by_id[veh_id]
-            active_ride = rides_by_vehicle.get(veh_id)
+        candidate_vehicles_with_min_dist.sort(key=operator.itemgetter(0))
+
+        # Candidate vehicle truncation in bounded mode
+        if (
+            effective_config.mode != DispatchMode.EXACT
+            and effective_config.max_candidate_vehicles is not None
+        ):
+            candidate_vehicles_with_min_dist = candidate_vehicles_with_min_dist[
+                : effective_config.max_candidate_vehicles
+            ]
+
+        vehicle_eval_plan: list[tuple[Vehicle, Ride | None, list[RideRequest], list[Coordinate]]] = []
+        waypoint_groups_to_prefetch: list[list[Coordinate]] = []
+
+        for _, veh, nearby_reqs in candidate_vehicles_with_min_dist:
+            active_ride = rides_by_vehicle.get(veh.vehicle_id)
             if active_ride is not None:
                 plain_reqs = [r for _, r in nearby_reqs]
                 sorted_reqs = _sort_requests_by_active_detour(
@@ -505,9 +523,17 @@ class DispatchEngine:
             vehicle_eval_plan.append((veh, active_ride, eval_reqs, v_wps))
             waypoint_groups_to_prefetch.append(v_wps)
 
-        # Batch concurrent matrix prefetch across candidate vehicle groups
+        # Launch asynchronous pipelined prefetch if supported by routing provider
+        prefetch_handle = self.routing_provider.start_prefetch_matrices(
+            groups=waypoint_groups_to_prefetch,
+            deadline=effective_deadline,
+            reserved_headroom=reserved_headroom,
+        )
+
+        # Synchronous prefetch fallback if pipelining is not supported
         if (
-            (
+            prefetch_handle is None
+            and (
                 type(self.routing_provider).prefetch_matrices is not RoadNetworkRoutingProvider.prefetch_matrices
                 or type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
             )
@@ -521,7 +547,24 @@ class DispatchEngine:
             )
 
         # Stage 3 & 4: Route Insertion & Group Bundling
-        for veh, active_ride, eval_reqs, v_wps in vehicle_eval_plan:
+        for idx, (veh, active_ride, eval_reqs, v_wps) in enumerate(vehicle_eval_plan):
+            if time.monotonic() > effective_deadline - reserved_headroom:
+                search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                is_approximated = True
+                break
+
+            # If pipelined prefetch is active, wait for this specific vehicle's group
+            if prefetch_handle is not None:
+                rem_budget = max(0.001, (effective_deadline - reserved_headroom) - time.monotonic())
+                try:
+                    prefetch_handle.wait_group(idx, timeout=rem_budget)
+                except TimeoutError:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    is_approximated = True
+                    break
+                except Exception:
+                    pass
+
             if time.monotonic() > effective_deadline - reserved_headroom:
                 search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
                 is_approximated = True
@@ -535,7 +578,8 @@ class DispatchEngine:
 
             # Defensive per-vehicle fallback prefetch (instant O(1) no-op if already cached)
             if (
-                type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
+                prefetch_handle is None
+                and type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
                 and eval_reqs
             ):
                 self.routing_provider.prefetch_matrix(
@@ -586,6 +630,9 @@ class DispatchEngine:
                     search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
                     is_approximated = True
                     break
+
+        if prefetch_handle is not None:
+            prefetch_handle.cancel()
 
         if shared_routing_errors and search_status != SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
             if effective_config.mode == DispatchMode.EXACT:
@@ -691,8 +738,8 @@ class DispatchEngine:
             )
 
         # Stage 2, 3, 4: Candidate Generation
-        # Reserve headroom for set packing solver (headroom + 25ms)
-        cand_headroom = reserved_headroom + 0.025
+        # Reserve headroom for set packing solver (headroom + 15ms)
+        cand_headroom = reserved_headroom + 0.015
         candidates = self.generate_candidates(
             requests=pending_requests,
             vehicles=eligible_vehicles,

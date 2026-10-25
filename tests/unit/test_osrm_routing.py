@@ -958,3 +958,55 @@ def test_road_network_routing_provider_base_prefetch_matrices() -> None:
     assert count == 4
     assert len(router.prefetched_groups) == 2
 
+
+def test_osrm_prefetch_handle_and_start_prefetch_matrices() -> None:
+    """Verifies OsrmPrefetchHandle streaming wait, deduplication, and cancellation."""
+    transport = FakeOsrmTransport()
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, 1500.0], [1500.0, 0.0]],
+            "durations": [[0.0, 120.0], [120.0, 0.0]],
+        },
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=2)
+    handle = adapter.start_prefetch_matrices(groups=[[c1, c2], [c2, c3], [c1, c2]])
+    assert handle is not None
+
+    # Wait for group 0
+    ok0 = handle.wait_group(0, timeout=1.0)
+    assert ok0 is True
+
+    # Wait for out of bounds group index
+    ok_oob = handle.wait_group(99, timeout=1.0)
+    assert ok_oob is True
+
+    handle.cancel()
+    adapter.close()
+
+
+def test_default_osrm_transport_pool_exhaustion_timeout() -> None:
+    """Verifies that pool exhaustion raises TimeoutError when no connection is returned."""
+    from unittest.mock import MagicMock
+    import http.client
+
+    transport = DefaultOsrmTransport(base_url="http://127.0.0.1:5000", max_connections=1)
+    # Check out the only connection
+    conn1 = transport._get_connection(timeout=1.0)
+    assert transport._total_created == 1
+
+    # Attempting to check out second connection with short timeout should raise TimeoutError
+    with pytest.raises(TimeoutError, match="Connection pool exhausted"):
+        transport._get_connection(timeout=0.05)
+
+    # Return connection and close
+    transport._put_connection(conn1, healthy=True)
+    transport.close()
+

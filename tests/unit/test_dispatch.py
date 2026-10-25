@@ -342,3 +342,98 @@ def test_dispatch_batch_prefetches_matrices_across_candidate_vehicles() -> None:
     # Verify groups were passed for candidate vehicles
     groups = spy.prefetch_matrices_calls[0]
     assert len(groups) >= 1
+
+
+def test_dispatch_batch_pipelined_prefetch_handle() -> None:
+    """Verifies that dispatch_batch streams prefetch via RoutingPrefetchHandle."""
+    from typing import Sequence
+    from engine.contracts.routing import Coordinate, MatrixResult, RoadNetworkRoutingProvider, RouteGeometry, RoutingPrefetchHandle
+
+    class FakeHandle(RoutingPrefetchHandle):
+        def __init__(self) -> None:
+            self.waited_indices: list[int] = []
+            self.cancelled = False
+
+        def wait_group(self, group_index: int, timeout: float | None = None) -> bool:
+            self.waited_indices.append(group_index)
+            return True
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class PipelinedSpyRouter(RoadNetworkRoutingProvider):
+        def __init__(self) -> None:
+            self.handle = FakeHandle()
+
+        def get_direct_leg(self, origin: Coordinate, destination: Coordinate) -> tuple[int, int]:
+            return (1500, 200)
+
+        def get_distance_matrix(self, origins: Sequence[Coordinate], destinations: Sequence[Coordinate]) -> MatrixResult:
+            return MatrixResult(
+                distances_meters=[[1500 for _ in destinations] for _ in origins],
+                durations_seconds=[[200 for _ in destinations] for _ in origins],
+            )
+
+        def get_route(self, waypoints: Sequence[Coordinate]) -> RouteGeometry:
+            return RouteGeometry(points=list(waypoints), total_distance_meters=1500, total_duration_seconds=200)
+
+        def start_prefetch_matrices(
+            self,
+            groups: Sequence[Sequence[Coordinate]],
+            deadline: float | None = None,
+            reserved_headroom: float = 0.050,
+        ) -> RoutingPrefetchHandle | None:
+            return self.handle
+
+    spy = PipelinedSpyRouter()
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=spy,
+        spatial_index=H3SpatialIndexAdapter(),
+    )
+
+    req1 = _make_sample_request("req-pipe-1", 40.7128, -74.0060, 40.7200, -74.0050)
+    veh1 = _make_sample_vehicle("veh-pipe-1", 40.7130, -74.0055, capacity=4)
+    veh2 = _make_sample_vehicle("veh-pipe-2", 40.7132, -74.0058, capacity=4)
+
+    res = engine.dispatch_batch(
+        requests=[req1],
+        vehicles=[veh1, veh2],
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-pipe",
+    )
+
+    assert len(res.selected_assignments) == 1
+    assert len(spy.handle.waited_indices) >= 1
+    assert spy.handle.cancelled is True
+
+
+def test_dispatch_batch_candidate_vehicle_capping_and_prioritization() -> None:
+    """Verifies that CandidateGenerationConfig.bounded(max_candidate_vehicles=1) restricts evaluation."""
+    from engine.dispatch import CandidateGenerationConfig
+
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=MockRoutingProvider(),
+        spatial_index=H3SpatialIndexAdapter(),
+        config=CandidateGenerationConfig.bounded(max_candidate_vehicles=1),
+    )
+
+    # 1 request, 3 candidate vehicles at different distances
+    req = _make_sample_request("req-cap-1", 40.7128, -74.0060, 40.7200, -74.0050)
+    v_close = _make_sample_vehicle("veh-close", 40.7130, -74.0055, capacity=4)  # ~30m
+    v_mid = _make_sample_vehicle("veh-mid", 40.7150, -74.0050, capacity=4)      # ~250m
+    v_far = _make_sample_vehicle("veh-far", 40.7200, -74.0040, capacity=4)      # ~800m
+
+    res = engine.dispatch_batch(
+        requests=[req],
+        vehicles=[v_far, v_close, v_mid],
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-cap",
+    )
+
+    assert len(res.selected_assignments) == 1
+    # Verify the closest vehicle was selected because it was prioritized
+    assert res.selected_assignments[0].vehicle_id == "veh-close"
