@@ -409,6 +409,7 @@ class DispatchEngine:
                     nearby_requests_by_vehicle[sc.entity_id].append((sc.haversine_distance_meters, req))
 
         candidates: list[CandidateAssignment] = []
+        shared_leg_cache: dict[tuple[str, str], tuple[int, int]] = {}
 
         # Stage 3 & 4: Route Insertion & Group Bundling
         for veh_id, nearby_reqs in nearby_requests_by_vehicle.items():
@@ -457,6 +458,7 @@ class DispatchEngine:
                     deadline=effective_deadline,
                     reserved_headroom=reserved_headroom,
                     max_bundle_requests=max_bundle_reqs,
+                    shared_leg_cache=shared_leg_cache,
                 )
                 candidates.extend(ins_cands)
                 if time.monotonic() > effective_deadline - reserved_headroom:
@@ -474,6 +476,7 @@ class DispatchEngine:
                     deadline=effective_deadline,
                     reserved_headroom=reserved_headroom,
                     max_bundle_requests=max_bundle_reqs,
+                    shared_leg_cache=shared_leg_cache,
                 )
                 candidates.extend(bundle_cands)
                 if time.monotonic() > effective_deadline - reserved_headroom:

@@ -85,8 +85,8 @@ def solve_set_packing_regret_k(
         assigned_vehicles: set[str] = set()
         unassignable_requests: set[str] = {r for r in sorted_all_reqs if not req_to_cands[r]}
 
-        # Cached regret state: r -> (regret, c1)
-        req_info: dict[str, tuple[float, CandidateAssignment]] = {}
+        # Cached regret state: r -> (rounded_regret, regret, c1)
+        req_info: dict[str, tuple[float, float, CandidateAssignment]] = {}
 
         def _update_request(r: str) -> None:
             surviving = [
@@ -103,11 +103,14 @@ def solve_set_packing_regret_k(
             alt_idx = min(k - 1, len(surviving) - 1)
             ck = surviving[alt_idx]
             regret = c1.objective_value - ck.objective_value
-            req_info[r] = (regret, c1)
+            req_info[r] = (round(regret, 6), regret, c1)
 
         for r in sorted_all_reqs:
             if r not in unassignable_requests:
                 _update_request(r)
+
+        # Active request list maintained in deterministic sorted order
+        active_reqs = [r for r in sorted_all_reqs if r in req_info]
 
         # =========================================================================
         # Stage 5: Regret-K Heuristic Assignment Loop (Hard Cutoff at cutoff_time)
@@ -127,15 +130,15 @@ def solve_set_packing_regret_k(
             # Find active request with maximum regret (deterministic ordering over sorted_all_reqs)
             best_req: str | None = None
             max_regret = -float("inf")
+            rounded_max_regret = -float("inf")
             best_cand_for_best_req: CandidateAssignment | None = None
 
-            for r in sorted_all_reqs:
-                if r not in req_info:
-                    continue
-                regret, c1 = req_info[r]
+            active_reqs = [r for r in active_reqs if r in req_info]
+            for r in active_reqs:
+                rounded_regret, regret, c1 = req_info[r]
 
                 # Deterministic comparison of regret and candidate tie-breaking
-                regret_diff = round(regret, 6) - round(max_regret, 6)
+                regret_diff = rounded_regret - rounded_max_regret
                 is_better = False
                 if regret_diff > 0:
                     is_better = True
@@ -152,6 +155,7 @@ def solve_set_packing_regret_k(
 
                 if is_better:
                     max_regret = regret
+                    rounded_max_regret = rounded_regret
                     best_req = r
                     best_cand_for_best_req = c1
 

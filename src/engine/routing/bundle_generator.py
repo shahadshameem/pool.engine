@@ -84,6 +84,7 @@ def generate_group_bundles(
     deadline: float | None = None,
     reserved_headroom: float = 0.050,
     max_bundle_requests: int | None = None,
+    shared_leg_cache: dict[tuple[str, str], tuple[int, int]] | None = None,
 ) -> list[CandidateAssignment]:
     """
     Forms multi-passenger group trip bundles for an available vehicle.
@@ -108,9 +109,11 @@ def generate_group_bundles(
             req.dropoff_location.latitude, req.dropoff_location.longitude
         )
 
-    # Local per-invocation leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
+    # Leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
     # Keyed by stable waypoint identity; preserves directionality.
-    leg_cache: dict[tuple[str, str], tuple[int, int]] = {}
+    leg_cache: dict[tuple[str, str], tuple[int, int]] = (
+        shared_leg_cache if shared_leg_cache is not None else {}
+    )
 
     def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int]:
         cache_key = (from_id, to_id)
@@ -260,6 +263,7 @@ def generate_group_bundles(
             d_arr_times = [0] * num_reqs
             # req_status: 0 = not picked up, 1 = picked up, 2 = dropped off
             req_status = [0] * num_reqs
+            step_counter = 0
 
             def search_bundles(
                 current_occ: int,
@@ -268,9 +272,14 @@ def generate_group_bundles(
                 prev_stop_id: str,
                 total_vmt: int,
             ) -> None:
-                nonlocal valid_candidates, deadline_hit
+                nonlocal valid_candidates, deadline_hit, step_counter
 
-                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                step_counter += 1
+                if (
+                    deadline is not None
+                    and (step_counter & 31 == 0)
+                    and time.monotonic() > deadline - reserved_headroom
+                ):
                     deadline_hit = True
                     return
 

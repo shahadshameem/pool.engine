@@ -62,6 +62,7 @@ def generate_active_ride_insertions(
     deadline: float | None = None,
     reserved_headroom: float = 0.050,
     max_bundle_requests: int | None = None,
+    shared_leg_cache: dict[tuple[str, str], tuple[int, int]] | None = None,
 ) -> list[CandidateAssignment]:
     """
     Generates and evaluates all valid stop insertion permutations for single requests
@@ -88,9 +89,11 @@ def generate_active_ride_insertions(
     stop_coords: dict[str, Coordinate] = dict(existing_coords)
     stop_coords[v_stop_id] = v_coord
 
-    # Local per-invocation leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
+    # Leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
     # Keyed by stable waypoint identity; preserves directionality unless router itself guarantees symmetry.
-    leg_cache: dict[tuple[str, str], tuple[int, int]] = {}
+    leg_cache: dict[tuple[str, str], tuple[int, int]] = (
+        shared_leg_cache if shared_leg_cache is not None else {}
+    )
 
     def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int]:
         cache_key = (from_id, to_id)
@@ -166,6 +169,8 @@ def generate_active_ride_insertions(
         stop_coords[d_stop.stop_id] = Coordinate(d_stop.location.latitude, d_stop.location.longitude)
 
     # Pre-index stop IDs, deadlines and bounds for all eligible requests once
+    req_p_ids: dict[str, str] = {r.request_id: f"stop-p-{r.request_id}" for r in eligible_requests}
+    req_d_ids: dict[str, str] = {r.request_id: f"stop-d-{r.request_id}" for r in eligible_requests}
     req_p_deadlines: dict[str, int] = {
         r.request_id: r.earliest_pickup_time + policy.max_pickup_delay_seconds
         for r in eligible_requests
@@ -178,10 +183,39 @@ def generate_active_ride_insertions(
         )
         for r in eligible_requests
     }
-    existing_detour_map: dict[str, tuple[str, int, int]] = {
-        ex_id: (p_id, orig_p, orig_dur)
-        for ex_id, p_id, orig_p, orig_dur in existing_dropoff_detour_data
-    }
+
+    # Precompute existing stop metadata for array indexing
+    num_existing = len(existing_stops)
+    ex_stop_ids = [s.stop_id for s in existing_stops]
+    ex_deltas = [s.passenger_delta for s in existing_stops]
+    ex_dwells = [s.dwell_duration_seconds for s in existing_stops]
+    ex_deadlines = [s.promised_window_end for s in existing_stops]
+    ex_is_dropoff = [s.stop_type == StopType.DROPOFF for s in existing_stops]
+
+    ex_p_match_idx: list[int | None] = []
+    ex_orig_p_times: list[int] = []
+    ex_orig_durations: list[int] = []
+    for ex_idx, s in enumerate(existing_stops):
+        if s.stop_type == StopType.DROPOFF:
+            p_match = next(
+                (p for p in active_ride.stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
+                None,
+            )
+            if p_match is not None:
+                orig_p = p_match.actual_arrival_time or p_match.scheduled_arrival_time
+                orig_dur = max(0, s.scheduled_arrival_time - orig_p)
+                p_in_ex = next((idx for idx, st in enumerate(existing_stops) if st.stop_id == p_match.stop_id), None)
+                ex_p_match_idx.append(p_in_ex)
+                ex_orig_p_times.append(orig_p)
+                ex_orig_durations.append(orig_dur)
+            else:
+                ex_p_match_idx.append(None)
+                ex_orig_p_times.append(0)
+                ex_orig_durations.append(0)
+        else:
+            ex_p_match_idx.append(None)
+            ex_orig_p_times.append(0)
+            ex_orig_durations.append(0)
 
     deadline_hit = False
 
@@ -203,7 +237,6 @@ def generate_active_ride_insertions(
                 break
 
             # DFS branch-and-bound with admissible temporal and capacity pruning
-            num_existing = len(existing_stops)
             num_reqs = len(req_subset)
             req_list = list(req_subset)
 
@@ -212,13 +245,18 @@ def generate_active_ride_insertions(
             d_deadlines = [r.latest_dropoff_time for r in req_list]
             max_allowed_durs = [req_max_allowed_durs[r.request_id] for r in req_list]
 
-            req_p_stops = [req_stops_dict[r.request_id][0] for r in req_list]
-            req_d_stops = [req_stops_dict[r.request_id][1] for r in req_list]
+            subset_p_ids = [req_p_ids[r.request_id] for r in req_list]
+            subset_d_ids = [req_d_ids[r.request_id] for r in req_list]
+            p_deltas = [r.seat_count for r in req_list]
+            d_deltas = [-r.seat_count for r in req_list]
 
-            current_stops: list[RouteStop] = []
-            arrival_times: dict[str, int] = {}
+            current_stops_encoded: list[int] = []
+            ex_arr_times = [0] * num_existing
+            p_arr_times = [0] * num_reqs
+            d_arr_times = [0] * num_reqs
             # req_status: 0 = not picked up, 1 = picked up, 2 = dropped off
             req_status = [0] * num_reqs
+            step_counter = 0
 
             def search_insertions(
                 ex_idx: int,
@@ -228,9 +266,14 @@ def generate_active_ride_insertions(
                 prev_stop_id: str,
                 total_vmt: int,
             ) -> None:
-                nonlocal candidates, deadline_hit
+                nonlocal candidates, deadline_hit, step_counter
 
-                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                step_counter += 1
+                if (
+                    deadline is not None
+                    and (step_counter & 31 == 0)
+                    and time.monotonic() > deadline - reserved_headroom
+                ):
                     deadline_hit = True
                     return
 
@@ -238,11 +281,11 @@ def generate_active_ride_insertions(
                 # Monotonicity of time: all remaining unvisited stops must be visited at or after current_clock.
                 # 1. Unvisited pickups: arrival cannot be earlier than current_clock.
                 #    If current_clock > p_deadline, every continuation violates check_pickup_delay.
-                # 2. Picked-up requests: in-vehicle duration so far is (current_clock - p_arr).
+                # 2. Dropoff deadline: if current_clock > d_deadline, dropoff in any continuation
+                #    arrives at or after current_clock, so latest_dropoff_time is strictly violated.
+                # 3. Picked-up requests: in-vehicle duration so far is (current_clock - p_arr).
                 #    If (current_clock - p_arr) > max_allowed_dur, dropoff in any continuation
                 #    arrives at or after current_clock, so in-vehicle detour strictly violates check_detour_bound.
-                # 3. Dropoff deadline: if current_clock > d_deadline, dropoff in any continuation
-                #    arrives at or after current_clock, so latest_dropoff_time is strictly violated.
                 # 4. Unvisited existing dropoffs: arrival cannot be earlier than current_clock.
                 #    If current_clock > promised_window_end, every continuation violates the promise.
                 for i in range(num_reqs):
@@ -250,34 +293,71 @@ def generate_active_ride_insertions(
                         return
                     if req_status[i] != 2 and current_clock > d_deadlines[i]:
                         return
-                    if req_status[i] == 1:
-                        p_arr = arrival_times[req_p_stops[i].stop_id]
-                        if (current_clock - p_arr) > (max_allowed_durs[i] + 1e-6):
-                            return
+                    if req_status[i] == 1 and (current_clock - p_arr_times[i]) > (max_allowed_durs[i] + 1e-6):
+                        return
                 for j in range(ex_idx, num_existing):
-                    ex_st = existing_stops[j]
-                    if ex_st.stop_type == StopType.DROPOFF and current_clock > ex_st.promised_window_end:
+                    if ex_is_dropoff[j] and current_clock > ex_deadlines[j]:
                         return
 
                 # Base case: all existing stops and all requests have been placed
                 if ex_idx == num_existing and all(st == 2 for st in req_status):
                     # Create updated RouteStop instances only for confirmed feasible candidates
-                    updated_stops = [
-                        RouteStop(
-                            stop_id=s.stop_id,
-                            ride_id=active_ride.ride_id,
-                            request_id=s.request_id,
-                            stop_type=s.stop_type,
-                            location=s.location,
-                            passenger_delta=s.passenger_delta,
-                            scheduled_arrival_time=arrival_times[s.stop_id],
-                            promised_window_start=s.promised_window_start,
-                            promised_window_end=s.promised_window_end,
-                            dwell_duration_seconds=s.dwell_duration_seconds,
-                            status=s.status,
-                        )
-                        for s in current_stops
-                    ]
+                    updated_stops: list[RouteStop] = []
+                    for code in current_stops_encoded:
+                        if code >= 1000:
+                            j = code - 1000
+                            s = existing_stops[j]
+                            updated_stops.append(
+                                RouteStop(
+                                    stop_id=s.stop_id,
+                                    ride_id=active_ride.ride_id,
+                                    request_id=s.request_id,
+                                    stop_type=s.stop_type,
+                                    location=s.location,
+                                    passenger_delta=s.passenger_delta,
+                                    scheduled_arrival_time=ex_arr_times[j],
+                                    promised_window_start=s.promised_window_start,
+                                    promised_window_end=s.promised_window_end,
+                                    dwell_duration_seconds=s.dwell_duration_seconds,
+                                    status=s.status,
+                                )
+                            )
+                        elif code > 0:
+                            i = code - 1
+                            r = req_list[i]
+                            updated_stops.append(
+                                RouteStop(
+                                    stop_id=subset_p_ids[i],
+                                    ride_id=active_ride.ride_id,
+                                    request_id=r.request_id,
+                                    stop_type=StopType.PICKUP,
+                                    location=r.pickup_location,
+                                    passenger_delta=p_deltas[i],
+                                    scheduled_arrival_time=p_arr_times[i],
+                                    promised_window_start=r.earliest_pickup_time,
+                                    promised_window_end=p_deadlines[i],
+                                    dwell_duration_seconds=0,
+                                    status=StopStatus.SCHEDULED,
+                                )
+                            )
+                        else:
+                            i = (-code) - 1
+                            r = req_list[i]
+                            updated_stops.append(
+                                RouteStop(
+                                    stop_id=subset_d_ids[i],
+                                    ride_id=active_ride.ride_id,
+                                    request_id=r.request_id,
+                                    stop_type=StopType.DROPOFF,
+                                    location=r.dropoff_location,
+                                    passenger_delta=d_deltas[i],
+                                    scheduled_arrival_time=d_arr_times[i],
+                                    promised_window_start=r.earliest_pickup_time,
+                                    promised_window_end=d_deadlines[i],
+                                    dwell_duration_seconds=0,
+                                    status=StopStatus.SCHEDULED,
+                                )
+                            )
 
                     # Compute baseline unshared VMT and savings ratio
                     baseline_vmt = remaining_existing_vmt + sum(r.direct_distance_meters for r in req_subset)
@@ -287,12 +367,8 @@ def generate_active_ride_insertions(
                     # Penalties
                     total_direct_dur = sum(r.direct_duration_seconds for r in req_subset)
                     total_detour = sum(
-                        max(
-                            0,
-                            (arrival_times[f"stop-d-{r.request_id}"] - arrival_times[f"stop-p-{r.request_id}"])
-                            - r.direct_duration_seconds,
-                        )
-                        for r in req_subset
+                        max(0, (d_arr_times[i] - p_arr_times[i]) - req_list[i].direct_duration_seconds)
+                        for i in range(num_reqs)
                     )
                     p_detour = (
                         float(total_detour) / float(total_direct_dur)
@@ -301,8 +377,8 @@ def generate_active_ride_insertions(
                     )
 
                     total_wait = sum(
-                        max(0, arrival_times[f"stop-p-{r.request_id}"] - r.earliest_pickup_time)
-                        for r in req_subset
+                        max(0, p_arr_times[i] - req_list[i].earliest_pickup_time)
+                        for i in range(num_reqs)
                     )
                     p_wait = (
                         float(total_wait) / float(len(req_subset) * policy.max_pickup_delay_seconds)
@@ -346,99 +422,88 @@ def generate_active_ride_insertions(
 
                 # Branch 1: Next unvisited existing stop
                 if ex_idx < num_existing:
-                    ex_stop = existing_stops[ex_idx]
-                    next_occ = current_occ + ex_stop.passenger_delta
+                    next_occ = current_occ + ex_deltas[ex_idx]
                     if 0 <= next_occ <= vehicle.total_seat_capacity:
-                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, ex_stop.stop_id)
+                        ex_id = ex_stop_ids[ex_idx]
+                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, ex_id)
                         arr = current_clock + leg_dur
                         feasible = True
 
-                        if ex_stop.stop_type == StopType.DROPOFF:
-                            if arr > ex_stop.promised_window_end:
+                        if ex_is_dropoff[ex_idx]:
+                            if arr > ex_deadlines[ex_idx]:
                                 feasible = False
-                            elif ex_stop.stop_id in existing_detour_map:
-                                p_match_id, orig_p_time, orig_duration = existing_detour_map[ex_stop.stop_id]
-                                p_time = arrival_times.get(p_match_id, orig_p_time)
+                            elif ex_orig_durations[ex_idx] > 0:
+                                p_match_i = ex_p_match_idx[ex_idx]
+                                p_time = (
+                                    ex_arr_times[p_match_i]
+                                    if p_match_i is not None
+                                    else ex_orig_p_times[ex_idx]
+                                )
                                 actual_dur = max(0, arr - p_time)
-                                if not check_detour_bound(actual_dur, orig_duration, policy):
+                                if not check_detour_bound(actual_dur, ex_orig_durations[ex_idx], policy):
                                     feasible = False
 
                         if feasible:
-                            for i in range(num_reqs):
-                                if req_status[i] == 1:
-                                    p_arr = arrival_times[req_p_stops[i].stop_id]
-                                    if (arr - p_arr) > (max_allowed_durs[i] + 1e-6):
-                                        feasible = False
-                                        break
-                                    if arr > d_deadlines[i]:
-                                        feasible = False
-                                        break
-
-                        if feasible:
-                            arrival_times[ex_stop.stop_id] = arr
-                            current_stops.append(ex_stop)
+                            ex_arr_times[ex_idx] = arr
+                            current_stops_encoded.append(1000 + ex_idx)
                             search_insertions(
                                 ex_idx=ex_idx + 1,
                                 current_occ=next_occ,
                                 peak_occ=max(peak_occ, next_occ),
-                                current_clock=arr + ex_stop.dwell_duration_seconds,
-                                prev_stop_id=ex_stop.stop_id,
+                                current_clock=arr + ex_dwells[ex_idx],
+                                prev_stop_id=ex_id,
                                 total_vmt=total_vmt + leg_dist,
                             )
-                            current_stops.pop()
-                            del arrival_times[ex_stop.stop_id]
+                            current_stops_encoded.pop()
 
                 # Branch 2: Pick up or drop off request stops
                 for i in range(num_reqs):
                     if req_status[i] == 0:
                         # Pickup stop for request i
-                        p_stop = req_p_stops[i]
-                        next_occ = current_occ + p_stop.passenger_delta
+                        next_occ = current_occ + p_deltas[i]
                         if next_occ <= vehicle.total_seat_capacity:
-                            leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_stop.stop_id)
+                            p_id = subset_p_ids[i]
+                            leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_id)
                             arr = current_clock + leg_dur
                             if arr <= p_deadlines[i]:
-                                arrival_times[p_stop.stop_id] = arr
-                                current_stops.append(p_stop)
+                                p_arr_times[i] = arr
+                                current_stops_encoded.append(i + 1)
                                 req_status[i] = 1
                                 search_insertions(
                                     ex_idx=ex_idx,
                                     current_occ=next_occ,
                                     peak_occ=max(peak_occ, next_occ),
-                                    current_clock=arr + p_stop.dwell_duration_seconds,
-                                    prev_stop_id=p_stop.stop_id,
+                                    current_clock=arr,
+                                    prev_stop_id=p_id,
                                     total_vmt=total_vmt + leg_dist,
                                 )
                                 req_status[i] = 0
-                                current_stops.pop()
-                                del arrival_times[p_stop.stop_id]
+                                current_stops_encoded.pop()
 
                     elif req_status[i] == 1:
                         # Dropoff stop for request i
-                        d_stop = req_d_stops[i]
-                        next_occ = current_occ + d_stop.passenger_delta
+                        next_occ = current_occ + d_deltas[i]
                         if next_occ >= 0:
-                            leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_stop.stop_id)
+                            d_id = subset_d_ids[i]
+                            leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_id)
                             arr = current_clock + leg_dur
                             if arr > d_deadlines[i]:
                                 continue
-                            p_id = req_p_stops[i].stop_id
-                            in_veh = max(0, arr - arrival_times[p_id])
+                            in_veh = max(0, arr - p_arr_times[i])
                             if in_veh <= (max_allowed_durs[i] + 1e-6):
-                                arrival_times[d_stop.stop_id] = arr
-                                current_stops.append(d_stop)
+                                d_arr_times[i] = arr
+                                current_stops_encoded.append(-(i + 1))
                                 req_status[i] = 2
                                 search_insertions(
                                     ex_idx=ex_idx,
                                     current_occ=next_occ,
                                     peak_occ=max(peak_occ, next_occ),
-                                    current_clock=arr + d_stop.dwell_duration_seconds,
-                                    prev_stop_id=d_stop.stop_id,
+                                    current_clock=arr,
+                                    prev_stop_id=d_id,
                                     total_vmt=total_vmt + leg_dist,
                                 )
                                 req_status[i] = 1
-                                current_stops.pop()
-                                del arrival_times[d_stop.stop_id]
+                                current_stops_encoded.pop()
 
             search_insertions(
                 ex_idx=0,
