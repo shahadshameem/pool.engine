@@ -6,7 +6,14 @@ import uuid
 from typing import Sequence
 
 from engine.contracts.policy import DispatchPolicy
-from engine.contracts.routing import Coordinate, RoadNetworkRoutingProvider
+from engine.contracts.routing import (
+    Coordinate,
+    RoadNetworkRoutingProvider,
+    RouteLookupError,
+    RouteTimeoutError,
+    RoutingProviderError,
+    validate_route_leg,
+)
 from engine.domain.candidate import CandidateAssignment, ScoreBreakdown
 from engine.domain.enums import StopStatus, StopType
 from engine.domain.models import RideRequest, RouteStop, Vehicle
@@ -84,7 +91,9 @@ def generate_group_bundles(
     deadline: float | None = None,
     reserved_headroom: float = 0.050,
     max_bundle_requests: int | None = None,
-    shared_leg_cache: dict[tuple[str, str], tuple[int, int]] | None = None,
+    shared_leg_cache: dict[tuple[str, str], tuple[int, int] | None] | None = None,
+    shared_routing_errors: list[RoutingProviderError] | None = None,
+    propagate_routing_errors: bool = False,
 ) -> list[CandidateAssignment]:
     """
     Forms multi-passenger group trip bundles for an available vehicle.
@@ -109,19 +118,43 @@ def generate_group_bundles(
             req.dropoff_location.latitude, req.dropoff_location.longitude
         )
 
-    # Leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
-    # Keyed by stable waypoint identity; preserves directionality.
-    leg_cache: dict[tuple[str, str], tuple[int, int]] = (
+    # Leg cache: (from_id, to_id) -> (distance_meters, duration_seconds) | None
+    # Keyed by stable waypoint identity; preserves directionality. None indicates unroutable leg.
+    leg_cache: dict[tuple[str, str], tuple[int, int] | None] = (
         shared_leg_cache if shared_leg_cache is not None else {}
     )
 
-    def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int]:
+    def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int] | None:
         cache_key = (from_id, to_id)
-        cached = leg_cache.get(cache_key)
-        if cached is None:
-            cached = router.get_direct_leg(stop_coords[from_id], stop_coords[to_id])
-            leg_cache[cache_key] = cached
-        return cached
+        if cache_key in leg_cache:
+            return leg_cache[cache_key]
+
+        from_coord = stop_coords[from_id]
+        to_coord = stop_coords[to_id]
+        try:
+            raw_leg = router.get_direct_leg(from_coord, to_coord)
+            validated = validate_route_leg(from_coord, to_coord, raw_leg)
+            leg_cache[cache_key] = validated
+            return validated
+        except RoutingProviderError as err:
+            leg_cache[cache_key] = None
+            if shared_routing_errors is not None:
+                shared_routing_errors.append(err)
+            if propagate_routing_errors:
+                raise
+            return None
+        except (TimeoutError, ConnectionError) as net_err:
+            wrapped = (
+                RouteTimeoutError(str(net_err))
+                if isinstance(net_err, TimeoutError)
+                else RouteLookupError(str(net_err))
+            )
+            leg_cache[cache_key] = None
+            if shared_routing_errors is not None:
+                shared_routing_errors.append(wrapped)
+            if propagate_routing_errors:
+                raise wrapped from net_err
+            return None
 
     # Pre-index stop IDs, deadlines and bounds for all eligible requests once
     req_p_id: dict[str, str] = {r.request_id: f"stop-p-{r.request_id}" for r in eligible_requests}
@@ -166,11 +199,17 @@ def generate_group_bundles(
                 r = req_list[0]
                 p_id = req_p_id[r.request_id]
                 d_id = req_d_id[r.request_id]
-                leg1_dist, leg1_dur = get_cached_leg(v_stop_id, p_id)
+                leg1 = get_cached_leg(v_stop_id, p_id)
+                if leg1 is None:
+                    continue
+                leg1_dist, leg1_dur = leg1
                 arr_p = current_time + leg1_dur
                 if arr_p > req_p_deadlines[r.request_id]:
                     continue
-                leg2_dist, leg2_dur = get_cached_leg(p_id, d_id)
+                leg2 = get_cached_leg(p_id, d_id)
+                if leg2 is None:
+                    continue
+                leg2_dist, leg2_dur = leg2
                 arr_d = arr_p + leg2_dur
                 if arr_d > r.latest_dropoff_time:
                     continue
@@ -410,7 +449,10 @@ def generate_group_bundles(
                             continue
 
                         p_id = p_ids[i]
-                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_id)
+                        leg = get_cached_leg(prev_stop_id, p_id)
+                        if leg is None:
+                            continue
+                        leg_dist, leg_dur = leg
                         arr = current_clock + leg_dur
                         if arr > p_deadlines[i]:
                             continue
@@ -436,7 +478,10 @@ def generate_group_bundles(
                     if req_status[i] == 1:
                         new_occ = current_occ + d_deltas[i]
                         d_id = d_ids[i]
-                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_id)
+                        leg = get_cached_leg(prev_stop_id, d_id)
+                        if leg is None:
+                            continue
+                        leg_dist, leg_dur = leg
                         arr = current_clock + leg_dur
                         if arr > d_deadlines[i]:
                             continue

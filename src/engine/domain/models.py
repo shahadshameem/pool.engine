@@ -139,6 +139,7 @@ class MatchResult(BaseModel):
     dispatch_mode: DispatchMode = DispatchMode.BOUNDED
     search_status: SearchStatus = SearchStatus.COMPLETE
     is_approximated: bool = False
+    routing_errors_count: int = 0
 
 
 # Rebuild candidate assignment now that RouteStop is defined

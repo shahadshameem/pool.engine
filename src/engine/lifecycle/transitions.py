@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from engine.contracts.policy import DispatchPolicy
-from engine.contracts.routing import Coordinate, RoadNetworkRoutingProvider
+from engine.contracts.routing import (
+    Coordinate,
+    RoadNetworkRoutingProvider,
+    RoutingProviderError,
+    validate_route_leg,
+)
 from engine.contracts.storage import RideStorageProvider
 from engine.domain.enums import RequestStatus, RideStatus, StopStatus, StopType
 from engine.domain.models import GeoCoordinate, Ride, RouteStop
@@ -472,7 +477,15 @@ def cancel_en_route_request(
             updated_etas[stop.stop_id] = stop.scheduled_arrival_time
             continue
 
-        leg_dist, leg_dur = router.get_direct_leg(waypoints[idx], waypoints[idx + 1])
+        try:
+            raw_leg = router.get_direct_leg(waypoints[idx], waypoints[idx + 1])
+            leg_dist, leg_dur = validate_route_leg(
+                waypoints[idx], waypoints[idx + 1], raw_leg
+            )
+        except (RoutingProviderError, TimeoutError, ConnectionError) as err:
+            raise LifecycleTransitionError(
+                f"Failed to calculate route leg during en-route cancellation: {err}"
+            ) from err
         total_vmt += leg_dist
         clock += leg_dur
         new_arrival = clock

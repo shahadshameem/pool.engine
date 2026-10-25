@@ -8,7 +8,11 @@ import uuid
 from typing import Optional, Sequence
 
 from engine.contracts.policy import DispatchPolicy, DispatchPolicyProvider
-from engine.contracts.routing import Coordinate, RoadNetworkRoutingProvider
+from engine.contracts.routing import (
+    Coordinate,
+    RoadNetworkRoutingProvider,
+    RoutingProviderError,
+)
 from engine.contracts.spatial import SpatialIndexProvider
 from engine.contracts.storage import RideStorageProvider
 from engine.domain.candidate import CandidateAssignment
@@ -46,11 +50,13 @@ class CandidateList(list[CandidateAssignment]):
         dispatch_mode: DispatchMode = DispatchMode.BOUNDED,
         search_status: SearchStatus = SearchStatus.COMPLETE,
         is_approximated: bool = False,
+        routing_errors_count: int = 0,
     ) -> None:
         super().__init__(candidates)
         self.dispatch_mode = dispatch_mode
         self.search_status = search_status
         self.is_approximated = is_approximated
+        self.routing_errors_count = routing_errors_count
 
 
 @dataclass(frozen=True)
@@ -85,6 +91,7 @@ class CandidateGenerationConfig:
         exhaustive_fallback: In BOUNDED mode, if True and bounded search yields 0 capable candidates,
             falls back to expanding search radius up to the physical reachability bound.
         initial_search_radius_meters: Initial radius used in BOUNDED mode when exhaustive_fallback is enabled.
+        propagate_routing_errors: If True, raises RoutingProviderError on routing failure rather than isolating.
     """
 
     mode: DispatchMode = DispatchMode.BOUNDED
@@ -95,9 +102,14 @@ class CandidateGenerationConfig:
     max_bundle_size: int = 2
     exhaustive_fallback: bool = True
     initial_search_radius_meters: float = 5000.0
+    propagate_routing_errors: bool = False
 
     @classmethod
-    def exact(cls, max_bundle_size: int = 2) -> "CandidateGenerationConfig":
+    def exact(
+        cls,
+        max_bundle_size: int = 2,
+        propagate_routing_errors: bool = False,
+    ) -> "CandidateGenerationConfig":
         """Constructs an EXACT mode configuration with zero truncation limits."""
         return cls(
             mode=DispatchMode.EXACT,
@@ -108,6 +120,7 @@ class CandidateGenerationConfig:
             max_bundle_size=max_bundle_size,
             exhaustive_fallback=False,
             initial_search_radius_meters=0.0,
+            propagate_routing_errors=propagate_routing_errors,
         )
 
     @classmethod
@@ -120,6 +133,7 @@ class CandidateGenerationConfig:
         max_bundle_size: int = 2,
         exhaustive_fallback: bool = True,
         initial_search_radius_meters: float = 5000.0,
+        propagate_routing_errors: bool = False,
     ) -> "CandidateGenerationConfig":
         """Constructs a BOUNDED mode configuration with explicit approximation limits."""
         return cls(
@@ -131,6 +145,7 @@ class CandidateGenerationConfig:
             max_bundle_size=max_bundle_size,
             exhaustive_fallback=exhaustive_fallback,
             initial_search_radius_meters=initial_search_radius_meters,
+            propagate_routing_errors=propagate_routing_errors,
         )
 
 
@@ -267,12 +282,14 @@ class DispatchEngine:
                 max_bundle_size=max_bundle_size,
                 exhaustive_fallback=effective_config.exhaustive_fallback,
                 initial_search_radius_meters=effective_config.initial_search_radius_meters,
+                propagate_routing_errors=effective_config.propagate_routing_errors,
             )
 
         # Normalize config for exact mode
         if effective_config.mode == DispatchMode.EXACT:
             effective_config = CandidateGenerationConfig.exact(
-                max_bundle_size=effective_config.max_bundle_size
+                max_bundle_size=effective_config.max_bundle_size,
+                propagate_routing_errors=effective_config.propagate_routing_errors,
             )
             is_approximated = False
             search_status = SearchStatus.COMPLETE
@@ -433,7 +450,8 @@ class DispatchEngine:
                     nearby_requests_by_vehicle[sc.entity_id].append((sc.haversine_distance_meters, req))
 
         candidates: list[CandidateAssignment] = []
-        shared_leg_cache: dict[tuple[str, str], tuple[int, int]] = {}
+        shared_leg_cache: dict[tuple[str, str], tuple[int, int] | None] = {}
+        shared_routing_errors: list[RoutingProviderError] = []
 
         # Stage 3 & 4: Route Insertion & Group Bundling
         for veh_id, nearby_reqs in nearby_requests_by_vehicle.items():
@@ -487,6 +505,8 @@ class DispatchEngine:
                     reserved_headroom=reserved_headroom,
                     max_bundle_requests=max_bundle_reqs,
                     shared_leg_cache=shared_leg_cache,
+                    shared_routing_errors=shared_routing_errors,
+                    propagate_routing_errors=effective_config.propagate_routing_errors,
                 )
                 candidates.extend(ins_cands)
                 if time.monotonic() > effective_deadline - reserved_headroom:
@@ -505,6 +525,8 @@ class DispatchEngine:
                     reserved_headroom=reserved_headroom,
                     max_bundle_requests=max_bundle_reqs,
                     shared_leg_cache=shared_leg_cache,
+                    shared_routing_errors=shared_routing_errors,
+                    propagate_routing_errors=effective_config.propagate_routing_errors,
                 )
                 candidates.extend(bundle_cands)
                 if time.monotonic() > effective_deadline - reserved_headroom:
@@ -512,11 +534,19 @@ class DispatchEngine:
                     is_approximated = True
                     break
 
+        if shared_routing_errors and search_status != SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
+            if effective_config.mode == DispatchMode.EXACT:
+                search_status = SearchStatus.INCOMPLETE_ROUTING_ERROR
+                is_approximated = True
+            else:
+                is_approximated = True
+
         return CandidateList(
             candidates=candidates,
             dispatch_mode=effective_config.mode,
             search_status=search_status,
             is_approximated=is_approximated,
+            routing_errors_count=len(shared_routing_errors),
         )
 
     def dispatch_batch(
@@ -646,6 +676,9 @@ class DispatchEngine:
         elif time.monotonic() >= effective_deadline:
             effective_search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
             effective_is_approximated = True
+        elif candidates.search_status == SearchStatus.INCOMPLETE_ROUTING_ERROR:
+            effective_search_status = SearchStatus.INCOMPLETE_ROUTING_ERROR
+            effective_is_approximated = True
 
         # Stage 6: Canonical MatchResult Serialization
         match_result = MatchResult(
@@ -659,6 +692,7 @@ class DispatchEngine:
             dispatch_mode=effective_dispatch_mode,
             search_status=effective_search_status,
             is_approximated=effective_is_approximated,
+            routing_errors_count=candidates.routing_errors_count,
         )
 
         return match_result

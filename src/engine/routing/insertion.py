@@ -6,7 +6,14 @@ import uuid
 from typing import Sequence
 
 from engine.contracts.policy import DispatchPolicy
-from engine.contracts.routing import Coordinate, RoadNetworkRoutingProvider
+from engine.contracts.routing import (
+    Coordinate,
+    RoadNetworkRoutingProvider,
+    RouteLookupError,
+    RouteTimeoutError,
+    RoutingProviderError,
+    validate_route_leg,
+)
 from engine.domain.candidate import CandidateAssignment, ScoreBreakdown
 from engine.domain.enums import StopStatus, StopType
 from engine.domain.models import GeoCoordinate, Ride, RideRequest, RouteStop, Vehicle
@@ -62,7 +69,9 @@ def generate_active_ride_insertions(
     deadline: float | None = None,
     reserved_headroom: float = 0.050,
     max_bundle_requests: int | None = None,
-    shared_leg_cache: dict[tuple[str, str], tuple[int, int]] | None = None,
+    shared_leg_cache: dict[tuple[str, str], tuple[int, int] | None] | None = None,
+    shared_routing_errors: list[RoutingProviderError] | None = None,
+    propagate_routing_errors: bool = False,
 ) -> list[CandidateAssignment]:
     """
     Generates and evaluates all valid stop insertion permutations for single requests
@@ -89,25 +98,53 @@ def generate_active_ride_insertions(
     stop_coords: dict[str, Coordinate] = dict(existing_coords)
     stop_coords[v_stop_id] = v_coord
 
-    # Leg cache: (from_id, to_id) -> (distance_meters, duration_seconds)
+    # Leg cache: (from_id, to_id) -> (distance_meters, duration_seconds) | None
     # Keyed by stable waypoint identity; preserves directionality unless router itself guarantees symmetry.
-    leg_cache: dict[tuple[str, str], tuple[int, int]] = (
+    leg_cache: dict[tuple[str, str], tuple[int, int] | None] = (
         shared_leg_cache if shared_leg_cache is not None else {}
     )
 
-    def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int]:
+    def get_cached_leg(from_id: str, to_id: str) -> tuple[int, int] | None:
         cache_key = (from_id, to_id)
-        cached = leg_cache.get(cache_key)
-        if cached is None:
-            cached = router.get_direct_leg(stop_coords[from_id], stop_coords[to_id])
-            leg_cache[cache_key] = cached
-        return cached
+        if cache_key in leg_cache:
+            return leg_cache[cache_key]
+
+        from_coord = stop_coords[from_id]
+        to_coord = stop_coords[to_id]
+        try:
+            raw_leg = router.get_direct_leg(from_coord, to_coord)
+            validated = validate_route_leg(from_coord, to_coord, raw_leg)
+            leg_cache[cache_key] = validated
+            return validated
+        except RoutingProviderError as err:
+            leg_cache[cache_key] = None
+            if shared_routing_errors is not None:
+                shared_routing_errors.append(err)
+            if propagate_routing_errors:
+                raise
+            return None
+        except (TimeoutError, ConnectionError) as net_err:
+            wrapped = (
+                RouteTimeoutError(str(net_err))
+                if isinstance(net_err, TimeoutError)
+                else RouteLookupError(str(net_err))
+            )
+            leg_cache[cache_key] = None
+            if shared_routing_errors is not None:
+                shared_routing_errors.append(wrapped)
+            if propagate_routing_errors:
+                raise wrapped from net_err
+            return None
 
     # Compute unshared remaining baseline VMT from vehicle's current location through outstanding stops
     remaining_existing_stop_ids = [v_stop_id] + [s.stop_id for s in existing_stops]
     remaining_existing_vmt = 0
     for idx in range(len(existing_stops)):
-        leg_dist, _ = get_cached_leg(remaining_existing_stop_ids[idx], remaining_existing_stop_ids[idx + 1])
+        leg = get_cached_leg(remaining_existing_stop_ids[idx], remaining_existing_stop_ids[idx + 1])
+        if leg is None:
+            # Active ride's own existing itinerary cannot be routed; cannot safely evaluate insertions
+            return []
+        leg_dist, _ = leg
         remaining_existing_vmt += leg_dist
 
     eligible_requests = [r for r in requests if r.seat_count <= vehicle.total_seat_capacity]
@@ -390,36 +427,38 @@ def generate_active_ride_insertions(
                     next_occ = current_occ + ex_deltas[ex_idx]
                     if 0 <= next_occ <= vehicle.total_seat_capacity:
                         ex_id = ex_stop_ids[ex_idx]
-                        leg_dist, leg_dur = get_cached_leg(prev_stop_id, ex_id)
-                        arr = current_clock + leg_dur
-                        feasible = True
+                        leg = get_cached_leg(prev_stop_id, ex_id)
+                        if leg is not None:
+                            leg_dist, leg_dur = leg
+                            arr = current_clock + leg_dur
+                            feasible = True
 
-                        if ex_is_dropoff[ex_idx]:
-                            if arr > ex_deadlines[ex_idx]:
-                                feasible = False
-                            elif ex_orig_durations[ex_idx] > 0:
-                                p_match_i = ex_p_match_idx[ex_idx]
-                                p_time = (
-                                    ex_arr_times[p_match_i]
-                                    if p_match_i is not None
-                                    else ex_orig_p_times[ex_idx]
-                                )
-                                actual_dur = max(0, arr - p_time)
-                                if actual_dur > (ex_max_allowed_durs[ex_idx] + 1e-6):
+                            if ex_is_dropoff[ex_idx]:
+                                if arr > ex_deadlines[ex_idx]:
                                     feasible = False
+                                elif ex_orig_durations[ex_idx] > 0:
+                                    p_match_i = ex_p_match_idx[ex_idx]
+                                    p_time = (
+                                        ex_arr_times[p_match_i]
+                                        if p_match_i is not None
+                                        else ex_orig_p_times[ex_idx]
+                                    )
+                                    actual_dur = max(0, arr - p_time)
+                                    if actual_dur > (ex_max_allowed_durs[ex_idx] + 1e-6):
+                                        feasible = False
 
-                        if feasible:
-                            ex_arr_times[ex_idx] = arr
-                            current_stops_encoded.append(1000 + ex_idx)
-                            search_insertions(
-                                ex_idx=ex_idx + 1,
-                                current_occ=next_occ,
-                                peak_occ=max(peak_occ, next_occ),
-                                current_clock=arr + ex_dwells[ex_idx],
-                                prev_stop_id=ex_id,
-                                total_vmt=total_vmt + leg_dist,
-                            )
-                            current_stops_encoded.pop()
+                            if feasible:
+                                ex_arr_times[ex_idx] = arr
+                                current_stops_encoded.append(1000 + ex_idx)
+                                search_insertions(
+                                    ex_idx=ex_idx + 1,
+                                    current_occ=next_occ,
+                                    peak_occ=max(peak_occ, next_occ),
+                                    current_clock=arr + ex_dwells[ex_idx],
+                                    prev_stop_id=ex_id,
+                                    total_vmt=total_vmt + leg_dist,
+                                )
+                                current_stops_encoded.pop()
 
                 # Branch 2: Pick up or drop off request stops
                 for i in range(num_reqs):
@@ -428,47 +467,50 @@ def generate_active_ride_insertions(
                         next_occ = current_occ + p_deltas[i]
                         if next_occ <= vehicle.total_seat_capacity:
                             p_id = subset_p_ids[i]
-                            leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_id)
-                            arr = current_clock + leg_dur
-                            if arr <= p_deadlines[i]:
-                                p_arr_times[i] = arr
-                                current_stops_encoded.append(i + 1)
-                                req_status[i] = 1
-                                search_insertions(
-                                    ex_idx=ex_idx,
-                                    current_occ=next_occ,
-                                    peak_occ=max(peak_occ, next_occ),
-                                    current_clock=arr,
-                                    prev_stop_id=p_id,
-                                    total_vmt=total_vmt + leg_dist,
-                                )
-                                req_status[i] = 0
-                                current_stops_encoded.pop()
+                            leg = get_cached_leg(prev_stop_id, p_id)
+                            if leg is not None:
+                                leg_dist, leg_dur = leg
+                                arr = current_clock + leg_dur
+                                if arr <= p_deadlines[i]:
+                                    p_arr_times[i] = arr
+                                    current_stops_encoded.append(i + 1)
+                                    req_status[i] = 1
+                                    search_insertions(
+                                        ex_idx=ex_idx,
+                                        current_occ=next_occ,
+                                        peak_occ=max(peak_occ, next_occ),
+                                        current_clock=arr,
+                                        prev_stop_id=p_id,
+                                        total_vmt=total_vmt + leg_dist,
+                                    )
+                                    req_status[i] = 0
+                                    current_stops_encoded.pop()
 
                     elif req_status[i] == 1:
                         # Dropoff stop for request i
                         next_occ = current_occ + d_deltas[i]
                         if next_occ >= 0:
                             d_id = subset_d_ids[i]
-                            leg_dist, leg_dur = get_cached_leg(prev_stop_id, d_id)
-                            arr = current_clock + leg_dur
-                            if arr > d_deadlines[i]:
-                                continue
-                            in_veh = max(0, arr - p_arr_times[i])
-                            if in_veh <= (max_allowed_durs[i] + 1e-6):
-                                d_arr_times[i] = arr
-                                current_stops_encoded.append(-(i + 1))
-                                req_status[i] = 2
-                                search_insertions(
-                                    ex_idx=ex_idx,
-                                    current_occ=next_occ,
-                                    peak_occ=max(peak_occ, next_occ),
-                                    current_clock=arr,
-                                    prev_stop_id=d_id,
-                                    total_vmt=total_vmt + leg_dist,
-                                )
-                                req_status[i] = 1
-                                current_stops_encoded.pop()
+                            leg = get_cached_leg(prev_stop_id, d_id)
+                            if leg is not None:
+                                leg_dist, leg_dur = leg
+                                arr = current_clock + leg_dur
+                                if arr <= d_deadlines[i]:
+                                    in_veh = max(0, arr - p_arr_times[i])
+                                    if in_veh <= (max_allowed_durs[i] + 1e-6):
+                                        d_arr_times[i] = arr
+                                        current_stops_encoded.append(-(i + 1))
+                                        req_status[i] = 2
+                                        search_insertions(
+                                            ex_idx=ex_idx,
+                                            current_occ=next_occ,
+                                            peak_occ=max(peak_occ, next_occ),
+                                            current_clock=arr,
+                                            prev_stop_id=d_id,
+                                            total_vmt=total_vmt + leg_dist,
+                                        )
+                                        req_status[i] = 1
+                                        current_stops_encoded.pop()
 
             search_insertions(
                 ex_idx=0,
@@ -493,6 +535,8 @@ def generate_single_request_insertions(
     router: RoadNetworkRoutingProvider,
     policy: DispatchPolicy,
     current_time: int | None = None,
+    shared_routing_errors: list[RoutingProviderError] | None = None,
+    propagate_routing_errors: bool = False,
 ) -> list[CandidateAssignment]:
     """
     Generates and evaluates all valid stop insertion permutations for a single request
@@ -506,4 +550,6 @@ def generate_single_request_insertions(
         policy=policy,
         current_time=current_time,
         max_bundle_size=1,
+        shared_routing_errors=shared_routing_errors,
+        propagate_routing_errors=propagate_routing_errors,
     )

@@ -67,4 +67,5 @@ class SearchStatus(str, Enum):
     """Completeness status of candidate discovery and solving."""
     COMPLETE = "COMPLETE"
     INCOMPLETE_DEADLINE_EXPIRED = "INCOMPLETE_DEADLINE_EXPIRED"
+    INCOMPLETE_ROUTING_ERROR = "INCOMPLETE_ROUTING_ERROR"
     APPROXIMATED = "APPROXIMATED"

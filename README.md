@@ -87,6 +87,11 @@ $env:TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/pool_eng
 pytest tests/integration/test_postgres_integration.py -v
 ```
 
+### 9. Routing Provider Fault Isolation & Leg Validation
+```powershell
+pytest tests/unit/test_routing_fault_isolation.py -v
+```
+
 ## Static Analysis & Testing
 
 Run all unit, scenario, property, concurrency, and benchmark tests:
