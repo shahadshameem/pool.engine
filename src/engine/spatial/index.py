@@ -1,6 +1,7 @@
 """Provider-neutral spatial indexing coordinator with safe multi-ring expansion and BBox fallback."""
 
 import logging
+from collections.abc import Callable
 from typing import Sequence
 
 from engine.contracts.routing import Coordinate
@@ -34,6 +35,7 @@ class SpatialIndexCoordinator:
         self,
         target: Coordinate,
         max_radius_meters: float,
+        entity_filter: Callable[[str], bool] | None = None,
     ) -> Sequence[SpatialCandidate]:
         """
         Exhaustive brute-force all-pairs candidate discovery using derived bounding box.
@@ -43,6 +45,8 @@ class SpatialIndexCoordinator:
         candidates: list[SpatialCandidate] = []
 
         for entity_id, loc in self._all_entities:
+            if entity_filter is not None and not entity_filter(entity_id):
+                continue
             # 1. Bounding-box pre-filtering
             if is_in_bounding_box(loc, bbox):
                 # 2. Exact great-circle Haversine verification
@@ -67,6 +71,7 @@ class SpatialIndexCoordinator:
         max_radius_meters: float,
         min_candidates: int = 5,
         max_candidates: int | None = None,
+        entity_filter: Callable[[str], bool] | None = None,
     ) -> Sequence[SpatialCandidate]:
         """
         Discovers candidates within max_radius_meters.
@@ -90,7 +95,11 @@ class SpatialIndexCoordinator:
 
         if is_polar or spans_antimeridian:
             logger.info("Search geometry spans spherical boundary; executing safe exhaustive BBox fallback.")
-            res = self.exhaustive_search(target=target, max_radius_meters=max_radius_meters)
+            res = self.exhaustive_search(
+                target=target,
+                max_radius_meters=max_radius_meters,
+                entity_filter=entity_filter,
+            )
             return res[:max_candidates] if max_candidates is not None else res
 
         try:
@@ -99,13 +108,18 @@ class SpatialIndexCoordinator:
                 max_radius_meters=max_radius_meters,
                 min_candidates=min_candidates,
                 max_candidates=max_candidates,
+                entity_filter=entity_filter,
             )
 
             # Safe Fallback Check:
             # If discrete indexing returned fewer than min_candidates but we have enough total entities
             if len(candidates) < min_candidates and len(self._all_entities) >= min_candidates:
                 # Check whether exhaustive search yields more valid candidates
-                exhaustive = self.exhaustive_search(target=target, max_radius_meters=max_radius_meters)
+                exhaustive = self.exhaustive_search(
+                    target=target,
+                    max_radius_meters=max_radius_meters,
+                    entity_filter=entity_filter,
+                )
                 if len(exhaustive) > len(candidates):
                     return exhaustive[:max_candidates] if max_candidates is not None else exhaustive
 
@@ -115,5 +129,9 @@ class SpatialIndexCoordinator:
             logger.warning(
                 f"Spatial provider error ({exc}); triggering automatic exhaustive BBox fallback."
             )
-            res = self.exhaustive_search(target=target, max_radius_meters=max_radius_meters)
+            res = self.exhaustive_search(
+                target=target,
+                max_radius_meters=max_radius_meters,
+                entity_filter=entity_filter,
+            )
             return res[:max_candidates] if max_candidates is not None else res

@@ -314,7 +314,7 @@ class DispatchEngine:
         ]
         spatial_coord.index_entities(vehicle_entities)
 
-        nearby_requests_by_vehicle: dict[str, list[RideRequest]] = {
+        nearby_requests_by_vehicle: dict[str, list[tuple[float, RideRequest]]] = {
             v.vehicle_id: [] for v in eligible_vehicles
         }
 
@@ -327,6 +327,12 @@ class DispatchEngine:
             for req in pending_requests
         }
 
+        # Precompute capable vehicle sets by required seat count once per batch
+        capable_vehs_by_seats: dict[int, set[str]] = {
+            s: {v.vehicle_id for v in eligible_vehicles if v.total_seat_capacity >= s}
+            for s in set(r.seat_count for r in pending_requests)
+        }
+
         # Exact vs Bounded spatial search configuration
         if effective_config.mode == DispatchMode.EXACT:
             for req in pending_requests:
@@ -336,22 +342,17 @@ class DispatchEngine:
                     break
 
                 pickup_coord = req_pickup_coords[req.request_id]
+                cap_filter = capable_vehs_by_seats[req.seat_count].__contains__
                 # Exact mode: examine full physically reachable radius with no candidate limit
-                spatial_candidates = spatial_coord.find_candidates_within_radius(
+                capable = spatial_coord.find_candidates_within_radius(
                     target=pickup_coord,
                     max_radius_meters=r_reach,
                     min_candidates=1,
                     max_candidates=None,
+                    entity_filter=cap_filter,
                 )
-                capable = [
-                    sc
-                    for sc in spatial_candidates
-                    if sc.entity_id in vehicles_by_id
-                    and vehicles_by_id[sc.entity_id].total_seat_capacity
-                    >= req.seat_count
-                ]
                 for sc in capable:
-                    nearby_requests_by_vehicle[sc.entity_id].append(req)
+                    nearby_requests_by_vehicle[sc.entity_id].append((sc.haversine_distance_meters, req))
         else:
             # Bounded mode: use configured radius and candidate count
             search_radius = (
@@ -377,41 +378,35 @@ class DispatchEngine:
                 else:
                     probe_radius = search_radius
 
-                spatial_candidates = spatial_coord.find_candidates_within_radius(
-                    target=pickup_coord,
-                    max_radius_meters=probe_radius,
-                    min_candidates=1,
-                    max_candidates=effective_config.max_vehicles_per_request,
+                cap_filter = capable_vehs_by_seats[req.seat_count].__contains__
+
+                capable = list(
+                    spatial_coord.find_candidates_within_radius(
+                        target=pickup_coord,
+                        max_radius_meters=probe_radius,
+                        min_candidates=1,
+                        max_candidates=effective_config.max_vehicles_per_request,
+                        entity_filter=cap_filter,
+                    )
                 )
-                capable = [
-                    sc
-                    for sc in spatial_candidates
-                    if sc.entity_id in vehicles_by_id
-                    and vehicles_by_id[sc.entity_id].total_seat_capacity
-                    >= req.seat_count
-                ]
 
                 # Bounded fallback if 0 capable vehicles found in initial probe
                 if not capable and effective_config.exhaustive_fallback and probe_radius < r_reach:
-                    spatial_candidates = spatial_coord.find_candidates_within_radius(
-                        target=pickup_coord,
-                        max_radius_meters=r_reach,
-                        min_candidates=1,
-                        max_candidates=effective_config.max_vehicles_per_request,
+                    capable = list(
+                        spatial_coord.find_candidates_within_radius(
+                            target=pickup_coord,
+                            max_radius_meters=r_reach,
+                            min_candidates=1,
+                            max_candidates=effective_config.max_vehicles_per_request,
+                            entity_filter=cap_filter,
+                        )
                     )
-                    capable = [
-                        sc
-                        for sc in spatial_candidates
-                        if sc.entity_id in vehicles_by_id
-                        and vehicles_by_id[sc.entity_id].total_seat_capacity
-                        >= req.seat_count
-                    ]
 
                 if effective_config.max_vehicles_per_request is not None:
                     capable = capable[: effective_config.max_vehicles_per_request]
 
                 for sc in capable:
-                    nearby_requests_by_vehicle[sc.entity_id].append(req)
+                    nearby_requests_by_vehicle[sc.entity_id].append((sc.haversine_distance_meters, req))
 
         candidates: list[CandidateAssignment] = []
 
@@ -427,23 +422,13 @@ class DispatchEngine:
 
             veh = vehicles_by_id[veh_id]
             active_ride = rides_by_vehicle.get(veh_id)
-            v_loc = Coordinate(
-                latitude=veh.current_location.latitude,
-                longitude=veh.current_location.longitude,
-            )
-
             if active_ride is not None:
+                plain_reqs = [r for _, r in nearby_reqs]
                 sorted_reqs = _sort_requests_by_active_detour(
-                    nearby_reqs, veh, active_ride, req_pickup_coords=req_pickup_coords
+                    plain_reqs, veh, active_ride, req_pickup_coords=req_pickup_coords
                 )
             else:
-                sorted_reqs = sorted(
-                    nearby_reqs,
-                    key=lambda r: haversine_distance_meters(
-                        v_loc,
-                        req_pickup_coords[r.request_id],
-                    ),
-                )
+                sorted_reqs = [r for _, r in sorted(nearby_reqs, key=lambda pair: pair[0])]
 
             # Request slicing: strictly controlled by explicit configuration
             if effective_config.mode == DispatchMode.EXACT:

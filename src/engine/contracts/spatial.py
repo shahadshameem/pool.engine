@@ -1,8 +1,8 @@
 """Contract for spatial indexing providers."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from engine.contracts.routing import Coordinate
 
@@ -36,7 +36,8 @@ class SpatialIndexProvider(ABC):
         target: Coordinate,
         max_radius_meters: float,
         min_candidates: int = 5,
-        max_candidates: int | None = None
+        max_candidates: int | None = None,
+        entity_filter: Callable[[str], bool] | None = None,
     ) -> Sequence[SpatialCandidate]:
         """
         Queries nearest candidate entities within max_radius_meters.

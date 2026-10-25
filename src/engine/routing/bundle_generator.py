@@ -403,9 +403,7 @@ def generate_group_bundles(
                         p_id = p_ids[i]
                         leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_id)
                         arr = current_clock + leg_dur
-                        if not check_pickup_delay(
-                            arr, req_list[i].earliest_pickup_time, policy.max_pickup_delay_seconds
-                        ):
+                        if arr > p_deadlines[i]:
                             continue
 
                         dep = arr + p_dwells[i]
@@ -435,9 +433,7 @@ def generate_group_bundles(
                             continue
                         p_arr = p_arr_times[i]
                         in_veh_dur = max(0, arr - p_arr)
-                        if not check_detour_bound(
-                            in_veh_dur, req_list[i].direct_duration_seconds, policy
-                        ):
+                        if in_veh_dur > (max_allowed_durs[i] + 1e-6):
                             continue
 
                         dep = arr + d_dwells[i]

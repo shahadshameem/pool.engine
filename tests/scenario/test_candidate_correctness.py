@@ -1025,3 +1025,86 @@ def test_decoupled_single_request_cap_discovers_unpooled_candidates() -> None:
         key = (c.vehicle_id, c.request_ids, tuple(s.stop_id for s in c.ordered_stops))
         assert key in oracle_keys, f"Generated candidate {key} must be valid in oracle"
 
+
+def test_capacity_aware_spatial_query_discovers_feasible_vehicle_beyond_incapable_neighbors() -> None:
+    """
+    Regression Test for Spatial Recall Risk:
+    When 8 closer vehicles (100m to 800m away) have capacity=2, but a request requires 3 seats,
+    an un-filtered spatial query caps at max_vehicles_per_request=8 and returns only the 8 incapable
+    vehicles. Even fallback queries the exact same 8 closest vehicles, causing the request to get
+    0 capable vehicles and remain unassigned.
+    With capacity-aware spatial candidate discovery (entity_filter), the spatial index ring expansion
+    evaluates vehicle seat capacity before ring saturation, successfully discovering the 9th vehicle
+    (1,200m away, capacity=4) and assigning the request.
+    """
+    policy = DispatchPolicy(max_pickup_delay_seconds=600)
+    policy_provider = DefaultPolicyProvider(initial_policy=policy)
+    router = MockRoutingProvider(average_speed_kmh=40.0)
+    spatial_index = H3SpatialIndexAdapter()
+    engine = DispatchEngine(
+        policy_provider=policy_provider,
+        routing_provider=router,
+        spatial_index=spatial_index,
+    )
+
+    req = RideRequest(
+        request_id="req-spatial-cap-3",
+        user_id="user-cap",
+        pickup_location=GeoCoordinate(latitude=40.7100, longitude=-74.0000),
+        dropoff_location=GeoCoordinate(latitude=40.7300, longitude=-74.0000),
+        seat_count=3,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=3000,
+        direct_distance_meters=2220,
+        direct_duration_seconds=200,
+        status=RequestStatus.PENDING,
+    )
+
+    # 8 closer vehicles (100m to 800m away), all with only 2 seats
+    closer_vehs = [
+        Vehicle(
+            vehicle_id=f"veh-close-incapable-{i}",
+            driver_id=f"drv-close-{i}",
+            total_seat_capacity=2,
+            current_location=GeoCoordinate(latitude=40.7100 + i * 0.001, longitude=-74.0000),
+            is_active=True,
+        )
+        for i in range(1, 9)
+    ]
+
+    # 9th vehicle: 1,200m away, total_seat_capacity=4 (capable!)
+    veh_capable_9 = Vehicle(
+        vehicle_id="veh-capable-9",
+        driver_id="drv-capable-9",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=40.7100 + 0.011, longitude=-74.0000),
+        is_active=True,
+    )
+
+    all_vehs = closer_vehs + [veh_capable_9]
+
+    # 1. Independent candidate oracle verification
+    oracle_cands = enumerate_exhaustive_candidates(
+        requests=[req],
+        vehicles=all_vehs,
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=1000,
+    )
+    assert len(oracle_cands) >= 1
+    assert any(c.vehicle_id == "veh-capable-9" for c in oracle_cands)
+
+    # 2. Dispatch batch execution
+    res = engine.dispatch_batch(
+        requests=[req],
+        vehicles=all_vehs,
+        active_rides=[],
+        current_time=1000,
+    )
+    assert len(res.selected_assignments) == 1, (
+        "Engine must discover capable 9th vehicle beyond the 8 incapable 2-seat vehicles"
+    )
+    assert res.selected_assignments[0].vehicle_id == "veh-capable-9"
+    assert "req-spatial-cap-3" in res.selected_assignments[0].request_ids
+

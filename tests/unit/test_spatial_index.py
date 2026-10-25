@@ -360,3 +360,53 @@ def test_h3_traversal_failure_triggers_exhaustive_fallback_and_retains_candidate
     assert "veh-close" in found_ids
     assert "veh-outer" in found_ids, "Outer candidate must not be silently omitted when H3 ring fails"
 
+
+def test_entity_filter_skips_ineligible_entities_during_ring_expansion() -> None:
+    """
+    Unit test for entity_filter support in SpatialIndexProvider and Coordinator.
+    Verifies that entities failing entity_filter are excluded from candidate counts,
+    allowing ring expansion to continue until the requested number of eligible entities is discovered.
+    """
+    adapter = H3SpatialIndexAdapter(resolution=8)
+    coordinator = SpatialIndexCoordinator(spatial_provider=adapter)
+
+    target = Coordinate(latitude=40.7100, longitude=-74.0000)
+
+    # 4 close entities (100m - 400m away) that will be rejected by filter
+    ineligible = [
+        (f"ent-ineligible-{i}", Coordinate(latitude=40.7100 + i * 0.001, longitude=-74.0000))
+        for i in range(1, 5)
+    ]
+    # 2 further entities (1,000m - 1,200m away) that will be accepted by filter
+    eligible = [
+        ("ent-eligible-1", Coordinate(latitude=40.7100 + 0.009, longitude=-74.0000)),
+        ("ent-eligible-2", Coordinate(latitude=40.7100 + 0.011, longitude=-74.0000)),
+    ]
+
+    coordinator.index_entities(ineligible + eligible)
+
+    # Filter accepting only entities starting with 'ent-eligible'
+    is_eligible = lambda eid: eid.startswith("ent-eligible")
+
+    # Adapter level
+    cands_adapter = adapter.find_nearest_candidates(
+        target=target,
+        max_radius_meters=5000.0,
+        min_candidates=1,
+        max_candidates=2,
+        entity_filter=is_eligible,
+    )
+    found_adapter_ids = [c.entity_id for c in cands_adapter]
+    assert found_adapter_ids == ["ent-eligible-1", "ent-eligible-2"]
+
+    # Coordinator level
+    cands_coord = coordinator.find_candidates_within_radius(
+        target=target,
+        max_radius_meters=5000.0,
+        min_candidates=1,
+        max_candidates=2,
+        entity_filter=is_eligible,
+    )
+    found_coord_ids = [c.entity_id for c in cands_coord]
+    assert found_coord_ids == ["ent-eligible-1", "ent-eligible-2"]
+

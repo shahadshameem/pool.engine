@@ -397,7 +397,7 @@ def generate_active_ride_insertions(
                         if next_occ <= vehicle.total_seat_capacity:
                             leg_dist, leg_dur = get_cached_leg(prev_stop_id, p_stop.stop_id)
                             arr = current_clock + leg_dur
-                            if check_pickup_delay(arr, req_list[i].earliest_pickup_time, policy.max_pickup_delay_seconds):
+                            if arr <= p_deadlines[i]:
                                 arrival_times[p_stop.stop_id] = arr
                                 current_stops.append(p_stop)
                                 req_status[i] = 1
@@ -424,7 +424,7 @@ def generate_active_ride_insertions(
                                 continue
                             p_id = req_p_stops[i].stop_id
                             in_veh = max(0, arr - arrival_times[p_id])
-                            if check_detour_bound(in_veh, req_list[i].direct_duration_seconds, policy):
+                            if in_veh <= (max_allowed_durs[i] + 1e-6):
                                 arrival_times[d_stop.stop_id] = arr
                                 current_stops.append(d_stop)
                                 req_status[i] = 2
