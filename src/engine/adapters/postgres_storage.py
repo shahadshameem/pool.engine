@@ -68,6 +68,10 @@ class PostgresRideStorage(RideStorageProvider):
         if self._owned_conn is not None and not self._owned_conn.closed:
             self._owned_conn.close()
 
+    def init_db(self) -> None:
+        """Alias for create_schema() initializing all tables, constraints, and indexes."""
+        self.create_schema()
+
     def create_schema(self) -> None:
         """Executes DDL migrations from schema.sql to initialize tables and indexes."""
         if not _SCHEMA_FILE.exists():

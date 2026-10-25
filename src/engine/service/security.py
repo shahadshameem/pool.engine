@@ -1,5 +1,7 @@
 """Security boundaries, authentication/authorization providers, and credential sanitization."""
 
+import json
+import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -93,3 +95,48 @@ def sanitize_sensitive_strings(text: str) -> str:
         return text
     # Mask password in URL / DSN patterns: ://user:password@host
     return re.sub(r"://([^:@/\s]+):([^\s/]+)@([a-zA-Z0-9_\-\.]+)", r"://\1:***@\3", text)
+
+
+def build_auth_provider_from_env(env: Optional[Mapping[str, str]] = None) -> AuthProvider:
+    """
+    Constructs an AuthProvider from environment variables or provided mapping.
+    Inspects API_KEYS formatted as JSON or comma-separated tokens (token:role).
+    Returns NoOpAuthProvider if API_KEYS is unset or empty.
+    """
+    source = os.environ if env is None else env
+    raw_keys = source.get("API_KEYS", "").strip()
+    if not raw_keys:
+        return NoOpAuthProvider()
+
+    registry: dict[str, tuple[str, tuple[str, ...]]] = {}
+    if raw_keys.startswith("{"):
+        try:
+            parsed = json.loads(raw_keys)
+            if isinstance(parsed, dict):
+                for key_token, val in parsed.items():
+                    if isinstance(val, (list, tuple)) and len(val) >= 2:
+                        subj = str(val[0])
+                        roles = tuple(str(r) for r in val[1])
+                        registry[str(key_token)] = (subj, roles)
+                    elif isinstance(val, str):
+                        registry[str(key_token)] = (str(val), ("admin",))
+                if registry:
+                    return ApiKeyAuthProvider(registry)
+        except Exception:
+            pass
+
+    for entry in raw_keys.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            token, role = entry.split(":", 1)
+            token = token.strip()
+            role = role.strip()
+            registry[token] = (token, (role,))
+        else:
+            registry[entry] = (entry, ("admin",))
+
+    if registry:
+        return ApiKeyAuthProvider(registry)
+    return NoOpAuthProvider()

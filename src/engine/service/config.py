@@ -1,6 +1,7 @@
 """Configuration models for the pool engine API service."""
 
-from typing import Optional
+import os
+from typing import Any, Mapping, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -54,3 +55,41 @@ class ServiceConfig(BaseModel):
                 "unless explicitly overridden by 'allow_unauthenticated_in_production=True'."
             )
         return self
+
+    @classmethod
+    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "ServiceConfig":
+        """Instantiates ServiceConfig by inspecting environment variables or provided mapping."""
+        source = os.environ if env is None else env
+        kwargs: dict[str, Any] = {}
+        if "MAX_REQUEST_BODY_BYTES" in source:
+            try:
+                kwargs["max_request_body_bytes"] = int(source["MAX_REQUEST_BODY_BYTES"])
+            except ValueError:
+                pass
+        auth_env = source.get("REQUIRE_AUTH") or source.get("AUTH_ENABLED")
+        if auth_env is not None:
+            kwargs["require_auth"] = auth_env.lower() in ("true", "1", "yes")
+        if "ALLOW_UNAUTHENTICATED_IN_PRODUCTION" in source:
+            kwargs["allow_unauthenticated_in_production"] = source[
+                "ALLOW_UNAUTHENTICATED_IN_PRODUCTION"
+            ].lower() in ("true", "1", "yes")
+        if "STRICT_ROUTING_READINESS" in source:
+            kwargs["strict_routing_readiness"] = source[
+                "STRICT_ROUTING_READINESS"
+            ].lower() in ("true", "1", "yes")
+        if "SHUTDOWN_TIMEOUT_SECONDS" in source:
+            try:
+                kwargs["shutdown_timeout_seconds"] = float(source["SHUTDOWN_TIMEOUT_SECONDS"])
+            except ValueError:
+                pass
+        if "MASK_COORDINATES_IN_LOGS" in source:
+            kwargs["mask_coordinates_in_logs"] = source[
+                "MASK_COORDINATES_IN_LOGS"
+            ].lower() in ("true", "1", "yes")
+        if "ENABLE_TELEMETRY" in source:
+            kwargs["enable_telemetry"] = source[
+                "ENABLE_TELEMETRY"
+            ].lower() in ("true", "1", "yes")
+        if "ENVIRONMENT" in source:
+            kwargs["environment"] = source["ENVIRONMENT"]
+        return cls(**kwargs)

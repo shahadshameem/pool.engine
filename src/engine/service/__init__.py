@@ -33,9 +33,10 @@ from engine.service.security import (
     AuthContext,
     AuthProvider,
     NoOpAuthProvider,
+    build_auth_provider_from_env,
     sanitize_sensitive_strings,
 )
-from engine.service.service import PoolEngineService
+from engine.service.service import PoolEngineService, build_service_from_env
 from engine.service.telemetry import (
     EngineTelemetryProvider,
     InMemoryTelemetry,
@@ -52,6 +53,7 @@ __all__ = [
     "AuthProvider",
     "NoOpAuthProvider",
     "ApiKeyAuthProvider",
+    "build_auth_provider_from_env",
     "sanitize_sensitive_strings",
     "EngineTelemetryProvider",
     "StructuredLoggerTelemetry",
@@ -79,4 +81,5 @@ __all__ = [
     "StaleAssignmentDiagnosticResponse",
     "DispatchCycleResponse",
     "PoolEngineService",
+    "build_service_from_env",
 ]

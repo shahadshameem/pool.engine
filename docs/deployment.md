@@ -59,25 +59,130 @@ The service is configured via `ServiceConfig` and standard environment variables
 
 ---
 
-## 3. Database Setup & Schema Management
+## 3. Database Setup, Schema Initialization & Migration Expectations
 
 The engine requires PostgreSQL 14+. PostGIS is optional and will be utilized for spatial bounding if available, but standard composite indexing is fully supported.
 
-### Schema Initialization
-Initialize or verify schema on startup:
+### Schema Initialization Script
+Initialize or verify the PostgreSQL schema via the provided CLI tool:
+```bash
+# Verify schema presence without altering tables (check-only mode)
+python scripts/init_db.py --dsn "postgresql://pool_user:pass@localhost:5432/pool_engine" --check-only
+
+# Apply schema migrations idempotently
+python scripts/init_db.py --dsn "postgresql://pool_user:pass@localhost:5432/pool_engine"
+```
+Or programmatically in Python:
 ```python
 from engine.adapters.postgres_storage import PostgresRideStorage
 
 storage = PostgresRideStorage(dsn="postgresql://postgres:pass@localhost:5432/pool_db")
-storage.init_db()
+storage.init_db()  # Idempotently executes schema.sql
 ```
 
+### Migration & Versioning Strategy
+- **Forward-Only DDL**: All schema modifications are forward-compatible. Existing columns and constraints must not be destructively dropped without a multi-phase deprecation cycle.
+- **Safe Concurrency**: All tables and indexes in `schema.sql` use `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`. Re-running initialization on an existing operational database is completely non-destructive and idempotent.
+- **Zero-Downtime Rollouts**: Add new nullable columns or tables first, deploy updated application code, and remove unused legacy columns in a subsequent maintenance release.
+
 ### Table Guarantees
-- `pool_requests`: Strict constraints on time windows (`latest_dropoff_time >= earliest_pickup_time`).
-- `pool_vehicles`: Current coordinates, driver references, and capacity constraints.
-- `pool_rides`: Optimistic concurrency control via `version` column.
-- `pool_route_stops`: Composite primary key `(ride_id, stop_order)` enforcing stop ordering invariants.
-- `pool_seat_holds`: Row-level seat reservation locking for concurrency protection.
+- `vehicles`: Current coordinates, driver references, active status, and capacity constraints.
+- `rides`: Optimistic concurrency control via `version` column.
+- `route_stops`: Composite unique constraint `(ride_id, stop_order)` enforcing strict stop ordering.
+- `ride_requests`: Strict constraints on time windows (`latest_dropoff_time >= earliest_pickup_time`).
+- `join_requests` & `seat_holds`: Row-level seat reservation locking and expiry for concurrency protection.
+- `idempotency_records`: Durable deduplication of join requests and dispatch cycles.
+
+---
+
+## 3.1 Local Development Quickstart
+
+To run the complete engine locally without containers:
+
+1. **Prerequisites**:
+   - Python 3.13+
+   - PostgreSQL 14+ (or run with default in-memory storage)
+   - (Optional) Local OSRM instance
+
+2. **Setup Virtual Environment & Install**:
+   ```bash
+   python -m venv .venv
+   # Windows:
+   .venv\Scripts\activate
+   # Linux/macOS:
+   source .venv/bin/activate
+
+   pip install --upgrade pip
+   pip install -e ".[postgres,service,dev]"
+   ```
+
+3. **Configure Environment**:
+   ```bash
+   cp .env.example .env
+   # Edit .env with your local PostgreSQL or OSRM settings if available
+   ```
+
+4. **Initialize Database** (if using PostgreSQL):
+   ```bash
+   python scripts/init_db.py --dsn "postgresql://postgres@localhost:5432/pool_engine"
+   ```
+
+5. **Start the ASGI Server**:
+   ```bash
+   uvicorn "engine.service.app:create_app" --factory --host 127.0.0.1 --port 8000 --reload
+   ```
+
+6. **Verify with Smoke Test**:
+   ```bash
+   # Run against running server:
+   python scripts/smoke_test.py --base-url http://127.0.0.1:8000
+
+   # Or run standalone in-process:
+   python scripts/smoke_test.py
+   ```
+
+---
+
+## 3.2 Local OSRM Road Graph Operations
+
+For real road-network distances and travel times, run an OSRM instance locally:
+
+1. **Obtain OSM Extract**:
+   Download a regional extract (e.g., `new-york-latest.osm.pbf` or `monaco-latest.osm.pbf`) from [Geofabrik](https://download.geofabrik.de/).
+
+2. **Extract & Contract Road Graph**:
+   Using Docker or native OSRM binaries:
+   ```bash
+   # Extract using car speed profile
+   osrm-extract -p /opt/car.lua /data/region.osm.pbf
+
+   # Contract hierarchy for sub-millisecond matrix queries (CH)
+   osrm-contract /data/region.osrm
+   ```
+
+3. **Launch OSRM Routed Daemon**:
+   ```bash
+   osrm-routed --algorithm ch -p 5000 /data/region.osrm
+   ```
+
+4. **Verify Connectivity & Configure**:
+   ```bash
+   # Test connectivity
+   curl "http://localhost:5000/table/v1/driving/-73.9855,40.7580;-73.9800,40.7620?annotations=distance,duration"
+
+   # Set environment variable for Pool Engine
+   export OSRM_BASE_URL="http://localhost:5000"
+   ```
+
+---
+
+## 3.3 Deployment Assets & Orchestration Examples
+
+All deployment configurations reside in [`deploy/`](file:///c:/Users/shaha/pool%20engine/deploy):
+
+- **Docker Container**: [`deploy/docker/Dockerfile`](file:///c:/Users/shaha/pool%20engine/deploy/docker/Dockerfile) — Multi-stage, unprivileged non-root user (`appuser:10001`), in-container liveness health checks.
+- **Compose Stack**: [`deploy/docker/docker-compose.yml`](file:///c:/Users/shaha/pool%20engine/deploy/docker/docker-compose.yml) — Optional development/testing composition wiring Pool Engine, PostgreSQL, and OSRM.
+- **Linux Systemd Service**: [`deploy/systemd/pool-engine.service`](file:///c:/Users/shaha/pool%20engine/deploy/systemd/pool-engine.service) — Hardened unit file with sandboxing options, `LimitNOFILE`, graceful `SIGTERM` draining, and automatic restarts.
 
 ---
 

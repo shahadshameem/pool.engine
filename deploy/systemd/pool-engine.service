@@ -1,0 +1,51 @@
+# ==============================================================================
+# Systemd Service Unit for Pool Engine API Service
+# Location: /etc/systemd/system/pool-engine.service
+# ==============================================================================
+
+[Unit]
+Description=Pool Engine - High-Performance Ride-Pooling and Dispatch Service
+Documentation=https://github.com/pool-engine/pool-engine
+After=network-online.target postgresql.service
+Wants=network-online.target
+RequiresMountsFor=/opt/pool-engine
+
+[Service]
+Type=simple
+User=poolengine
+Group=poolengine
+WorkingDirectory=/opt/pool-engine
+
+# Load runtime environment configuration
+EnvironmentFile=-/etc/pool-engine/pool-engine.env
+Environment=PYTHONPATH=/opt/pool-engine/src
+Environment=PYTHONUNBUFFERED=1
+
+# Execution command using virtualenv-managed uvicorn
+ExecStart=/opt/pool-engine/.venv/bin/uvicorn \
+    engine.service.app:create_app \
+    --factory \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --timeout-keep-alive 5 \
+    --workers 1
+
+# Process management and graceful termination
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=65535
+
+# Security sandboxing options
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

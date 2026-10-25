@@ -2,7 +2,7 @@
 
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from engine.contracts.routing import (
     Coordinate,
@@ -447,3 +447,60 @@ class PoolEngineService:
         if ride is None:
             raise ResourceNotFoundError(f"Ride '{ride_id}' not found")
         return ride
+
+
+def build_service_from_env(env: Optional[Mapping[str, str]] = None) -> PoolEngineService:
+    """
+    Constructs a production-ready PoolEngineService from environment variables or mapping:
+    - Storage: PostgresRideStorage if DATABASE_URL is set, else InMemoryRideStorage
+    - Routing: OsrmRoutingAdapter if OSRM_BASE_URL is set, else MockRoutingProvider
+    - Spatial: H3SpatialIndexAdapter
+    - Policy: DefaultPolicyProvider
+    - Telemetry: StructuredLoggerTelemetry
+    """
+    import os
+    from engine.adapters.default_policy import DefaultPolicyProvider
+    from engine.adapters.h3_spatial import H3SpatialIndexAdapter
+
+    source = os.environ if env is None else env
+    db_url = source.get("DATABASE_URL")
+    if db_url:
+        from engine.adapters.postgres_storage import PostgresRideStorage
+
+        storage: RideStorageProvider = PostgresRideStorage(dsn=db_url)
+    else:
+        from engine.adapters.in_memory_storage import InMemoryRideStorage
+
+        storage = InMemoryRideStorage()
+
+    osrm_url = source.get("OSRM_BASE_URL")
+    timeout_raw = source.get("ROUTING_TIMEOUT_SECONDS")
+    timeout_seconds = float(timeout_raw) if timeout_raw else 0.500
+    if osrm_url:
+        from engine.adapters.osrm_routing import OsrmRoutingAdapter
+
+        router: RoadNetworkRoutingProvider = OsrmRoutingAdapter(
+            base_url=osrm_url,
+            timeout_seconds=timeout_seconds,
+        )
+    else:
+        from engine.adapters.mock_routing import MockRoutingProvider
+
+        router = MockRoutingProvider()
+
+    spatial = H3SpatialIndexAdapter()
+    policy = DefaultPolicyProvider()
+    orchestrator = DispatchOrchestrator(
+        storage=storage,
+        policy_provider=policy,
+        routing_provider=router,
+        spatial_index=spatial,
+    )
+    telemetry = StructuredLoggerTelemetry()
+
+    return PoolEngineService(
+        storage=storage,
+        orchestrator=orchestrator,
+        router=router,
+        telemetry=telemetry,
+    )

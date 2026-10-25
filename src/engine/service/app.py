@@ -113,18 +113,25 @@ def _error_response(
 
 
 def create_app(
-    service: PoolEngineService,
+    service: Optional[PoolEngineService] = None,
     config: Optional[ServiceConfig] = None,
     auth_provider: Optional[AuthProvider] = None,
     telemetry: Optional[EngineTelemetryProvider] = None,
 ) -> Callable[[Scope, Receive, Send], Awaitable[None]]:
     """
-    Creates and returns a standard ASGI 3 application callable bound to the given PoolEngineService.
+    Creates and returns a standard ASGI 3 application callable.
+    If service is omitted, constructs PoolEngineService from environment variables.
     Zero external web framework dependencies (no FastAPI/Starlette).
     """
-    eff_config = config or ServiceConfig()
-    eff_auth = auth_provider or NoOpAuthProvider()
-    eff_telemetry = telemetry or service.telemetry
+    from engine.service.security import build_auth_provider_from_env
+    from engine.service.service import build_service_from_env
+
+    eff_config = config or ServiceConfig.from_env()
+    eff_service = service or build_service_from_env()
+    eff_auth = auth_provider or (
+        build_auth_provider_from_env() if eff_config.require_auth else NoOpAuthProvider()
+    )
+    eff_telemetry = telemetry or eff_service.telemetry
     router = AsgiRouter()
 
     is_shutting_down = False
@@ -150,7 +157,7 @@ def create_app(
     async def handle_readiness(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
-        readiness = service.check_readiness(strict_routing=eff_config.strict_routing_readiness)
+        readiness = eff_service.check_readiness(strict_routing=eff_config.strict_routing_readiness)
         status_code = 200 if readiness.get("ready") else 503
         return _json_response(status_code, readiness)
 
@@ -174,7 +181,7 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Request input validation failed", details)
 
-        req = service.create_request(dto)
+        req = eff_service.create_request(dto)
         return _json_response(201, req)
 
     router.add("POST", "/v1/requests", handle_create_request)
@@ -184,7 +191,7 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         req_id = params["request_id"]
-        req = service.get_request(req_id)
+        req = eff_service.get_request(req_id)
         return _json_response(200, req)
 
     router.add("GET", "/v1/requests/{request_id}", handle_get_request)
@@ -213,7 +220,7 @@ def create_app(
                 f"Idempotency-Key header ('{header_idemp}') does not match body idempotency_token ('{body_idemp}')",
             )
         eff_idemp = header_idemp or body_idemp
-        cancelled = service.cancel_request(req_id, reason=reason, idempotency_token=eff_idemp)
+        cancelled = eff_service.cancel_request(req_id, reason=reason, idempotency_token=eff_idemp)
         return _json_response(200, cancelled)
 
     router.add("POST", "/v1/requests/{request_id}/cancel", handle_cancel_request)
@@ -236,7 +243,7 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Vehicle input validation failed", details)
 
-        veh = service.register_vehicle(dto)
+        veh = eff_service.register_vehicle(dto)
         return _json_response(201, veh)
 
     router.add("POST", "/v1/vehicles", handle_register_vehicle)
@@ -246,7 +253,7 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         veh_id = params["vehicle_id"]
-        veh = service.get_vehicle(veh_id)
+        veh = eff_service.get_vehicle(veh_id)
         return _json_response(200, veh)
 
     router.add("GET", "/v1/vehicles/{vehicle_id}", handle_get_vehicle)
@@ -271,7 +278,7 @@ def create_app(
             return _error_response(400, "VALIDATION_ERROR", "Location update validation failed", details)
 
         coord = GeoCoordinate(latitude=dto.latitude, longitude=dto.longitude)
-        updated = service.update_vehicle_location(veh_id, coord)
+        updated = eff_service.update_vehicle_location(veh_id, coord)
         return _json_response(200, updated)
 
     router.add("PATCH", "/v1/vehicles/{vehicle_id}/location", handle_update_vehicle_location)
@@ -295,7 +302,7 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Status update validation failed", details)
 
-        updated = service.update_vehicle_status(veh_id, dto.is_active)
+        updated = eff_service.update_vehicle_status(veh_id, dto.is_active)
         return _json_response(200, updated)
 
     router.add("PATCH", "/v1/vehicles/{vehicle_id}/status", handle_update_vehicle_status)
@@ -319,7 +326,7 @@ def create_app(
             return _error_response(400, "VALIDATION_ERROR", "Dispatch input validation failed", details)
 
         header_idemp = headers.get("idempotency-key")
-        result = service.run_dispatch(dto, header_idempotency_key=header_idemp)
+        result = eff_service.run_dispatch(dto, header_idempotency_key=header_idemp)
         return _json_response(200, result)
 
     router.add("POST", "/v1/dispatch", handle_dispatch)
@@ -329,7 +336,7 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         ride_id = params["ride_id"]
-        ride = service.get_ride(ride_id)
+        ride = eff_service.get_ride(ride_id)
         return _json_response(200, ride)
 
     router.add("GET", "/v1/rides/{ride_id}", handle_get_ride)
@@ -356,7 +363,7 @@ def create_app(
                             )
                             break
                         await asyncio.sleep(0.02)
-                    service.close()
+                    eff_service.close()
                     await send({"type": "lifespan.shutdown.complete"})
                     return
             return
