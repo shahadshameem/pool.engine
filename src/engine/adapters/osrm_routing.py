@@ -101,14 +101,23 @@ class DefaultOsrmTransport(OsrmHttpTransport):
 
 
 class LruLegCache:
-    """Thread-safe LRU cache for road legs."""
+    """Thread-safe LRU cache for road legs (with negative caching support)."""
 
     def __init__(self, maxsize: int = 50000) -> None:
         self.maxsize = max(1, maxsize)
-        self._data: OrderedDict[tuple[float, float, float, float], tuple[int, int]] = OrderedDict()
+        self._data: OrderedDict[tuple[float, float, float, float], tuple[int, int] | None] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
+
+    def lookup(self, key: tuple[float, float, float, float]) -> tuple[bool, tuple[int, int] | None]:
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+                self.hits += 1
+                return True, self._data[key]
+            self.misses += 1
+            return False, None
 
     def get(self, key: tuple[float, float, float, float]) -> tuple[int, int] | None:
         with self._lock:
@@ -119,7 +128,7 @@ class LruLegCache:
             self.misses += 1
             return None
 
-    def set(self, key: tuple[float, float, float, float], value: tuple[int, int]) -> None:
+    def set(self, key: tuple[float, float, float, float], value: tuple[int, int] | None) -> None:
         with self._lock:
             if key in self._data:
                 self._data.move_to_end(key)
@@ -250,9 +259,14 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
             return 0, 0
 
         key = self._cache_key(origin, destination)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
+        found, cached = self._cache.lookup(key)
+        if found:
+            if cached is not None:
+                return cached
+            raise RouteLookupError(
+                f"OSRM could not resolve route from ({origin.latitude}, {origin.longitude}) "
+                f"to ({destination.latitude}, {destination.longitude}) [cached failure]"
+            )
 
         # Query OSRM Table service for single pair
         orig_str = f"{origin.longitude:.{self.coord_precision}f},{origin.latitude:.{self.coord_precision}f}"
@@ -283,12 +297,17 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         raw_dur = durations[0][0]
 
         if raw_dist is None or raw_dur is None:
+            self._cache.set(key, None)
             raise RouteLookupError(
                 f"OSRM could not resolve route from ({origin.latitude}, {origin.longitude}) "
                 f"to ({destination.latitude}, {destination.longitude})"
             )
 
-        validated = validate_route_leg(origin, destination, (raw_dist, raw_dur))
+        try:
+            validated = validate_route_leg(origin, destination, (raw_dist, raw_dur))
+        except InvalidRouteDataError:
+            self._cache.set(key, None)
+            raise
         self._cache.set(key, validated)
         return validated
 
@@ -324,8 +343,13 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                     res_dist[i][j] = 0
                     res_dur[i][j] = 0
                 else:
-                    cached = self._cache.get(self._cache_key(orig, dest))
-                    if cached is not None:
+                    found, cached = self._cache.lookup(self._cache_key(orig, dest))
+                    if found:
+                        if cached is None:
+                            raise RouteLookupError(
+                                f"OSRM could not resolve route from ({orig.latitude}, {orig.longitude}) "
+                                f"to ({dest.latitude}, {dest.longitude}) [cached failure]"
+                            )
                         res_dist[i][j] = cached[0]
                         res_dur[i][j] = cached[1]
 

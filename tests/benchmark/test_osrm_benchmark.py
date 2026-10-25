@@ -287,6 +287,7 @@ def test_live_osrm_real_road_benchmark() -> None:
         active_rides=rides_all[:5],
         current_time=1700000000,
         batch_id="live-osrm-50",
+        deadline=time.monotonic() + 10.0,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 

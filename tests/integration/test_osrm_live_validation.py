@@ -14,8 +14,8 @@ from engine.domain.enums import RequestStatus, SearchStatus
 from engine.domain.models import GeoCoordinate, RideRequest, Vehicle
 
 
-# Default to public OSRM demo server if OSRM_BASE_URL is not set
-LIVE_OSRM_URL = os.environ.get("OSRM_BASE_URL", "http://router.project-osrm.org")
+# Keep public endpoint correctness tests separate from local benchmark endpoint
+LIVE_OSRM_URL = os.environ.get("OSRM_PUBLIC_URL", "http://router.project-osrm.org")
 
 
 def _is_live_server_available(base_url: str) -> bool:

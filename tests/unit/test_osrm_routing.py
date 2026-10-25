@@ -150,6 +150,15 @@ def test_get_direct_leg_unreachable_route_raises_lookup_error() -> None:
     with pytest.raises(RouteLookupError, match="could not resolve route"):
         adapter.get_direct_leg(C_PHL, C_UPENN)
 
+    assert len(transport.call_history) == 1
+
+    # Second call should hit the negative cache and raise without issuing an HTTP query!
+    with pytest.raises(RouteLookupError, match="cached failure"):
+        adapter.get_direct_leg(C_PHL, C_UPENN)
+
+    assert len(transport.call_history) == 1
+    assert adapter.cache_hits == 1
+
 
 def test_get_direct_leg_distinct_coords_zero_cost_raises_invalid_route_data() -> None:
     transport = FakeOsrmTransport()
