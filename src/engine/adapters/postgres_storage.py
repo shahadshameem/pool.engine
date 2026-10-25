@@ -51,7 +51,7 @@ class PostgresRideStorage(RideStorageProvider):
                 raise StorageProviderError(
                     "PostgresRideStorage requires a DSN or active psycopg Connection, but none was provided."
                 )
-            self._owned_conn = psycopg.connect(self._dsn, autocommit=False)
+            self._owned_conn = psycopg.connect(self._dsn, autocommit=True)
         return self._owned_conn
 
     def close(self) -> None:
@@ -67,7 +67,8 @@ class PostgresRideStorage(RideStorageProvider):
         conn = self._get_connection()
         with conn.cursor() as cur:
             cur.execute(sql)
-        conn.commit()
+        if not conn.autocommit:
+            conn.commit()
 
     # -------------------------------------------------------------------------
     # Domain Mapping Helpers

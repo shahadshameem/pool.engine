@@ -104,8 +104,8 @@ CREATE INDEX IF NOT EXISTS idx_join_requests_ride ON join_requests (ride_id, sta
 
 -- 6. Seat Holds Table
 CREATE TABLE IF NOT EXISTS seat_holds (
-    join_request_id VARCHAR(128) PRIMARY KEY REFERENCES join_requests (join_request_id) ON DELETE CASCADE,
-    ride_id VARCHAR(128) NOT NULL REFERENCES rides (ride_id),
+    join_request_id VARCHAR(128) PRIMARY KEY,
+    ride_id VARCHAR(128) NOT NULL REFERENCES rides (ride_id) ON DELETE CASCADE,
     request_id VARCHAR(128) NOT NULL,
     seat_count INTEGER NOT NULL CHECK (seat_count >= 1),
     submitted_at BIGINT NOT NULL,

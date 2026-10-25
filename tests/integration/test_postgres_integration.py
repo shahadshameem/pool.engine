@@ -182,6 +182,30 @@ def test_ride_request_and_join_request_persistence(postgres_storage: PostgresRid
     assert loaded_req is not None
     assert loaded_req == req
 
+    v = Vehicle(
+        vehicle_id="veh-int-1",
+        driver_id="drv-int-1",
+        total_seat_capacity=4,
+        luggage_capacity_units=2,
+        current_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        is_active=True,
+    )
+    postgres_storage.save_vehicle(v)
+
+    ride = Ride(
+        ride_id="ride-int-1",
+        vehicle_id="veh-int-1",
+        driver_id="drv-int-1",
+        lifecycle_status=RideStatus.SCHEDULED,
+        stops=(),
+        scheduled_departure_time=1000,
+        actual_departure_time=None,
+        active_passenger_count=0,
+        total_vmt_meters=12000,
+        version=1,
+    )
+    postgres_storage.save_ride(ride)
+
     join_req = JoinRequest(
         join_request_id="join-int-1",
         ride_id="ride-int-1",
@@ -572,3 +596,53 @@ def test_concurrent_seat_hold_contention(postgres_storage: PostgresRideStorage) 
     holds = postgres_storage.get_active_seat_holds("ride-race-1", current_time=1000)
     assert len(holds) == 1
     assert holds[0].seat_count == 2
+
+
+def test_transaction_rollback_on_error(postgres_storage: PostgresRideStorage) -> None:
+    """Verifies that failures inside transaction blocks roll back completely."""
+    v = Vehicle(
+        vehicle_id="veh-rb-1",
+        driver_id="drv-rb-1",
+        total_seat_capacity=4,
+        luggage_capacity_units=2,
+        current_location=GeoCoordinate(latitude=40.7128, longitude=-74.0060),
+        is_active=True,
+    )
+    postgres_storage.save_vehicle(v)
+
+    ride = Ride(
+        ride_id="ride-rb-1",
+        vehicle_id="veh-rb-1",
+        driver_id="drv-rb-1",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(),
+        scheduled_departure_time=1000,
+        active_passenger_count=0,
+        version=1,
+    )
+    postgres_storage.save_ride(ride)
+
+    # Trigger a database CheckViolation inside a transaction
+    conn = postgres_storage._get_connection()
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with conn.transaction():
+            with conn.cursor() as cur:
+                # Mutate ride version
+                cur.execute("UPDATE rides SET version = 99 WHERE ride_id = %s", ("ride-rb-1",))
+                # Insert seat hold with invalid seat_count 0 violating check constraint (seat_count >= 1)
+                cur.execute(
+                    """
+                    INSERT INTO seat_holds (
+                        join_request_id, ride_id, request_id, seat_count,
+                        submitted_at, expires_at, idempotency_token
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    ("join-rb-1", "ride-rb-1", "req-rb-1", 0, 1000, 1300, "tok-rb-1"),
+                )
+
+    # Verify that the entire transaction was rolled back
+    reloaded_ride = postgres_storage.get_ride("ride-rb-1")
+    assert reloaded_ride is not None
+    assert reloaded_ride.version == 1, "Ride version must not have been modified due to rollback"
+    holds = postgres_storage.get_active_seat_holds("ride-rb-1")
+    assert len(holds) == 0, "No seat holds should exist after rollback"
