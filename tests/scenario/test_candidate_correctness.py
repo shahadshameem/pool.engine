@@ -934,3 +934,94 @@ def test_latest_dropoff_deadline_enforced_idle_vehicle_multi_bundle() -> None:
     assert len(b2_late) == 0, "Bundle of 2 arriving 1s late must be pruned"
     assert len(b2_oracle_late) == 0, "Oracle must also reject bundle of 2 arriving 1s late"
 
+
+def test_decoupled_single_request_cap_discovers_unpooled_candidates() -> None:
+    """
+    Focused candidate-generation test:
+    Verifies that single-request candidate generation evaluates up to
+    max_single_requests_per_vehicle (default 6) without being prematurely truncated
+    by max_requests_per_vehicle=3, while multi-passenger bundles (permutations)
+    remain bounded to max_requests_per_vehicle to avoid combinatorial explosion.
+    """
+    policy = DispatchPolicy(max_pickup_delay_seconds=600)
+    policy_provider = DefaultPolicyProvider(initial_policy=policy)
+    router = MockRoutingProvider(average_speed_kmh=40.0, circuity_factor=1.0)
+    spatial_index = H3SpatialIndexAdapter()
+    engine = DispatchEngine(
+        policy_provider=policy_provider,
+        routing_provider=router,
+        spatial_index=spatial_index,
+    )
+
+    veh = Vehicle(
+        vehicle_id="veh-idle-test",
+        driver_id="drv-test",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=40.7100, longitude=-74.0000),
+        is_active=True,
+    )
+
+    # 5 requests with pickups at increasing distances from the vehicle:
+    # 0.002 deg (~222m), 0.004 deg (~444m), 0.006 deg (~666m), 0.008 deg (~888m), 0.010 deg (~1110m)
+    # All are easily reachable within max_pickup_delay_seconds=600s.
+    test_reqs: list[RideRequest] = []
+    for i in range(1, 6):
+        req = RideRequest(
+            request_id=f"req-decoupled-{i}",
+            user_id=f"u-{i}",
+            pickup_location=GeoCoordinate(latitude=40.7100 + i * 0.002, longitude=-74.0000),
+            dropoff_location=GeoCoordinate(latitude=40.7300 + i * 0.002, longitude=-74.0000),
+            seat_count=1,
+            earliest_pickup_time=1000,
+            latest_dropoff_time=3000,
+            direct_distance_meters=2220,
+            direct_duration_seconds=200,
+            status=RequestStatus.PENDING,
+        )
+        test_reqs.append(req)
+
+    # Bounded mode: max_requests_per_vehicle=3, max_single_requests_per_vehicle=8, max_bundle_size=2
+    cands = engine.generate_candidates(
+        requests=test_reqs,
+        vehicles=[veh],
+        active_rides=[],
+        current_time=1000,
+    )
+
+    # 1. Single candidates: all 5 requests must have single-passenger candidates
+    single_cands = [c for c in cands if len(c.request_ids) == 1]
+    single_req_ids = {c.request_ids[0] for c in single_cands}
+    assert len(single_cands) == 5, (
+        f"Expected all 5 single-request candidates, got {len(single_cands)}: {single_req_ids}"
+    )
+    for i in range(1, 6):
+        assert f"req-decoupled-{i}" in single_req_ids
+
+    # 2. Multi-passenger bundles: only requests from the top max_requests_per_vehicle=3
+    # should be combined into 2-passenger bundles
+    multi_cands = [c for c in cands if len(c.request_ids) > 1]
+    for c in multi_cands:
+        for rid in c.request_ids:
+            assert rid in {"req-decoupled-1", "req-decoupled-2", "req-decoupled-3"}, (
+                f"Multi-passenger bundle {c.request_ids} must only contain requests from the top 3 bundle pool"
+            )
+
+    # 3. Independent candidate oracle verification
+    oracle_cands = enumerate_exhaustive_candidates(
+        requests=test_reqs,
+        vehicles=[veh],
+        active_rides=[],
+        router=router,
+        policy=policy,
+        current_time=1000,
+        max_bundle_size=2,
+    )
+    # Every generated candidate must be valid according to the first-principles oracle
+    oracle_keys = {
+        (c.vehicle_id, c.request_ids, c.ordered_stop_ids)
+        for c in oracle_cands
+    }
+    for c in cands:
+        key = (c.vehicle_id, c.request_ids, tuple(s.stop_id for s in c.ordered_stops))
+        assert key in oracle_keys, f"Generated candidate {key} must be valid in oracle"
+

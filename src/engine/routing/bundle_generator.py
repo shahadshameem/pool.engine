@@ -83,6 +83,7 @@ def generate_group_bundles(
     max_bundle_size: int = 3,
     deadline: float | None = None,
     reserved_headroom: float = 0.050,
+    max_bundle_requests: int | None = None,
 ) -> list[CandidateAssignment]:
     """
     Forms multi-passenger group trip bundles for an available vehicle.
@@ -141,7 +142,15 @@ def generate_group_bundles(
     for bundle_size in range(1, min(max_bundle_size, len(eligible_requests)) + 1):
         if deadline_hit:
             break
-        for req_subset in itertools.combinations(eligible_requests, bundle_size):
+        # For multi-passenger bundles (size >= 2), restrict combinatorial combinations
+        # to the top max_bundle_requests if specified. Single-request bundles (size == 1)
+        # evaluate the full eligible_requests sequence.
+        if bundle_size > 1 and max_bundle_requests is not None:
+            combo_pool: Sequence[RideRequest] = eligible_requests[:max_bundle_requests]
+        else:
+            combo_pool = eligible_requests
+
+        for req_subset in itertools.combinations(combo_pool, bundle_size):
             if deadline is not None and time.monotonic() > deadline - reserved_headroom:
                 deadline_hit = True
                 break

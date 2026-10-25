@@ -72,9 +72,12 @@ class CandidateGenerationConfig:
         max_vehicles_per_request: Maximum number of capable candidate vehicles to retain per request.
             In EXACT mode, this must be None (unconstrained).
             In BOUNDED mode, caps candidates per request.
-        max_requests_per_vehicle: Maximum candidate requests to evaluate per vehicle.
+        max_requests_per_vehicle: Maximum candidate requests to evaluate for multi-passenger pooling per vehicle.
             In EXACT mode, this must be None (unconstrained).
-            In BOUNDED mode, caps requests prioritized by lower-bound detour.
+            In BOUNDED mode, caps pooled requests prioritized by lower-bound detour.
+        max_single_requests_per_vehicle: Maximum candidate requests to evaluate for single-passenger service per vehicle.
+            In EXACT mode, this must be None (unconstrained).
+            In BOUNDED mode, caps single-passenger evaluation without combinatorial explosion (default 6).
         max_bundle_size: Maximum number of pooled requests in a single multi-passenger bundle (2, 3, or 4).
         exhaustive_fallback: In BOUNDED mode, if True and bounded search yields 0 capable candidates,
             falls back to expanding search radius up to the physical reachability bound.
@@ -85,6 +88,7 @@ class CandidateGenerationConfig:
     max_search_radius_meters: Optional[float] = 5000.0
     max_vehicles_per_request: Optional[int] = 8
     max_requests_per_vehicle: Optional[int] = 3
+    max_single_requests_per_vehicle: Optional[int] = 6
     max_bundle_size: int = 2
     exhaustive_fallback: bool = True
     initial_search_radius_meters: float = 5000.0
@@ -97,6 +101,7 @@ class CandidateGenerationConfig:
             max_search_radius_meters=None,
             max_vehicles_per_request=None,
             max_requests_per_vehicle=None,
+            max_single_requests_per_vehicle=None,
             max_bundle_size=max_bundle_size,
             exhaustive_fallback=False,
             initial_search_radius_meters=0.0,
@@ -108,6 +113,7 @@ class CandidateGenerationConfig:
         max_search_radius_meters: Optional[float] = 5000.0,
         max_vehicles_per_request: Optional[int] = 8,
         max_requests_per_vehicle: Optional[int] = 3,
+        max_single_requests_per_vehicle: Optional[int] = 6,
         max_bundle_size: int = 2,
         exhaustive_fallback: bool = True,
         initial_search_radius_meters: float = 5000.0,
@@ -118,6 +124,7 @@ class CandidateGenerationConfig:
             max_search_radius_meters=max_search_radius_meters,
             max_vehicles_per_request=max_vehicles_per_request,
             max_requests_per_vehicle=max_requests_per_vehicle,
+            max_single_requests_per_vehicle=max_single_requests_per_vehicle,
             max_bundle_size=max_bundle_size,
             exhaustive_fallback=exhaustive_fallback,
             initial_search_radius_meters=initial_search_radius_meters,
@@ -240,6 +247,7 @@ class DispatchEngine:
                 max_search_radius_meters=effective_config.max_search_radius_meters,
                 max_vehicles_per_request=effective_config.max_vehicles_per_request,
                 max_requests_per_vehicle=effective_config.max_requests_per_vehicle,
+                max_single_requests_per_vehicle=effective_config.max_single_requests_per_vehicle,
                 max_bundle_size=max_bundle_size,
                 exhaustive_fallback=effective_config.exhaustive_fallback,
                 initial_search_radius_meters=effective_config.initial_search_radius_meters,
@@ -257,6 +265,7 @@ class DispatchEngine:
                 effective_config.max_search_radius_meters is not None
                 or effective_config.max_vehicles_per_request is not None
                 or effective_config.max_requests_per_vehicle is not None
+                or effective_config.max_single_requests_per_vehicle is not None
             )
             search_status = (
                 SearchStatus.APPROXIMATED if is_approximated else SearchStatus.COMPLETE
@@ -439,10 +448,17 @@ class DispatchEngine:
             # Request slicing: strictly controlled by explicit configuration
             if effective_config.mode == DispatchMode.EXACT:
                 eval_reqs = sorted_reqs
-            elif effective_config.max_requests_per_vehicle is not None:
-                eval_reqs = sorted_reqs[: effective_config.max_requests_per_vehicle]
+                max_bundle_reqs = None
             else:
-                eval_reqs = sorted_reqs
+                single_cap = effective_config.max_single_requests_per_vehicle
+                bundle_cap = effective_config.max_requests_per_vehicle
+                effective_eval_cap = (
+                    max(single_cap or 0, bundle_cap or 0)
+                    if (single_cap is not None or bundle_cap is not None)
+                    else None
+                )
+                eval_reqs = sorted_reqs[:effective_eval_cap] if effective_eval_cap is not None else sorted_reqs
+                max_bundle_reqs = bundle_cap
 
             if active_ride is not None:
                 ins_cands = generate_active_ride_insertions(
@@ -455,6 +471,7 @@ class DispatchEngine:
                     max_bundle_size=effective_config.max_bundle_size,
                     deadline=effective_deadline,
                     reserved_headroom=reserved_headroom,
+                    max_bundle_requests=max_bundle_reqs,
                 )
                 candidates.extend(ins_cands)
                 if time.monotonic() > effective_deadline - reserved_headroom:
@@ -471,6 +488,7 @@ class DispatchEngine:
                     max_bundle_size=effective_config.max_bundle_size,
                     deadline=effective_deadline,
                     reserved_headroom=reserved_headroom,
+                    max_bundle_requests=max_bundle_reqs,
                 )
                 candidates.extend(bundle_cands)
                 if time.monotonic() > effective_deadline - reserved_headroom:
