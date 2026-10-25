@@ -286,3 +286,59 @@ def test_dispatch_batch_completeness_and_deadline_status() -> None:
     )
     assert res_expired.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
     assert res_expired.is_approximated is True
+
+
+def test_dispatch_batch_prefetches_matrices_across_candidate_vehicles() -> None:
+    """Verifies that dispatch_batch calls prefetch_matrices across candidate vehicle waypoint groups."""
+    from typing import Sequence
+    from engine.contracts.routing import Coordinate, MatrixResult, RoadNetworkRoutingProvider, RouteGeometry
+
+    class SpyMultiGroupRouter(RoadNetworkRoutingProvider):
+        def __init__(self) -> None:
+            self.prefetch_matrices_calls: list[Sequence[Sequence[Coordinate]]] = []
+
+        def get_direct_leg(self, origin: Coordinate, destination: Coordinate) -> tuple[int, int]:
+            return (1500, 200)
+
+        def get_distance_matrix(self, origins: Sequence[Coordinate], destinations: Sequence[Coordinate]) -> MatrixResult:
+            return MatrixResult(
+                distances_meters=[[1500 for _ in destinations] for _ in origins],
+                durations_seconds=[[200 for _ in destinations] for _ in origins],
+            )
+
+        def get_route(self, waypoints: Sequence[Coordinate]) -> RouteGeometry:
+            return RouteGeometry(points=list(waypoints), total_distance_meters=1500, total_duration_seconds=200)
+
+        def prefetch_matrices(
+            self,
+            groups: Sequence[Sequence[Coordinate]],
+            deadline: float | None = None,
+            reserved_headroom: float = 0.050,
+        ) -> int:
+            self.prefetch_matrices_calls.append(groups)
+            return len(groups)
+
+    spy = SpyMultiGroupRouter()
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=spy,
+        spatial_index=H3SpatialIndexAdapter(),
+    )
+
+    req1 = _make_sample_request("req-multi-1", 40.7128, -74.0060, 40.7200, -74.0050)
+    veh1 = _make_sample_vehicle("veh-multi-1", 40.7130, -74.0055, capacity=4)
+    veh2 = _make_sample_vehicle("veh-multi-2", 40.7132, -74.0058, capacity=4)
+
+    res = engine.dispatch_batch(
+        requests=[req1],
+        vehicles=[veh1, veh2],
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-multi",
+    )
+
+    assert len(res.selected_assignments) == 1
+    assert len(spy.prefetch_matrices_calls) == 1
+    # Verify groups were passed for candidate vehicles
+    groups = spy.prefetch_matrices_calls[0]
+    assert len(groups) >= 1

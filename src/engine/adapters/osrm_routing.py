@@ -2,9 +2,11 @@
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+import concurrent.futures
 import http.client
 import json
 import math
+import queue
 import threading
 import time
 from typing import Any, Mapping, Sequence
@@ -40,11 +42,15 @@ class OsrmHttpTransport(ABC):
 
 class DefaultOsrmTransport(OsrmHttpTransport):
     """
-    Standard HTTP transport for OSRM with Keep-Alive connection pooling
+    Standard HTTP transport for OSRM with bounded Keep-Alive connection pooling
     and automatic reconnection.
     """
 
-    def __init__(self, base_url: str = "http://localhost:5000") -> None:
+    def __init__(
+        self,
+        base_url: str = "http://localhost:5000",
+        max_connections: int = 8,
+    ) -> None:
         parsed = urllib.parse.urlsplit(base_url)
         self.scheme = parsed.scheme.lower() if parsed.scheme else "http"
         host = parsed.hostname or "localhost"
@@ -53,29 +59,76 @@ class DefaultOsrmTransport(OsrmHttpTransport):
         self.host = "127.0.0.1" if host == "localhost" else host
         self.port = parsed.port or (443 if self.scheme == "https" else 80)
         self.path_prefix = parsed.path.rstrip("/")
-        self._lock = threading.Lock()
-        self._conn: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
+        self.max_connections = max(1, max_connections)
+        self._pool: queue.LifoQueue[http.client.HTTPConnection | http.client.HTTPSConnection] = queue.LifoQueue(
+            maxsize=self.max_connections
+        )
+        self._total_created = 0
+        self._pool_lock = threading.Lock()
+        self._closed = False
 
-    def _get_connection(self, timeout: float) -> http.client.HTTPConnection:
-        if self._conn is None:
-            if self.scheme == "https":
-                self._conn = http.client.HTTPSConnection(self.host, self.port, timeout=timeout)
-            else:
-                self._conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-        else:
-            self._conn.timeout = timeout
-        return self._conn
+    def _create_raw_connection(self, timeout: float) -> http.client.HTTPConnection | http.client.HTTPSConnection:
+        if self.scheme == "https":
+            return http.client.HTTPSConnection(self.host, self.port, timeout=timeout)
+        return http.client.HTTPConnection(self.host, self.port, timeout=timeout)
+
+    def _get_connection(self, timeout: float) -> http.client.HTTPConnection | http.client.HTTPSConnection:
+        if self._closed:
+            raise ConnectionError("DefaultOsrmTransport is closed")
+        try:
+            conn = self._pool.get_nowait()
+            conn.timeout = timeout
+            return conn
+        except queue.Empty:
+            with self._pool_lock:
+                if self._closed:
+                    raise ConnectionError("DefaultOsrmTransport is closed")
+                if self._total_created < self.max_connections:
+                    self._total_created += 1
+                    return self._create_raw_connection(timeout)
+            try:
+                conn = self._pool.get(timeout=timeout)
+                conn.timeout = timeout
+                return conn
+            except queue.Empty:
+                raise TimeoutError(f"Connection pool exhausted (max={self.max_connections}) after {timeout}s")
+
+    def _put_connection(
+        self,
+        conn: http.client.HTTPConnection | http.client.HTTPSConnection,
+        healthy: bool = True,
+    ) -> None:
+        if self._closed or not healthy:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._pool_lock:
+                self._total_created = max(0, self._total_created - 1)
+            return
+
+        try:
+            self._pool.put_nowait(conn)
+        except queue.Full:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._pool_lock:
+                self._total_created = max(0, self._total_created - 1)
 
     def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
         full_path = self.path_prefix + (path_and_query if path_and_query.startswith("/") else "/" + path_and_query)
         headers = {"Accept": "application/json", "User-Agent": "PoolEngine-OSRM/1.0"}
 
-        with self._lock:
+        for attempt in range(2):
             conn = self._get_connection(timeout)
+            healthy = False
             try:
                 conn.request("GET", full_path, headers=headers)
                 resp = conn.getresponse()
                 body = resp.read()
+                healthy = True
                 return resp.status, body
             except (
                 http.client.RemoteDisconnected,
@@ -83,25 +136,26 @@ class DefaultOsrmTransport(OsrmHttpTransport):
                 BrokenPipeError,
                 ConnectionResetError,
             ):
-                # Connection was closed or stale; reconnect once
-                self._close_locked()
-                conn = self._get_connection(timeout)
-                conn.request("GET", full_path, headers=headers)
-                resp = conn.getresponse()
-                body = resp.read()
-                return resp.status, body
+                healthy = False
+                if attempt == 0:
+                    continue
+                raise
+            finally:
+                self._put_connection(conn, healthy=healthy)
 
-    def _close_locked(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
+        raise RuntimeError("Unexpected transport loop termination")
 
     def close(self) -> None:
-        with self._lock:
-            self._close_locked()
+        with self._pool_lock:
+            self._closed = True
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except Exception:
+                pass
+        with self._pool_lock:
+            self._total_created = 0
 
 
 class LruLegCache:
@@ -187,6 +241,7 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         max_table_size: int = 100,
         cache_maxsize: int = 50000,
         coord_precision: int = 6,
+        max_workers: int = 8,
         transport: OsrmHttpTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -195,8 +250,44 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         self.max_retries = max(0, max_retries)
         self.max_table_size = max(2, max_table_size)
         self.coord_precision = coord_precision
+        self.max_workers = max(1, max_workers)
         self._cache = LruLegCache(maxsize=cache_maxsize)
-        self.transport = transport if transport is not None else DefaultOsrmTransport(base_url=self.base_url)
+        self.transport = (
+            transport
+            if transport is not None
+            else DefaultOsrmTransport(base_url=self.base_url, max_connections=self.max_workers)
+        )
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._executor_lock = threading.Lock()
+
+    def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.max_workers,
+                    thread_name_prefix="poolengine-osrm-prefetch",
+                )
+            return self._executor
+
+    def close(self) -> None:
+        """Closes thread pool and transport connections."""
+        with self._executor_lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = None
+        self.transport.close()
+
+    def __enter__(self) -> "OsrmRoutingAdapter":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @property
     def cache(self) -> LruLegCache:
@@ -564,7 +655,12 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                 chunk_destinations = destinations[d_start:d_end]
 
                 chunk_same = (same_endpoints and o_start == d_start and o_end == d_end)
-                keys = [self._cache_key(o, d) for o in chunk_origins for d in chunk_destinations]
+                keys = [
+                    self._cache_key(o, d)
+                    for o in chunk_origins
+                    for d in chunk_destinations
+                    if (o.latitude, o.longitude) != (d.latitude, d.longitude)
+                ]
                 missing = self._cache.get_missing(keys)
                 if not missing:
                     continue
@@ -626,6 +722,103 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                     self._cache.set_many(batch_to_set)
 
         return cached_count
+
+    def prefetch_matrices(
+        self,
+        groups: Sequence[Sequence[Coordinate]],
+        deadline: float | None = None,
+        reserved_headroom: float = 0.050,
+    ) -> int:
+        """
+        Prefetches pairwise distance and duration matrices for multiple waypoint groups
+        concurrently using bounded worker threads and pooled HTTP connections.
+        Handles deduplication, missing key detection, and negative caching.
+        Returns the count of new valid legs cached.
+        """
+        if not groups:
+            return 0
+        if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+            return 0
+
+        # Filter and deduplicate groups that actually have missing keys
+        needed_groups: list[Sequence[Coordinate]] = []
+        seen_group_coords: set[tuple[tuple[float, float], ...]] = set()
+
+        for group in groups:
+            if len(group) < 2:
+                continue
+            # Deduplicate groups with identical coordinate sets (prevent duplicate in-flight requests)
+            group_key = tuple(sorted(set((c.latitude, c.longitude) for c in group)))
+            if group_key in seen_group_coords:
+                continue
+            seen_group_coords.add(group_key)
+
+            # Check if all legs in this group are already in cache (excluding self-to-self)
+            keys = [
+                self._cache_key(o, d)
+                for o in group
+                for d in group
+                if (o.latitude, o.longitude) != (d.latitude, d.longitude)
+            ]
+            missing = self._cache.get_missing(keys)
+            if missing:
+                needed_groups.append(group)
+
+        if not needed_groups:
+            return 0
+
+        # If only 1 group or max_workers <= 1, execute sequentially
+        if len(needed_groups) == 1 or self.max_workers <= 1:
+            total = 0
+            for g in needed_groups:
+                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                    break
+                total += self.prefetch_matrix(
+                    origins=g,
+                    destinations=g,
+                    deadline=deadline,
+                    reserved_headroom=reserved_headroom,
+                )
+            return total
+
+        # Concurrent execution with bounded worker pool
+        executor = self._get_executor()
+
+        def _fetch_group(grp: Sequence[Coordinate]) -> int:
+            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                return 0
+            return self.prefetch_matrix(
+                origins=grp,
+                destinations=grp,
+                deadline=deadline,
+                reserved_headroom=reserved_headroom,
+            )
+
+        timeout = (
+            max(0.001, (deadline - reserved_headroom) - time.monotonic())
+            if deadline is not None
+            else None
+        )
+
+        futures = [executor.submit(_fetch_group, g) for g in needed_groups]
+        done, not_done = concurrent.futures.wait(
+            futures,
+            timeout=timeout,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+
+        total_cached = 0
+        for f in done:
+            try:
+                total_cached += f.result()
+            except Exception:
+                pass
+
+        # Cancel any pending futures that did not complete within the deadline
+        for f in not_done:
+            f.cancel()
+
+        return total_cached
 
     def get_route(
         self,

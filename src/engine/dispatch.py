@@ -453,13 +453,11 @@ class DispatchEngine:
         shared_leg_cache: dict[tuple[str, str], tuple[int, int] | None] = {}
         shared_routing_errors: list[RoutingProviderError] = []
 
-        # Stage 3 & 4: Route Insertion & Group Bundling
-        for veh_id, nearby_reqs in nearby_requests_by_vehicle.items():
-            if time.monotonic() > effective_deadline - reserved_headroom:
-                search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
-                is_approximated = True
-                break
+        # Stage 3 Pre-pass: Prepare evaluation requests and waypoint groups for candidate vehicles
+        vehicle_eval_plan: list[tuple[Vehicle, Ride | None, list[RideRequest], list[Coordinate]]] = []
+        waypoint_groups_to_prefetch: list[list[Coordinate]] = []
 
+        for veh_id, nearby_reqs in nearby_requests_by_vehicle.items():
             if not nearby_reqs:
                 continue
 
@@ -480,7 +478,6 @@ class DispatchEngine:
             # Request slicing: strictly controlled by explicit configuration
             if effective_config.mode == DispatchMode.EXACT:
                 eval_reqs = sorted_reqs
-                max_bundle_reqs = None
             else:
                 single_cap = effective_config.max_single_requests_per_vehicle
                 bundle_cap = effective_config.max_requests_per_vehicle
@@ -490,23 +487,57 @@ class DispatchEngine:
                     else None
                 )
                 eval_reqs = sorted_reqs[:effective_eval_cap] if effective_eval_cap is not None else sorted_reqs
-                max_bundle_reqs = bundle_cap
 
-            # Bounded road network matrix prefetch for vehicle and candidate request waypoints
+            if not eval_reqs:
+                continue
+
+            v_wps = [Coordinate(veh.current_location.latitude, veh.current_location.longitude)]
+            if active_ride is not None:
+                v_wps.extend([
+                    Coordinate(s.location.latitude, s.location.longitude)
+                    for s in active_ride.stops
+                    if s.status in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
+                ])
+            for r in eval_reqs:
+                v_wps.append(Coordinate(r.pickup_location.latitude, r.pickup_location.longitude))
+                v_wps.append(Coordinate(r.dropoff_location.latitude, r.dropoff_location.longitude))
+
+            vehicle_eval_plan.append((veh, active_ride, eval_reqs, v_wps))
+            waypoint_groups_to_prefetch.append(v_wps)
+
+        # Batch concurrent matrix prefetch across candidate vehicle groups
+        if (
+            (
+                type(self.routing_provider).prefetch_matrices is not RoadNetworkRoutingProvider.prefetch_matrices
+                or type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
+            )
+            and waypoint_groups_to_prefetch
+        ):
+            prefetch_headroom = reserved_headroom + 0.050
+            self.routing_provider.prefetch_matrices(
+                groups=waypoint_groups_to_prefetch,
+                deadline=effective_deadline,
+                reserved_headroom=prefetch_headroom,
+            )
+
+        # Stage 3 & 4: Route Insertion & Group Bundling
+        for veh, active_ride, eval_reqs, v_wps in vehicle_eval_plan:
+            if time.monotonic() > effective_deadline - reserved_headroom:
+                search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                is_approximated = True
+                break
+
+            max_bundle_reqs = (
+                effective_config.max_requests_per_vehicle
+                if effective_config.mode != DispatchMode.EXACT
+                else None
+            )
+
+            # Defensive per-vehicle fallback prefetch (instant O(1) no-op if already cached)
             if (
                 type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
                 and eval_reqs
             ):
-                v_wps = [Coordinate(veh.current_location.latitude, veh.current_location.longitude)]
-                if active_ride is not None:
-                    v_wps.extend([
-                        Coordinate(s.location.latitude, s.location.longitude)
-                        for s in active_ride.stops
-                        if s.status in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
-                    ])
-                for r in eval_reqs:
-                    v_wps.append(Coordinate(r.pickup_location.latitude, r.pickup_location.longitude))
-                    v_wps.append(Coordinate(r.dropoff_location.latitude, r.dropoff_location.longitude))
                 self.routing_provider.prefetch_matrix(
                     origins=v_wps,
                     destinations=v_wps,

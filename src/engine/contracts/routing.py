@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import math
+import time
 from typing import Any, Sequence
 
 
@@ -156,6 +157,31 @@ class RoadNetworkRoutingProvider(ABC):
         Returns the count of new valid legs cached.
         """
         return 0
+
+    def prefetch_matrices(
+        self,
+        groups: Sequence[Sequence[Coordinate]],
+        deadline: float | None = None,
+        reserved_headroom: float = 0.050,
+    ) -> int:
+        """
+        Optional performance hint to prefetch and memoize pairwise legs for multiple waypoint groups.
+        Default implementation sequentially iterates through groups calling prefetch_matrix.
+        Concrete adapters with concurrent transports can execute requests concurrently.
+        Must never fail or raise if individual legs cannot be routed.
+        Returns the total count of new valid legs cached.
+        """
+        total = 0
+        for group in groups:
+            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                break
+            total += self.prefetch_matrix(
+                origins=group,
+                destinations=group,
+                deadline=deadline,
+                reserved_headroom=reserved_headroom,
+            )
+        return total
 
     def check_health(self) -> bool:
         """

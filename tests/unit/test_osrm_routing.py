@@ -764,3 +764,197 @@ def test_prefetch_matrix_compact_url_when_same_endpoints() -> None:
     assert url.count("-75.165200,39.952600") == 1
     assert url.count("-75.193200,39.952200") == 1
 
+
+def test_default_osrm_transport_pool_checkout_reuse_and_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies connection reuse, pool tracking, and cleanup on close."""
+    import http.client
+    from unittest.mock import MagicMock
+
+    mock_conns: list[MagicMock] = []
+
+    def mock_create_conn(*args: Any, **kwargs: Any) -> MagicMock:
+        conn = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = b'{"code":"Ok"}'
+        conn.getresponse.return_value = mock_resp
+        mock_conns.append(conn)
+        return conn
+
+    monkeypatch.setattr(http.client, "HTTPConnection", mock_create_conn)
+
+    transport = DefaultOsrmTransport(base_url="http://127.0.0.1:5000", max_connections=2)
+    assert transport._total_created == 0
+
+    # First request creates connection 1
+    status1, body1 = transport.get("/test", timeout=1.0)
+    assert status1 == 200
+    assert transport._total_created == 1
+    assert len(mock_conns) == 1
+
+    # Second request reuses connection 1 from pool
+    status2, body2 = transport.get("/test", timeout=1.0)
+    assert status2 == 200
+    assert transport._total_created == 1
+    assert len(mock_conns) == 1
+
+    # Close transport closes all connections and sets closed state
+    transport.close()
+    assert transport._closed is True
+    mock_conns[0].close.assert_called_once()
+
+    # Further get calls raise ConnectionError
+    with pytest.raises(ConnectionError, match="closed"):
+        transport.get("/test", timeout=1.0)
+
+
+def test_default_osrm_transport_reconnects_on_stale_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifies that stale or dropped connections are closed and retried with a fresh connection."""
+    import http.client
+    from unittest.mock import MagicMock
+
+    stale_conn = MagicMock()
+    stale_conn.request.side_effect = http.client.RemoteDisconnected("Connection closed by peer")
+
+    fresh_conn = MagicMock()
+    fresh_resp = MagicMock()
+    fresh_resp.status = 200
+    fresh_resp.read.return_value = b'{"code":"Ok"}'
+    fresh_conn.getresponse.return_value = fresh_resp
+
+    conns = [stale_conn, fresh_conn]
+
+    def mock_create_conn(*args: Any, **kwargs: Any) -> MagicMock:
+        return conns.pop(0)
+
+    monkeypatch.setattr(http.client, "HTTPConnection", mock_create_conn)
+
+    transport = DefaultOsrmTransport(base_url="http://127.0.0.1:5000", max_connections=2)
+    status, body = transport.get("/retry-test", timeout=1.0)
+    assert status == 200
+    assert body == b'{"code":"Ok"}'
+    stale_conn.close.assert_called_once()
+    transport.close()
+
+
+def test_prefetch_matrices_concurrent_and_deduplicated() -> None:
+    """Verifies concurrent prefetching across multiple waypoint groups with deduplication."""
+    import time
+    transport = FakeOsrmTransport()
+
+    # Coordinate groups
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)
+    c4 = Coordinate(latitude=40.74, longitude=-74.04)
+
+    group_a = [c1, c2]
+    group_b = [c3, c4]
+    group_a_dup = [c2, c1]  # Same coordinates, reversed order
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, 1500.0], [1500.0, 0.0]],
+            "durations": [[0.0, 120.0], [120.0, 0.0]],
+        },
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=4)
+    cached = adapter.prefetch_matrices(groups=[group_a, group_b, group_a_dup])
+
+    # Should have executed for group_a and group_b, but deduplicated group_a_dup
+    assert cached > 0
+    assert len(transport.call_history) == 2
+
+    # Verify keys are in cache
+    hit, val = adapter._cache.lookup(adapter._cache_key(c1, c2))
+    assert hit is True
+    assert val == (1500, 120)
+
+    hit_b, val_b = adapter._cache.lookup(adapter._cache_key(c3, c4))
+    assert hit_b is True
+    assert val_b == (1500, 120)
+
+    adapter.close()
+
+
+def test_prefetch_matrices_skips_fully_cached_groups() -> None:
+    """Verifies that prefetch_matrices does not issue requests for groups already in cache."""
+    transport = FakeOsrmTransport()
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=2)
+    # Pre-populate cache
+    adapter._cache.set(adapter._cache_key(c1, c2), (1000, 100))
+    adapter._cache.set(adapter._cache_key(c2, c1), (1000, 100))
+
+    cached = adapter.prefetch_matrices(groups=[[c1, c2]])
+    assert cached == 0
+    assert len(transport.call_history) == 0
+    adapter.close()
+
+
+def test_prefetch_matrices_deadline_budget_respected() -> None:
+    """Verifies that prefetch_matrices stops or cancels tasks if deadline is exceeded."""
+    import time
+
+    class SlowTransport(OsrmHttpTransport):
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            time.sleep(0.1)
+            return 200, b'{"code":"Ok","distances":[[0.0, 100.0],[100.0, 0.0]],"durations":[[0.0, 10.0],[10.0, 0.0]]}'
+
+    adapter = OsrmRoutingAdapter(transport=SlowTransport(), max_workers=2)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    # Deadline already in the past
+    cached = adapter.prefetch_matrices(
+        groups=[[c1, c2]],
+        deadline=time.monotonic() - 1.0,
+        reserved_headroom=0.05,
+    )
+    assert cached == 0
+    adapter.close()
+
+
+def test_road_network_routing_provider_base_prefetch_matrices() -> None:
+    """Verifies the base class contract implementation of prefetch_matrices."""
+    from typing import Sequence
+    from engine.contracts.routing import RoadNetworkRoutingProvider
+
+    class MinimalRouter(RoadNetworkRoutingProvider):
+        def __init__(self) -> None:
+            self.prefetched_groups: list[Sequence[Coordinate]] = []
+
+        def get_distance_matrix(self, origins: Sequence[Coordinate], destinations: Sequence[Coordinate]) -> MatrixResult:
+            return MatrixResult(distances_meters=[], durations_seconds=[])
+
+        def get_route(self, waypoints: Sequence[Coordinate]) -> RouteGeometry:
+            return RouteGeometry(points=list(waypoints), total_distance_meters=0, total_duration_seconds=0)
+
+        def get_direct_leg(self, origin: Coordinate, destination: Coordinate) -> tuple[int, int]:
+            return (1000, 100)
+
+        def prefetch_matrix(
+            self,
+            origins: Sequence[Coordinate],
+            destinations: Sequence[Coordinate] | None = None,
+            deadline: float | None = None,
+            reserved_headroom: float = 0.050,
+        ) -> int:
+            self.prefetched_groups.append(origins)
+            return len(origins)
+
+    router = MinimalRouter()
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)
+
+    count = router.prefetch_matrices(groups=[[c1, c2], [c2, c3]])
+    assert count == 4
+    assert len(router.prefetched_groups) == 2
+
