@@ -136,6 +136,23 @@ class RoadNetworkRoutingProvider(ABC):
         """
         pass
 
+    def prefetch_matrix(
+        self,
+        origins: Sequence[Coordinate],
+        destinations: Sequence[Coordinate] | None = None,
+        deadline: float | None = None,
+        reserved_headroom: float = 0.050,
+    ) -> int:
+        """
+        Optional performance hint to prefetch and memoize pairwise legs among waypoints.
+        Default implementation is a no-op returning 0.
+        Concrete adapters with batched matrix endpoints (e.g. OSRM /table)
+        can query and populate their internal cache in bulk.
+        Must never fail or raise if individual legs cannot be routed.
+        Returns the count of new valid legs cached.
+        """
+        return 0
+
     def check_health(self) -> bool:
         """
         Operational health check verifying connectivity to the routing backend.

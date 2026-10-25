@@ -42,6 +42,9 @@ def test_reproducible_benchmark_500ms_sla(
     num_runs = 5
     first_result: MatchResult | None = None
 
+    import gc
+    gc.collect()
+
     # Warmup run to warm JIT/caches
     _ = engine.dispatch_batch(
         requests=requests[:100],

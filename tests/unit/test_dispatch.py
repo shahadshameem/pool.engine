@@ -178,3 +178,71 @@ def test_dispatch_engine_reproducible_determinism() -> None:
         assert a1.request_ids == a2.request_ids
         assert a1.objective_value == a2.objective_value
     assert res1.unassigned_request_ids == res2.unassigned_request_ids
+
+
+def test_dispatch_prefetch_matrix_integration() -> None:
+    """Verifies that dispatch triggers prefetch_matrix on capable router during candidate discovery."""
+    from typing import Sequence
+    from engine.contracts.routing import Coordinate, MatrixResult, RoadNetworkRoutingProvider, RouteGeometry
+
+    class SpyRoutingProvider(RoadNetworkRoutingProvider):
+        def __init__(self) -> None:
+            self._cache: dict[tuple[float, float, float, float], tuple[int, int]] = {}
+            self.prefetch_calls: list[tuple[Sequence[Coordinate], Sequence[Coordinate] | None]] = []
+
+        def _cache_key(self, o: Coordinate, d: Coordinate) -> tuple[float, float, float, float]:
+            return (round(o.latitude, 6), round(o.longitude, 6), round(d.latitude, 6), round(d.longitude, 6))
+
+        def get_direct_leg(self, origin: Coordinate, destination: Coordinate) -> tuple[int, int]:
+            key = self._cache_key(origin, destination)
+            if key in self._cache:
+                return self._cache[key]
+            return (1500, 200)
+
+        def get_distance_matrix(self, origins: Sequence[Coordinate], destinations: Sequence[Coordinate]) -> MatrixResult:
+            return MatrixResult(
+                distances_meters=[[1500 for _ in destinations] for _ in origins],
+                durations_seconds=[[200 for _ in destinations] for _ in origins],
+            )
+
+        def get_route(self, waypoints: Sequence[Coordinate]) -> RouteGeometry:
+            return RouteGeometry(points=list(waypoints), total_distance_meters=1500, total_duration_seconds=200)
+
+        def prefetch_matrix(
+            self,
+            origins: Sequence[Coordinate],
+            destinations: Sequence[Coordinate] | None = None,
+            deadline: float | None = None,
+            reserved_headroom: float = 0.050,
+        ) -> int:
+            self.prefetch_calls.append((origins, destinations))
+            for o in origins:
+                for d in (destinations if destinations is not None else origins):
+                    self._cache[self._cache_key(o, d)] = (1500, 200)
+            return len(origins)
+
+    spy_router = SpyRoutingProvider()
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=spy_router,
+        spatial_index=H3SpatialIndexAdapter(),
+    )
+
+    req = _make_sample_request("req-seed-1", 40.7128, -74.0060, 40.7500, -73.9800)
+    veh = _make_sample_vehicle("veh-seed-1", 40.7130, -74.0050, capacity=4)
+
+    res = engine.dispatch_batch(
+        requests=[req],
+        vehicles=[veh],
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-seed",
+    )
+
+    assert len(res.selected_assignments) == 1
+    # Verify prefetch was invoked
+    assert len(spy_router.prefetch_calls) > 0
+    # Verify router's internal cache was populated
+    p_c = Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
+    d_c = Coordinate(req.dropoff_location.latitude, req.dropoff_location.longitude)
+    assert spy_router._cache_key(p_c, d_c) in spy_router._cache

@@ -6,6 +6,7 @@ import http.client
 import json
 import math
 import threading
+import time
 from typing import Any, Sequence
 import urllib.parse
 
@@ -46,7 +47,10 @@ class DefaultOsrmTransport(OsrmHttpTransport):
     def __init__(self, base_url: str = "http://localhost:5000") -> None:
         parsed = urllib.parse.urlsplit(base_url)
         self.scheme = parsed.scheme.lower() if parsed.scheme else "http"
-        self.host = parsed.hostname or "localhost"
+        host = parsed.hostname or "localhost"
+        # Windows IPv6 resolution for "localhost" introduces a 2-second connection delay
+        # when daemon binds to IPv4. Normalize to 127.0.0.1 for instant loopback connections.
+        self.host = "127.0.0.1" if host == "localhost" else host
         self.port = parsed.port or (443 if self.scheme == "https" else 80)
         self.path_prefix = parsed.path.rstrip("/")
         self._lock = threading.Lock()
@@ -383,6 +387,7 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         # Total coordinates in table query = chunk_origins + chunk_destinations <= max_table_size
         max_origins_per_chunk = max(1, self.max_table_size // 2)
         max_dest_per_chunk = max(1, self.max_table_size - max_origins_per_chunk)
+        unresolved_pairs: list[tuple[Coordinate, Coordinate]] = []
 
         for o_start in range(0, m, max_origins_per_chunk):
             o_end = min(m, o_start + max_origins_per_chunk)
@@ -448,17 +453,28 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                     for c, dest in enumerate(chunk_destinations):
                         raw_dist = row_dist[c]
                         raw_dur = row_dur[c]
+                        key = self._cache_key(orig, dest)
 
                         if raw_dist is None or raw_dur is None:
-                            raise RouteLookupError(
-                                f"OSRM could not resolve route from ({orig.latitude}, {orig.longitude}) "
-                                f"to ({dest.latitude}, {dest.longitude})"
-                            )
+                            self._cache.set(key, None)
+                            unresolved_pairs.append((orig, dest))
+                            continue
 
-                        validated = validate_route_leg(orig, dest, (raw_dist, raw_dur))
-                        res_dist[o_start + r][d_start + c] = validated[0]
-                        res_dur[o_start + r][d_start + c] = validated[1]
-                        self._cache.set(self._cache_key(orig, dest), validated)
+                        try:
+                            validated = validate_route_leg(orig, dest, (raw_dist, raw_dur))
+                            res_dist[o_start + r][d_start + c] = validated[0]
+                            res_dur[o_start + r][d_start + c] = validated[1]
+                            self._cache.set(key, validated)
+                        except InvalidRouteDataError:
+                            self._cache.set(key, None)
+                            unresolved_pairs.append((orig, dest))
+
+        if unresolved_pairs:
+            first_orig, first_dest = unresolved_pairs[0]
+            raise RouteLookupError(
+                f"OSRM could not resolve route from ({first_orig.latitude}, {first_orig.longitude}) "
+                f"to ({first_dest.latitude}, {first_dest.longitude})"
+            )
 
         # Assemble final validated matrix
         final_dist: list[list[int]] = []
@@ -479,6 +495,105 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
             final_dur.append(row_t)
 
         return MatrixResult(distances_meters=final_dist, durations_seconds=final_dur)
+
+    def prefetch_matrix(
+        self,
+        origins: Sequence[Coordinate],
+        destinations: Sequence[Coordinate] | None = None,
+        deadline: float | None = None,
+        reserved_headroom: float = 0.050,
+    ) -> int:
+        """
+        Prefetches pairwise distance and duration matrix from OSRM table service
+        and populates the internal cache. Handles chunking, deduplication, and
+        never raises if individual cells cannot be routed.
+        Returns the count of new valid legs cached.
+        """
+        if destinations is None:
+            destinations = origins
+        m = len(origins)
+        n = len(destinations)
+        if m == 0 or n == 0:
+            return 0
+
+        if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+            return 0
+
+        max_origins_per_chunk = max(1, self.max_table_size // 2)
+        max_dest_per_chunk = max(1, self.max_table_size - max_origins_per_chunk)
+        cached_count = 0
+
+        for o_start in range(0, m, max_origins_per_chunk):
+            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                break
+            o_end = min(m, o_start + max_origins_per_chunk)
+            chunk_origins = origins[o_start:o_end]
+
+            for d_start in range(0, n, max_dest_per_chunk):
+                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                    break
+                d_end = min(n, d_start + max_dest_per_chunk)
+                chunk_destinations = destinations[d_start:d_end]
+
+                # Check if all cells in this chunk are already cached
+                all_cached = True
+                for o in chunk_origins:
+                    for d in chunk_destinations:
+                        hit, _ = self._cache.lookup(self._cache_key(o, d))
+                        if not hit:
+                            all_cached = False
+                            break
+                    if not all_cached:
+                        break
+                if all_cached:
+                    continue
+
+                all_coords = list(chunk_origins) + list(chunk_destinations)
+                coords_str = ";".join(
+                    f"{c.longitude:.{self.coord_precision}f},{c.latitude:.{self.coord_precision}f}"
+                    for c in all_coords
+                )
+                sources_str = ";".join(str(i) for i in range(len(chunk_origins)))
+                dests_str = ";".join(
+                    str(len(chunk_origins) + j) for j in range(len(chunk_destinations))
+                )
+                path = (
+                    f"/table/v1/{self.profile}/{coords_str}"
+                    f"?sources={sources_str}&destinations={dests_str}&annotations=duration,distance"
+                )
+
+                try:
+                    data = self._execute_get(path)
+                except Exception:
+                    continue
+
+                distances = data.get("distances")
+                durations = data.get("durations")
+                if not isinstance(distances, list) or not isinstance(durations, list):
+                    continue
+
+                for r, orig in enumerate(chunk_origins):
+                    if r >= len(distances) or not isinstance(distances[r], list):
+                        continue
+                    row_dist = distances[r]
+                    row_dur = durations[r]
+                    for c, dest in enumerate(chunk_destinations):
+                        if c >= len(row_dist):
+                            continue
+                        raw_dist = row_dist[c]
+                        raw_dur = row_dur[c]
+                        key = self._cache_key(orig, dest)
+                        if raw_dist is None or raw_dur is None:
+                            self._cache.set(key, None)
+                            continue
+                        try:
+                            val = validate_route_leg(orig, dest, (raw_dist, raw_dur))
+                            self._cache.set(key, val)
+                            cached_count += 1
+                        except InvalidRouteDataError:
+                            self._cache.set(key, None)
+
+        return cached_count
 
     def get_route(
         self,

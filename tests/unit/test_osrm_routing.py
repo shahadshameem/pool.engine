@@ -563,3 +563,122 @@ def test_default_osrm_transport_url_parsing_and_close() -> None:
     # Close should not raise even if connection was never opened
     transport.close()
 
+
+def test_default_osrm_transport_normalizes_localhost_to_ipv4() -> None:
+    """Verifies DefaultOsrmTransport converts 'localhost' to '127.0.0.1' to avoid Windows IPv6 probe lag."""
+    transport = DefaultOsrmTransport(base_url="http://localhost:5000")
+    assert transport.host == "127.0.0.1"
+    assert transport.port == 5000
+
+    transport_ip = DefaultOsrmTransport(base_url="http://127.0.0.1:5000")
+    assert transport_ip.host == "127.0.0.1"
+
+
+def test_osrm_adapter_prefetch_matrix_success() -> None:
+    """Verifies prefetch_matrix populates cache with valid legs without raising."""
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, 1500.0], [1400.0, 0.0]],
+            "durations": [[0.0, 180.0], [170.0, 0.0]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+    assert len(adapter.cache) == 0
+
+    cached = adapter.prefetch_matrix(origins=[C_PHL, C_UPENN])
+    assert cached == 4  # All 4 pairwise combinations (including zero-cost diagonals)
+    assert len(adapter.cache) == 4
+
+    # Subsequent direct leg lookup hits cache without network call
+    call_count_before = len(transport.call_history)
+    dist, dur = adapter.get_direct_leg(C_PHL, C_UPENN)
+    assert dist == 1500
+    assert dur == 180
+    assert len(transport.call_history) == call_count_before
+
+
+def test_osrm_adapter_prefetch_matrix_skips_when_already_cached() -> None:
+    """Verifies prefetch_matrix skips network calls when coordinates are already in cache."""
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, 1500.0], [1400.0, 0.0]],
+            "durations": [[0.0, 180.0], [170.0, 0.0]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+    adapter.prefetch_matrix(origins=[C_PHL, C_UPENN])
+    initial_calls = len(transport.call_history)
+
+    # Calling prefetch again with the same coordinates should not issue new network requests
+    adapter.prefetch_matrix(origins=[C_PHL, C_UPENN])
+    assert len(transport.call_history) == initial_calls
+
+
+def test_osrm_adapter_prefetch_matrix_negative_caching_and_no_exception() -> None:
+    """Verifies prefetch_matrix caches unroutable pairs as None without raising."""
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, None]],
+            "durations": [[0.0, None]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+    cached = adapter.prefetch_matrix(origins=[C_PHL], destinations=[C_UPENN])
+    assert cached == 0
+
+    # The unroutable pair should be in cache as None (negative cached)
+    hit, val = adapter._cache.lookup(adapter._cache_key(C_PHL, C_UPENN))
+    assert hit is True
+    assert val is None
+
+
+def test_osrm_adapter_prefetch_matrix_respects_deadline() -> None:
+    """Verifies prefetch_matrix exits early when deadline is exceeded."""
+    import time
+
+    transport = FakeOsrmTransport()
+    adapter = OsrmRoutingAdapter(transport=transport)
+
+    # Expired deadline
+    cached = adapter.prefetch_matrix(
+        origins=[C_PHL, C_UPENN],
+        deadline=time.monotonic() - 1.0,
+    )
+    assert cached == 0
+    assert len(transport.call_history) == 0
+
+
+def test_osrm_adapter_get_distance_matrix_caches_valid_legs_before_raising() -> None:
+    """Verifies get_distance_matrix caches all valid legs even when unroutable pairs cause RouteLookupError."""
+    transport = FakeOsrmTransport()
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": [[0.0, 1200.0], [None, 0.0]],
+            "durations": [[0.0, 150.0], [None, 0.0]],
+        },
+    )
+    adapter = OsrmRoutingAdapter(transport=transport)
+    with pytest.raises(RouteLookupError) as exc_info:
+        adapter.get_distance_matrix(origins=[C_PHL, C_UPENN], destinations=[C_PHL, C_UPENN])
+
+    assert "OSRM could not resolve route" in str(exc_info.value)
+    # Valid leg (C_PHL -> C_UPENN) should be cached despite the error on (C_UPENN -> C_PHL)
+    hit, val = adapter._cache.lookup(adapter._cache_key(C_PHL, C_UPENN))
+    assert hit is True
+    assert val == (1200, 150)
+

@@ -492,6 +492,28 @@ class DispatchEngine:
                 eval_reqs = sorted_reqs[:effective_eval_cap] if effective_eval_cap is not None else sorted_reqs
                 max_bundle_reqs = bundle_cap
 
+            # Bounded road network matrix prefetch for vehicle and candidate request waypoints
+            if (
+                type(self.routing_provider).prefetch_matrix is not RoadNetworkRoutingProvider.prefetch_matrix
+                and eval_reqs
+            ):
+                v_wps = [Coordinate(veh.current_location.latitude, veh.current_location.longitude)]
+                if active_ride is not None:
+                    v_wps.extend([
+                        Coordinate(s.location.latitude, s.location.longitude)
+                        for s in active_ride.stops
+                        if s.status in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
+                    ])
+                for r in eval_reqs:
+                    v_wps.append(Coordinate(r.pickup_location.latitude, r.pickup_location.longitude))
+                    v_wps.append(Coordinate(r.dropoff_location.latitude, r.dropoff_location.longitude))
+                self.routing_provider.prefetch_matrix(
+                    origins=v_wps,
+                    destinations=v_wps,
+                    deadline=effective_deadline,
+                    reserved_headroom=reserved_headroom,
+                )
+
             if active_ride is not None:
                 ins_cands = generate_active_ride_insertions(
                     active_ride=active_ride,
