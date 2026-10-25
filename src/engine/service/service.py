@@ -137,21 +137,18 @@ class PoolEngineService:
         request_id: str,
         reason: Optional[str] = None,
         current_time: Optional[int] = None,
+        idempotency_token: Optional[str] = None,
     ) -> RideRequest:
         """
         Safely cancels a ride request preserving lifecycle invariants.
 
         - If PENDING: marks CANCELLED directly in storage.
         - If MATCHED: safely adjusts active ride stops, revalidates itinerary, updates ETAs,
-          and marks request CANCELLED.
+          and commits both the re-optimized ride and request status atomically via
+          storage.cancel_assigned_request_atomic().
         - If CANCELLED: idempotent, returns existing request.
         - If COMPLETED or EXPIRED: raises LifecycleError (422).
         - If IN_TRANSIT (already boarded): raises LifecycleError (422).
-
-        NOTE on Concurrency & Atomicity:
-        The underlying RideStorageProvider contract does not currently expose an atomic
-        cross-entity transaction method for ride cancellation and request status update.
-        Hence, ride updates and request cancellation are committed sequentially.
         """
         req = self.storage.get_request(request_id)
         if req is None:
@@ -174,36 +171,68 @@ class PoolEngineService:
                 self.storage.save_request(cancelled_req)
                 return cancelled_req
 
-            ride = self.storage.get_ride(req.matched_ride_id)
-            if ride is None:
-                raise ResourceNotFoundError(
-                    f"Matched Ride '{req.matched_ride_id}' for request '{request_id}' not found"
-                )
-
             eff_time = current_time if current_time is not None else int(time.time())
-            vehicle = self.storage.get_vehicle(ride.vehicle_id)
-            veh_loc = vehicle.current_location if vehicle else None
 
-            try:
-                cancel_en_route_request(
-                    ride=ride,
+            # Bounded retry on optimistic concurrency conflict
+            max_attempts = 2
+            for attempt in range(max_attempts):
+                ride = self.storage.get_ride(req.matched_ride_id)
+                if ride is None:
+                    raise ResourceNotFoundError(
+                        f"Matched Ride '{req.matched_ride_id}' for request '{request_id}' not found"
+                    )
+
+                vehicle = self.storage.get_vehicle(ride.vehicle_id)
+                veh_loc = vehicle.current_location if vehicle else None
+
+                # Compute re-optimized itinerary without modifying storage (storage=None)
+                try:
+                    computed_ride, _ = cancel_en_route_request(
+                        ride=ride,
+                        request_id=request_id,
+                        router=self.router,
+                        current_time=eff_time,
+                        vehicle_location=veh_loc,
+                        storage=None,
+                    )
+                except LifecycleTransitionError as err:
+                    raise LifecycleError(str(err)) from err
+                except (RoutingProviderError, TimeoutError, ConnectionError) as err:
+                    raise RoutingError(
+                        f"Routing provider failure during en-route cancellation: {err}"
+                    ) from err
+
+                # Commit atomically across ride and request in one single transaction
+                eff_token = f"{idempotency_token}:att{attempt}" if idempotency_token is not None else None
+                commit_res = self.storage.cancel_assigned_request_atomic(
+                    ride_id=ride.ride_id,
                     request_id=request_id,
-                    router=self.router,
-                    current_time=eff_time,
-                    vehicle_location=veh_loc,
-                    storage=self.storage,
+                    expected_ride_version=ride.version,
+                    updated_stops=computed_ride.stops,
+                    new_total_vmt_meters=computed_ride.total_vmt_meters,
+                    idempotency_token=eff_token,
                 )
-            except LifecycleTransitionError as err:
-                raise LifecycleError(str(err)) from err
-            except (RoutingProviderError, TimeoutError, ConnectionError) as err:
-                raise RoutingError(
-                    f"Routing provider failure during en-route cancellation: {err}"
-                ) from err
 
-            updated_req = self.storage.get_request(request_id)
-            if updated_req is None:
-                updated_req = req.model_copy(update={"status": RequestStatus.CANCELLED})
-            return updated_req
+                if commit_res.success and commit_res.request is not None:
+                    return commit_res.request
+
+                if commit_res.rejection_reason == "VERSION_CONFLICT":
+                    if attempt < max_attempts - 1:
+                        continue  # retry with freshly fetched ride
+                    raise ConflictError(
+                        f"Optimistic concurrency conflict cancelling request '{request_id}': "
+                        f"ride '{ride.ride_id}' was modified concurrently"
+                    )
+                elif commit_res.rejection_reason == "PASSENGER_ALREADY_BOARDED":
+                    raise LifecycleError(f"Passenger {request_id} has already boarded; cannot cancel en-route")
+                elif commit_res.rejection_reason == "REQUEST_NOT_FOUND":
+                    raise ResourceNotFoundError(f"RideRequest '{request_id}' not found")
+                elif commit_res.rejection_reason == "RIDE_NOT_FOUND":
+                    raise ResourceNotFoundError(f"Ride '{ride.ride_id}' not found")
+                else:
+                    raise LifecycleError(f"Cancellation rejected: {commit_res.rejection_reason}")
+
+            raise ConflictError(f"Concurrency conflict cancelling request '{request_id}'")
 
         if req.status == RequestStatus.IN_TRANSIT:
             raise LifecycleError("Passenger has already boarded vehicle; cannot cancel en-route")

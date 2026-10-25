@@ -45,6 +45,7 @@ class CancelRideRequestInput(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     reason: Optional[str] = None
+    idempotency_token: Optional[str] = None
 
 
 class RegisterVehicleInput(BaseModel):

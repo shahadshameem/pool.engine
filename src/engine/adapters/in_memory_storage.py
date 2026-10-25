@@ -5,13 +5,14 @@ from typing import Any, Optional, Sequence
 
 from engine.contracts.storage import (
     AssignmentCommitResult,
+    CancellationCommitResult,
     IdempotencyRecord,
     RideStorageProvider,
     SeatHold,
     VersionConflictError,
 )
 from engine.domain.candidate import CandidateAssignment
-from engine.domain.enums import RequestStatus, RideStatus
+from engine.domain.enums import RequestStatus, RideStatus, StopStatus, StopType
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.routing.invariants import check_capacity_profile
 
@@ -564,4 +565,121 @@ class InMemoryRideStorage(RideStorageProvider):
                 ride_id=existing_ride.ride_id,
                 ride=updated_ride,
                 committed_request_ids=assignment.request_ids,
+            )
+
+    def cancel_assigned_request_atomic(
+        self,
+        ride_id: str,
+        request_id: str,
+        expected_ride_version: int,
+        updated_stops: Sequence[RouteStop],
+        new_total_vmt_meters: int,
+        idempotency_token: Optional[str] = None,
+        new_ride_status: Optional[RideStatus] = None,
+    ) -> CancellationCommitResult:
+        with self._lock:
+            # 1. Idempotency Check
+            if idempotency_token is not None and idempotency_token in self._idempotency_records:
+                rec = self._idempotency_records[idempotency_token]
+                if rec.get("record_type") == "cancellation" and rec.get("request_id") == request_id and rec.get("ride_id") == ride_id:
+                    return CancellationCommitResult(
+                        success=True,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        ride=self._rides.get(ride_id),
+                        request=self._requests.get(request_id),
+                    )
+                return CancellationCommitResult(
+                    success=False,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    rejection_reason="IDEMPOTENCY_CONFLICT",
+                )
+
+            # 2. Check Ride exists and OCC version
+            ride = self._rides.get(ride_id)
+            if ride is None:
+                return CancellationCommitResult(
+                    success=False,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    rejection_reason="RIDE_NOT_FOUND",
+                )
+
+            if ride.version != expected_ride_version:
+                return CancellationCommitResult(
+                    success=False,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    rejection_reason="VERSION_CONFLICT",
+                )
+
+            # 3. Check Request exists and is MATCHED to this ride
+            req = self._requests.get(request_id)
+            if req is None:
+                return CancellationCommitResult(
+                    success=False,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    rejection_reason="REQUEST_NOT_FOUND",
+                )
+
+            if req.status == RequestStatus.CANCELLED:
+                # Idempotent replay
+                return CancellationCommitResult(
+                    success=True,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    ride=ride,
+                    request=req,
+                )
+
+            if req.status != RequestStatus.MATCHED or req.matched_ride_id != ride_id:
+                return CancellationCommitResult(
+                    success=False,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    rejection_reason="REQUEST_NOT_MATCHED",
+                )
+
+            # 4. Check if passenger already boarded
+            for s in ride.stops:
+                if s.request_id == request_id and s.stop_type == StopType.PICKUP and s.status == StopStatus.COMPLETED:
+                    return CancellationCommitResult(
+                        success=False,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        rejection_reason="PASSENGER_ALREADY_BOARDED",
+                    )
+
+            # 5. Atomic Update
+            new_version = ride.version + 1
+            eff_status = new_ride_status if new_ride_status is not None else ride.lifecycle_status
+            new_ride = ride.model_copy(
+                update={
+                    "stops": tuple(updated_stops),
+                    "total_vmt_meters": new_total_vmt_meters,
+                    "lifecycle_status": eff_status,
+                    "version": new_version,
+                }
+            )
+            new_req = req.model_copy(update={"status": RequestStatus.CANCELLED})
+
+            self._rides[ride_id] = new_ride
+            self._requests[request_id] = new_req
+
+            if idempotency_token is not None:
+                self._idempotency_records[idempotency_token] = {
+                    "record_type": "cancellation",
+                    "request_id": request_id,
+                    "ride_id": ride_id,
+                    "version": new_version,
+                }
+
+            return CancellationCommitResult(
+                success=True,
+                request_id=request_id,
+                ride_id=ride_id,
+                ride=new_ride,
+                request=new_req,
             )

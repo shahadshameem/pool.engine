@@ -191,10 +191,31 @@ class RideStorageProvider(ABC):
         Atomically commits a single dispatch candidate assignment to storage.
         """
         pass
+
+    @abstractmethod
+    def cancel_assigned_request_atomic(
+        self,
+        ride_id: str,
+        request_id: str,
+        expected_ride_version: int,
+        updated_stops: Sequence[RouteStop],
+        new_total_vmt_meters: int,
+        idempotency_token: Optional[str] = None,
+        new_ride_status: Optional[RideStatus] = None,
+    ) -> CancellationCommitResult:
+        """
+        Atomically cancels an assigned request and commits the re-optimized ride itinerary in a single transaction.
+        """
+        pass
 ```
 
 ## 2. Invariants & Concurrency Contract
-- **Serializable Isolation & Race Resolution**: `acquire_seat_hold_atomic`, `reserve_seats_atomic`, and `commit_dispatch_assignment_atomic` MUST guarantee serializable isolation for concurrent seat requests and batch dispatch commits.
+- **Serializable Isolation & Race Resolution**: `acquire_seat_hold_atomic`, `reserve_seats_atomic`, `commit_dispatch_assignment_atomic`, and `cancel_assigned_request_atomic` MUST guarantee serializable isolation for concurrent seat requests, batch dispatch commits, and en-route cancellations.
+- **Atomic Assigned-Request Cancellation**: `cancel_assigned_request_atomic` guarantees single-transaction atomicity across both `rides` and `ride_requests`:
+  - Acquires row-level locks (`SELECT ... FOR UPDATE`) on the target ride, request, and route stops.
+  - Verifies OCC version (`rides.version == expected_ride_version`) and validates passenger has not already boarded.
+  - Updates the route itinerary (stops and VMT), increments ride version, and transitions the request to `CANCELLED` within the same transaction.
+  - Complete Rollback: Any database constraint violation or unexpected failure rolls back the entire transaction, preventing partial writes or desynchronized state.
 - **Per-Assignment Atomic Commits**: In batch dispatch orchestration, each candidate assignment is committed in an independent, atomic database transaction with row-level locks (`SELECT ... FOR UPDATE`) on the vehicle, ride, and requests:
   - If a concurrent collision occurs (e.g. `VERSION_CONFLICT` on an existing active ride, or a request was cancelled), only that specific assignment fails and rolls back.
   - Other valid assignments in the same batch continue to commit without interruption or data corruption.

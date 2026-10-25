@@ -8,12 +8,13 @@ import pytest
 from engine.adapters.in_memory_storage import InMemoryRideStorage
 from engine.contracts.storage import (
     AssignmentCommitResult,
+    CancellationCommitResult,
     IdempotencyRecord,
     RideStorageProvider,
     SeatHold,
 )
 from engine.domain.candidate import CandidateAssignment
-from engine.domain.enums import JoinStatus, RequestStatus, RideStatus
+from engine.domain.enums import JoinStatus, RequestStatus, RideStatus, StopStatus, StopType
 from engine.domain.models import GeoCoordinate, JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.lifecycle.reservations import expire_stale_holds, submit_join_request
 from engine.contracts.policy import DispatchPolicy
@@ -56,6 +57,7 @@ def test_storage_contract_defines_abstract_methods() -> None:
     assert "get_active_vehicles" in RideStorageProvider.__abstractmethods__
     assert "get_active_rides" in RideStorageProvider.__abstractmethods__
     assert "commit_dispatch_assignment_atomic" in RideStorageProvider.__abstractmethods__
+    assert "cancel_assigned_request_atomic" in RideStorageProvider.__abstractmethods__
 
     class IncompleteStorage(RideStorageProvider):
         pass
@@ -402,6 +404,26 @@ def test_submit_join_request_occ_retry_uses_contract_without_private_holds_acces
                 assignment, idempotency_token, current_time, expected_ride_version, new_ride_id
             )
 
+        def cancel_assigned_request_atomic(
+            self,
+            ride_id: str,
+            request_id: str,
+            expected_ride_version: int,
+            updated_stops: Sequence[RouteStop],
+            new_total_vmt_meters: int,
+            idempotency_token: Optional[str] = None,
+            new_ride_status: Optional[RideStatus] = None,
+        ) -> CancellationCommitResult:
+            return self._target.cancel_assigned_request_atomic(
+                ride_id,
+                request_id,
+                expected_ride_version,
+                updated_stops,
+                new_total_vmt_meters,
+                idempotency_token,
+                new_ride_status,
+            )
+
     proxy_storage = ContractOnlyStorageProxy(raw_storage)
     policy = DispatchPolicy(join_request_expiry_seconds=300)
 
@@ -482,4 +504,115 @@ def test_get_idempotency_record_and_conflict_detection() -> None:
     assert rec.join_request_id == "join-1"
     assert rec.request_id == "req-1"
     assert rec.ride_id == "ride-idem"
-    assert rec.version == 2
+
+
+def test_cancel_assigned_request_atomic_in_memory() -> None:
+    """Verifies cancel_assigned_request_atomic:
+    - Atomically removes stops and updates request status
+    - Rejects stale versions (VERSION_CONFLICT)
+    - Rejects already boarded passengers (PASSENGER_ALREADY_BOARDED)
+    - Supports idempotent replays
+    """
+    storage, ride, _ = _setup_test_ride_and_storage("ride-atomic-c1", vehicle_capacity=4)
+    loc = GeoCoordinate(latitude=40.75, longitude=-73.98)
+
+    pickup = RouteStop(
+        stop_id="stop-p1",
+        ride_id=ride.ride_id,
+        request_id="req-c1",
+        stop_type=StopType.PICKUP,
+        location=loc,
+        passenger_delta=1,
+        scheduled_arrival_time=1200,
+        promised_window_start=1150,
+        promised_window_end=1250,
+        status=StopStatus.SCHEDULED,
+    )
+    dropoff = RouteStop(
+        stop_id="stop-d1",
+        ride_id=ride.ride_id,
+        request_id="req-c1",
+        stop_type=StopType.DROPOFF,
+        location=loc,
+        passenger_delta=-1,
+        scheduled_arrival_time=1600,
+        promised_window_start=1550,
+        promised_window_end=1650,
+        status=StopStatus.SCHEDULED,
+    )
+    ride_with_stops = ride.model_copy(update={"stops": (pickup, dropoff), "version": 1})
+    storage.save_ride(ride_with_stops)
+
+    req = RideRequest(
+        request_id="req-c1",
+        user_id="usr-c1",
+        pickup_location=loc,
+        dropoff_location=loc,
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=2000,
+        direct_distance_meters=2000,
+        direct_duration_seconds=400,
+        status=RequestStatus.MATCHED,
+        matched_ride_id=ride.ride_id,
+    )
+    storage.save_request(req)
+
+    # 1. Stale version rejection
+    stale_res = storage.cancel_assigned_request_atomic(
+        ride_id=ride.ride_id,
+        request_id="req-c1",
+        expected_ride_version=99,
+        updated_stops=(),
+        new_total_vmt_meters=0,
+    )
+    assert not stale_res.success
+    assert stale_res.rejection_reason == "VERSION_CONFLICT"
+
+    # 2. Boarded passenger rejection
+    boarded_pickup = pickup.model_copy(update={"status": StopStatus.COMPLETED})
+    storage.save_ride(ride_with_stops.model_copy(update={"stops": (boarded_pickup, dropoff)}))
+    boarded_res = storage.cancel_assigned_request_atomic(
+        ride_id=ride.ride_id,
+        request_id="req-c1",
+        expected_ride_version=1,
+        updated_stops=(),
+        new_total_vmt_meters=0,
+    )
+    assert not boarded_res.success
+    assert boarded_res.rejection_reason == "PASSENGER_ALREADY_BOARDED"
+
+    # Restore unboarded stops
+    storage.save_ride(ride_with_stops)
+
+    # 3. Successful atomic cancellation
+    success_res = storage.cancel_assigned_request_atomic(
+        ride_id=ride.ride_id,
+        request_id="req-c1",
+        expected_ride_version=1,
+        updated_stops=(),
+        new_total_vmt_meters=0,
+        idempotency_token="token-cancel-1",
+    )
+    assert success_res.success
+    assert success_res.ride is not None
+    assert success_res.ride.version == 2
+    assert len(success_res.ride.stops) == 0
+    assert success_res.request is not None
+    assert success_res.request.status == RequestStatus.CANCELLED
+
+    # Check persistence in storage
+    assert storage.get_ride(ride.ride_id).version == 2  # type: ignore[union-attr]
+    assert storage.get_request("req-c1").status == RequestStatus.CANCELLED  # type: ignore[union-attr]
+
+    # 4. Idempotent replay with same token
+    replay_res = storage.cancel_assigned_request_atomic(
+        ride_id=ride.ride_id,
+        request_id="req-c1",
+        expected_ride_version=2,
+        updated_stops=(),
+        new_total_vmt_meters=0,
+        idempotency_token="token-cancel-1",
+    )
+    assert replay_res.success
+    assert replay_res.ride is not None and replay_res.ride.version == 2

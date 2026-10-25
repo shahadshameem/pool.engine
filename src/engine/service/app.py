@@ -132,14 +132,25 @@ def create_app(service: PoolEngineService) -> Callable[[Scope, Receive, Send], A
     async def handle_cancel_request(scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]) -> tuple[int, dict[str, str], bytes]:
         req_id = params["request_id"]
         reason = None
+        body_idemp = None
         if body:
             try:
                 raw_data = json.loads(body.decode("utf-8"))
                 cancel_dto = CancelRideRequestInput.model_validate(raw_data)
                 reason = cancel_dto.reason
+                body_idemp = cancel_dto.idempotency_token
             except Exception:
                 pass
-        cancelled = service.cancel_request(req_id, reason=reason)
+
+        header_idemp = headers.get("idempotency-key")
+        if header_idemp is not None and body_idemp is not None and header_idemp != body_idemp:
+            return _error_response(
+                400,
+                "VALIDATION_ERROR",
+                f"Idempotency-Key header ('{header_idemp}') does not match body idempotency_token ('{body_idemp}')",
+            )
+        eff_idemp = header_idemp or body_idemp
+        cancelled = service.cancel_request(req_id, reason=reason, idempotency_token=eff_idemp)
         return _json_response(200, cancelled)
 
     router.add("POST", "/v1/requests/{request_id}/cancel", handle_cancel_request)

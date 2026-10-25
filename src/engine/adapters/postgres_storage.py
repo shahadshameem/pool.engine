@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import time
 from typing import Any, Optional, Sequence
 
 import psycopg
@@ -10,6 +11,7 @@ from psycopg.rows import dict_row
 
 from engine.contracts.storage import (
     AssignmentCommitResult,
+    CancellationCommitResult,
     IdempotencyRecord,
     RideStorageProvider,
     SeatHold,
@@ -1259,4 +1261,212 @@ class PostgresRideStorage(RideStorageProvider):
                     ride_id=assignment.existing_ride_id,
                     ride=updated_ride,
                     committed_request_ids=assignment.request_ids,
+                )
+
+    def cancel_assigned_request_atomic(
+        self,
+        ride_id: str,
+        request_id: str,
+        expected_ride_version: int,
+        updated_stops: Sequence[RouteStop],
+        new_total_vmt_meters: int,
+        idempotency_token: Optional[str] = None,
+        new_ride_status: Optional[RideStatus] = None,
+    ) -> CancellationCommitResult:
+        """
+        Atomically cancels an assigned request and commits the re-optimized ride itinerary in a single transaction.
+        Uses SELECT ... FOR UPDATE on both the ride and request rows.
+        """
+        conn = self._get_connection()
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                # 1. Idempotency Check
+                if idempotency_token is not None:
+                    cur.execute(
+                        "SELECT * FROM idempotency_records WHERE idempotency_token = %s",
+                        (idempotency_token,),
+                    )
+                    rec = cur.fetchone()
+                    if rec is not None:
+                        if (
+                            rec["record_type"] == "cancellation"
+                            and rec["request_id"] == request_id
+                            and rec["ride_id"] == ride_id
+                        ):
+                            cur_ride = self.get_ride(ride_id)
+                            cur_req = self.get_request(request_id)
+                            return CancellationCommitResult(
+                                success=True,
+                                request_id=request_id,
+                                ride_id=ride_id,
+                                ride=cur_ride,
+                                request=cur_req,
+                            )
+                        return CancellationCommitResult(
+                            success=False,
+                            request_id=request_id,
+                            ride_id=ride_id,
+                            rejection_reason="IDEMPOTENCY_CONFLICT",
+                        )
+
+                # 2. Lock Ride Row (SELECT ... FOR UPDATE) and verify OCC version
+                cur.execute(
+                    """
+                    SELECT version, lifecycle_status, total_vmt_meters
+                    FROM rides
+                    WHERE ride_id = %s
+                    FOR UPDATE
+                    """,
+                    (ride_id,),
+                )
+                ride_row = cur.fetchone()
+                if ride_row is None:
+                    return CancellationCommitResult(
+                        success=False,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        rejection_reason="RIDE_NOT_FOUND",
+                    )
+
+                if ride_row["version"] != expected_ride_version:
+                    return CancellationCommitResult(
+                        success=False,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        rejection_reason="VERSION_CONFLICT",
+                    )
+
+                # 3. Lock Request Row
+                cur.execute(
+                    """
+                    SELECT request_id, status, matched_ride_id
+                    FROM ride_requests
+                    WHERE request_id = %s
+                    FOR UPDATE
+                    """,
+                    (request_id,),
+                )
+                req_row = cur.fetchone()
+                if req_row is None:
+                    return CancellationCommitResult(
+                        success=False,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        rejection_reason="REQUEST_NOT_FOUND",
+                    )
+
+                if req_row["status"] == RequestStatus.CANCELLED.value:
+                    # Idempotent replay
+                    cur_ride = self.get_ride(ride_id)
+                    cur_req = self.get_request(request_id)
+                    return CancellationCommitResult(
+                        success=True,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        ride=cur_ride,
+                        request=cur_req,
+                    )
+
+                if req_row["status"] != RequestStatus.MATCHED.value or req_row["matched_ride_id"] != ride_id:
+                    return CancellationCommitResult(
+                        success=False,
+                        request_id=request_id,
+                        ride_id=ride_id,
+                        rejection_reason="REQUEST_NOT_MATCHED",
+                    )
+
+                # 4. Check route stops for passenger boarding
+                cur.execute(
+                    """
+                    SELECT stop_type, status
+                    FROM route_stops
+                    WHERE ride_id = %s AND request_id = %s
+                    FOR UPDATE
+                    """,
+                    (ride_id, request_id),
+                )
+                stop_rows = cur.fetchall()
+                for s in stop_rows:
+                    if s["stop_type"] == StopType.PICKUP.value and s["status"] == StopStatus.COMPLETED.value:
+                        return CancellationCommitResult(
+                            success=False,
+                            request_id=request_id,
+                            ride_id=ride_id,
+                            rejection_reason="PASSENGER_ALREADY_BOARDED",
+                        )
+
+                # 5. Delete existing route stops and insert updated_stops
+                cur.execute("DELETE FROM route_stops WHERE ride_id = %s", (ride_id,))
+                for idx, stop in enumerate(updated_stops):
+                    cur.execute(
+                        """
+                        INSERT INTO route_stops (
+                            stop_id, ride_id, stop_order, request_id, stop_type,
+                            latitude, longitude, passenger_delta, scheduled_arrival_time,
+                            promised_window_start, promised_window_end, dwell_duration_seconds, status
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            stop.stop_id,
+                            ride_id,
+                            idx,
+                            stop.request_id,
+                            stop.stop_type.value,
+                            stop.location.latitude,
+                            stop.location.longitude,
+                            stop.passenger_delta,
+                            stop.scheduled_arrival_time,
+                            stop.promised_window_start,
+                            stop.promised_window_end,
+                            stop.dwell_duration_seconds,
+                            stop.status.value,
+                        ),
+                    )
+
+                # 6. Update Ride version and VMT
+                new_version = ride_row["version"] + 1
+                eff_status = (
+                    new_ride_status.value
+                    if new_ride_status is not None
+                    else ride_row["lifecycle_status"]
+                )
+                cur.execute(
+                    """
+                    UPDATE rides
+                    SET total_vmt_meters = %s, version = %s, lifecycle_status = %s, updated_at = NOW()
+                    WHERE ride_id = %s
+                    """,
+                    (new_total_vmt_meters, new_version, eff_status, ride_id),
+                )
+
+                # 7. Update Request to CANCELLED
+                cur.execute(
+                    """
+                    UPDATE ride_requests
+                    SET status = %s, updated_at = NOW()
+                    WHERE request_id = %s
+                    """,
+                    (RequestStatus.CANCELLED.value, request_id),
+                )
+
+                # 8. Record Idempotency if token provided
+                if idempotency_token is not None:
+                    cur.execute(
+                        """
+                        INSERT INTO idempotency_records (
+                            idempotency_token, record_type, join_request_id, request_id, ride_id, version, created_at
+                        ) VALUES (%s, 'cancellation', '', %s, %s, %s, %s)
+                        """,
+                        (idempotency_token, request_id, ride_id, new_version, int(time.time())),
+                    )
+
+                # Return updated ride and request snapshots
+                updated_ride = self.get_ride(ride_id)
+                updated_req = self.get_request(request_id)
+                return CancellationCommitResult(
+                    success=True,
+                    request_id=request_id,
+                    ride_id=ride_id,
+                    ride=updated_ride,
+                    request=updated_req,
                 )

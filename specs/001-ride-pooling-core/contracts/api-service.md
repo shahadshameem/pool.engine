@@ -202,15 +202,16 @@ All non-2xx responses return a uniform error envelope:
   - Atomic transition of all matched requests from `PENDING` to `MATCHED`.
   - Atomic insertion of new or updated `Ride` and `RouteStop` rows.
   - Safe replay on identical idempotency tokens.
+- **Assigned Request Cancellation**: `RideStorageProvider.cancel_assigned_request_atomic()` guarantees single-transaction atomicity:
+  - Row-level lock on `rides` (`SELECT ... FOR UPDATE`) enforcing OCC version check.
+  - Row-level lock on `ride_requests` (`SELECT ... FOR UPDATE`).
+  - Row-level lock on `route_stops` checking passenger boarding state (rejecting if pickup completed).
+  - Atomic stop itinerary replacement, ride version increment, and request status transition to `CANCELLED`.
+  - Complete Rollback: Any constraint or transaction failure rolls back both ride and request updates together.
 
-### Documented Storage Contract Limitation (Cancellation)
-- **Cross-Entity Cancellation Atomicity**: The current `RideStorageProvider` contract exposes isolated single-entity operations (`save_ride()`, `save_request()`), but lacks a dedicated cross-entity atomic transaction method for route cancellation (e.g., `cancel_assigned_request_atomic()`).
-- **Implemented Mitigation**: `cancel_request()` executes the safest supported sequence:
-  1. Inspects active ride and verifies passenger has not already boarded.
-  2. Computes updated itinerary without the cancelled stops and recalculates downstream ETAs.
-  3. Increments ride version and calls `storage.save_ride(updated_ride)`.
-  4. Calls `storage.save_request(cancelled_request)`.
-- If process failure occurs between steps 3 and 4, the ride itinerary has freed the seats but the request status remains `MATCHED`. Applications requiring zero-risk distributed atomicity during cancellations should extend `RideStorageProvider` with an atomic cancellation method in a subsequent phase.
+### Distributed Transaction Scope
+- Atomicity is guaranteed at the storage engine level (PostgreSQL transaction / ACID boundary or in-memory lock).
+- This does not claim distributed two-phase commit across external payment or fleet networks.
 
 ---
 

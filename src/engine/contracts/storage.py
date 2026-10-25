@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 from engine.domain.candidate import CandidateAssignment
+from engine.domain.enums import RideStatus
 from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 
 
@@ -41,6 +42,17 @@ class AssignmentCommitResult:
     rejection_reason: Optional[str] = None
     ride: Optional[Ride] = None
     committed_request_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CancellationCommitResult:
+    """Outcome of attempting to atomically cancel an assigned request from a ride."""
+    success: bool
+    request_id: str
+    ride_id: str
+    rejection_reason: Optional[str] = None
+    ride: Optional[Ride] = None
+    request: Optional[RideRequest] = None
 
 
 class StorageProviderError(Exception):
@@ -228,5 +240,33 @@ class RideStorageProvider(ABC):
           - If idempotency_token conflicts with a different candidate or request, returns success=False with rejection_reason="IDEMPOTENCY_CONFLICT".
         - Isolation:
           - If any check fails, the transaction is completely rolled back and storage is left unmutated.
+        """
+        pass
+
+    @abstractmethod
+    def cancel_assigned_request_atomic(
+        self,
+        ride_id: str,
+        request_id: str,
+        expected_ride_version: int,
+        updated_stops: Sequence[RouteStop],
+        new_total_vmt_meters: int,
+        idempotency_token: Optional[str] = None,
+        new_ride_status: Optional[RideStatus] = None,
+    ) -> CancellationCommitResult:
+        """
+        Atomically cancels an assigned request and commits the re-optimized ride itinerary in a single transaction.
+
+        Guarantees:
+        - Locks both the Ride and the RideRequest (and RouteStops) under row-level or thread locks.
+        - Verifies the ride exists and ride.version == expected_ride_version (OCC).
+        - Verifies the request exists and is currently in MATCHED status with matched_ride_id == ride_id.
+        - Verifies the passenger has not already boarded (no pickup stop with status COMPLETED).
+        - Replaces the ride's route stops with updated_stops and updates total_vmt_meters.
+        - Increments ride.version by 1.
+        - Updates the request status to CANCELLED.
+        - If idempotency_token is provided, verifies/records idempotency.
+        - Atomic Rollback: If any validation or database constraint fails, the entire transaction is rolled back,
+          leaving both ride and request completely unmutated.
         """
         pass

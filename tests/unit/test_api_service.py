@@ -325,6 +325,147 @@ def test_cancel_matched_request_calls_en_route_cancellation(
     assert updated_ride.version == 2
 
 
+def test_cancel_request_boarded_passenger_raises_lifecycle_error(
+    service_env: tuple[PoolEngineService, InMemoryRideStorage, MockRoutingProvider, DispatchOrchestrator],
+) -> None:
+    service, storage, _, _ = service_env
+    veh = Vehicle(
+        vehicle_id="veh-b1",
+        driver_id="drv-b1",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=40.75, longitude=-73.98),
+        is_active=True,
+    )
+    storage.save_vehicle(veh)
+
+    pickup = RouteStop(
+        stop_id="stop-pb1",
+        ride_id="ride-b1",
+        request_id="req-boarded",
+        stop_type=StopType.PICKUP,
+        location=GeoCoordinate(latitude=40.755, longitude=-73.975),
+        passenger_delta=1,
+        scheduled_arrival_time=1200,
+        promised_window_start=1150,
+        promised_window_end=1250,
+        status=StopStatus.COMPLETED,  # Boarded!
+    )
+    dropoff = RouteStop(
+        stop_id="stop-db1",
+        ride_id="ride-b1",
+        request_id="req-boarded",
+        stop_type=StopType.DROPOFF,
+        location=GeoCoordinate(latitude=40.78, longitude=-73.96),
+        passenger_delta=-1,
+        scheduled_arrival_time=1600,
+        promised_window_start=1550,
+        promised_window_end=1650,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-b1",
+        vehicle_id="veh-b1",
+        driver_id="drv-b1",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(pickup, dropoff),
+        scheduled_departure_time=1000,
+        active_passenger_count=1,
+        total_vmt_meters=5000,
+        version=1,
+    )
+    storage.save_ride(ride)
+
+    req = RideRequest(
+        request_id="req-boarded",
+        user_id="usr-1",
+        pickup_location=GeoCoordinate(latitude=40.755, longitude=-73.975),
+        dropoff_location=GeoCoordinate(latitude=40.78, longitude=-73.96),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=3000,
+        direct_distance_meters=2000,
+        direct_duration_seconds=400,
+        status=RequestStatus.MATCHED,
+        matched_ride_id="ride-b1",
+    )
+    storage.save_request(req)
+
+    with pytest.raises(LifecycleError) as exc:
+        service.cancel_request("req-boarded")
+    assert exc.value.status_code == 422
+    assert "already boarded" in str(exc.value)
+
+
+def test_cancel_request_concurrency_conflict_raises_conflict_error(
+    service_env: tuple[PoolEngineService, InMemoryRideStorage, MockRoutingProvider, DispatchOrchestrator],
+) -> None:
+    service, storage, _, _ = service_env
+    veh = Vehicle(
+        vehicle_id="veh-occ",
+        driver_id="drv-occ",
+        total_seat_capacity=4,
+        current_location=GeoCoordinate(latitude=40.75, longitude=-73.98),
+        is_active=True,
+    )
+    storage.save_vehicle(veh)
+
+    pickup = RouteStop(
+        stop_id="stop-p-occ",
+        ride_id="ride-occ",
+        request_id="req-occ",
+        stop_type=StopType.PICKUP,
+        location=GeoCoordinate(latitude=40.755, longitude=-73.975),
+        passenger_delta=1,
+        scheduled_arrival_time=1200,
+        promised_window_start=1150,
+        promised_window_end=1250,
+        status=StopStatus.SCHEDULED,
+    )
+    ride = Ride(
+        ride_id="ride-occ",
+        vehicle_id="veh-occ",
+        driver_id="drv-occ",
+        lifecycle_status=RideStatus.ACTIVE,
+        stops=(pickup,),
+        scheduled_departure_time=1000,
+        active_passenger_count=0,
+        total_vmt_meters=2000,
+        version=1,
+    )
+    storage.save_ride(ride)
+
+    req = RideRequest(
+        request_id="req-occ",
+        user_id="usr-1",
+        pickup_location=GeoCoordinate(latitude=40.755, longitude=-73.975),
+        dropoff_location=GeoCoordinate(latitude=40.78, longitude=-73.96),
+        seat_count=1,
+        earliest_pickup_time=1000,
+        latest_dropoff_time=3000,
+        direct_distance_meters=2000,
+        direct_duration_seconds=400,
+        status=RequestStatus.MATCHED,
+        matched_ride_id="ride-occ",
+    )
+    storage.save_request(req)
+
+    # Mock cancel_assigned_request_atomic to always return VERSION_CONFLICT
+    from engine.contracts.storage import CancellationCommitResult
+    storage.cancel_assigned_request_atomic = MagicMock(  # type: ignore[method-assign]
+        return_value=CancellationCommitResult(
+            success=False,
+            request_id="req-occ",
+            ride_id="ride-occ",
+            rejection_reason="VERSION_CONFLICT",
+        )
+    )
+
+    with pytest.raises(ConflictError) as exc:
+        service.cancel_request("req-occ")
+    assert exc.value.status_code == 409
+    assert "concurrency conflict" in str(exc.value).lower()
+
+
 def test_vehicle_registration_and_updates(
     service_env: tuple[PoolEngineService, InMemoryRideStorage, MockRoutingProvider, DispatchOrchestrator],
 ) -> None:
