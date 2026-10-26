@@ -52,13 +52,19 @@ jobs:
         env:
           TEST_DATABASE_URL: "postgresql://pool_user:pool_test_password@127.0.0.1:5432/pool_test"
         run: |
-          pytest -v tests --tb=short -ra > /tmp/pytest.log 2>&1 || true
+          set +e
+          pytest -v tests --tb=short -ra > /tmp/pytest.log 2>&1
+          PYTEST_EXIT=$?
+          set -e
           cat /tmp/pytest.log
-          echo "### Pytest Execution Summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -n 60 /tmp/pytest.log >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -q "passed" /tmp/pytest.log && ! grep -q "FAILED" /tmp/pytest.log
+          echo "### Pytest Execution Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 60 /tmp/pytest.log >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ $PYTEST_EXIT -ne 0 ]; then
+            echo "::error::Pytest suite failed with exit code $PYTEST_EXIT"
+            exit $PYTEST_EXIT
+          fi
 
       - name: Verify PostgreSQL schema initialization idempotency
         env:
@@ -77,8 +83,17 @@ jobs:
 
       - name: Validate Systemd service unit syntax
         run: |
-          sudo useradd -r -s /sbin/nologin poolengine || true
-          sudo systemd-analyze verify deploy/systemd/pool-engine.service || true
+          # 1. Pre-create runtime user so systemd can resolve User=poolengine
+          id -u poolengine >/dev/null 2>&1 || sudo useradd -r -s /sbin/nologin poolengine
+
+          # 2. Verify service unit using native systemd-analyze exit status.
+          # Use --recursive-errors=no when supported to validate pool-engine.service
+          # directives without failing on external system units (e.g. postgresql.service).
+          if systemd-analyze --help | grep -q -- "--recursive-errors"; then
+            systemd-analyze verify --recursive-errors=no deploy/systemd/pool-engine.service
+          else
+            systemd-analyze verify deploy/systemd/pool-engine.service
+          fi
 
   docker-and-deployment:
     name: Docker Build, Compose Healthcheck & Graceful Shutdown
