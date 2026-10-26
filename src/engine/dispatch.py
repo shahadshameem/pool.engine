@@ -108,6 +108,7 @@ class CandidateGenerationConfig:
     num_partitions: Optional[int] = None
     max_candidate_vehicles_per_partition: Optional[int] = 13
     boundary_buffer_meters: float = 600.0
+    aging_weight_mps: float = 15.0
 
     @classmethod
     def exact(
@@ -130,6 +131,7 @@ class CandidateGenerationConfig:
             spatial_partitioning=False,
             num_partitions=None,
             max_candidate_vehicles_per_partition=None,
+            aging_weight_mps=0.0,
         )
 
     @classmethod
@@ -148,6 +150,7 @@ class CandidateGenerationConfig:
         num_partitions: Optional[int] = None,
         max_candidate_vehicles_per_partition: Optional[int] = 13,
         boundary_buffer_meters: float = 600.0,
+        aging_weight_mps: float = 15.0,
     ) -> "CandidateGenerationConfig":
         """Constructs a BOUNDED mode configuration with explicit approximation limits."""
         return cls(
@@ -165,6 +168,7 @@ class CandidateGenerationConfig:
             num_partitions=num_partitions,
             max_candidate_vehicles_per_partition=max_candidate_vehicles_per_partition,
             boundary_buffer_meters=boundary_buffer_meters,
+            aging_weight_mps=aging_weight_mps,
         )
 
 
@@ -174,10 +178,13 @@ def _sort_requests_by_active_detour(
     active_ride: Ride,
     req_pickup_coords: dict[str, Coordinate] | None = None,
     req_pickup_rad: dict[str, tuple[float, float, float]] | None = None,
+    current_time: Optional[int] = None,
+    aging_weight_mps: float = 0.0,
 ) -> list[RideRequest]:
     """
     Sorts candidate requests ascending by lower-bound detour distance relative to
     the vehicle's current location and remaining scheduled/in-progress stops.
+    Incorporates starvation-aware aging credit when current_time and aging_weight_mps > 0.
     """
     v_loc = Coordinate(vehicle.current_location.latitude, vehicle.current_location.longitude)
     active_stops = [
@@ -208,6 +215,14 @@ def _sort_requests_by_active_detour(
         return (p_lat, p_lon, math.cos(p_lat))
 
     if not active_stops:
+        if current_time is not None and aging_weight_mps > 0.0:
+            return sorted(
+                requests,
+                key=lambda r: (
+                    _fast_hav(v_rad, _get_p_rad(r))
+                    - aging_weight_mps * max(0, current_time - r.earliest_pickup_time)
+                ),
+            )
         return sorted(requests, key=lambda r: _fast_hav(v_rad, _get_p_rad(r)))
 
     coords_rad = [v_rad] + [
@@ -241,7 +256,11 @@ def _sort_requests_by_active_detour(
             min_p_detour = append_detour
 
         direct_pd = float(req.direct_distance_meters)
-        return min_p_detour + direct_pd
+        base_detour = min_p_detour + direct_pd
+        if current_time is not None and aging_weight_mps > 0.0:
+            aging_credit = aging_weight_mps * float(max(0, current_time - req.earliest_pickup_time))
+            return base_detour - aging_credit
+        return base_detour
 
     return sorted(requests, key=_req_detour_lower_bound)
 
@@ -477,7 +496,15 @@ class DispatchEngine:
         for veh_id, nearby_reqs in nearby_requests_by_vehicle.items():
             if not nearby_reqs:
                 continue
-            min_d = min(d for d, _ in nearby_reqs)
+            if effective_config.aging_weight_mps > 0.0:
+                min_d = min(
+                    pair[0]
+                    - effective_config.aging_weight_mps
+                    * max(0, current_time - pair[1].earliest_pickup_time)
+                    for pair in nearby_reqs
+                )
+            else:
+                min_d = min(d for d, _ in nearby_reqs)
             candidate_vehicles_with_min_dist.append((min_d, vehicles_by_id[veh_id], nearby_reqs))
 
         candidate_vehicles_with_min_dist.sort(key=operator.itemgetter(0))
@@ -504,9 +531,24 @@ class DispatchEngine:
                     active_ride,
                     req_pickup_coords=req_pickup_coords,
                     req_pickup_rad=req_pickup_rad,
+                    current_time=current_time,
+                    aging_weight_mps=effective_config.aging_weight_mps,
                 )
             else:
-                sorted_reqs = [r for _, r in sorted(nearby_reqs, key=operator.itemgetter(0))]
+                if effective_config.aging_weight_mps > 0.0:
+                    sorted_reqs = [
+                        r
+                        for _, r in sorted(
+                            nearby_reqs,
+                            key=lambda pair: (
+                                pair[0]
+                                - effective_config.aging_weight_mps
+                                * max(0, current_time - pair[1].earliest_pickup_time)
+                            ),
+                        )
+                    ]
+                else:
+                    sorted_reqs = [r for _, r in sorted(nearby_reqs, key=operator.itemgetter(0))]
 
             # Request slicing: strictly controlled by explicit configuration
             if effective_config.mode == DispatchMode.EXACT:
@@ -865,17 +907,29 @@ class DispatchEngine:
         else:
             num_partitions = 3
 
-        cand_veh_limit = effective_config.max_candidate_vehicles_per_partition or 13
+        cand_veh_limit_default = effective_config.max_candidate_vehicles_per_partition or 13
+        total_cand_limit = (
+            effective_config.max_candidate_vehicles
+            if effective_config.max_candidate_vehicles is not None
+            else (cand_veh_limit_default * num_partitions)
+        )
         buffer_m = effective_config.boundary_buffer_meters
         buffer_deg = buffer_m / 111000.0
 
-        # Sort pending request latitudes to determine partition quantile boundaries
-        latitudes = sorted(r.pickup_location.latitude for r in pending_requests)
-        n_lat = len(latitudes)
-        split_lats = [
-            latitudes[int(i * n_lat / num_partitions)]
-            for i in range(1, num_partitions)
+        # Determine partition boundaries along the active spatial extent
+        all_lats = [r.pickup_location.latitude for r in pending_requests] + [
+            v.current_location.latitude for v in eligible_vehicles
         ]
+        min_lat = min(all_lats)
+        max_lat = max(all_lats)
+        lat_span = max_lat - min_lat
+        if lat_span > 1e-5:
+            split_lats = [
+                min_lat + lat_span * (i / num_partitions)
+                for i in range(1, num_partitions)
+            ]
+        else:
+            split_lats = []
 
         def get_home_sector(lat: float) -> int:
             for s_idx, split_lat in enumerate(split_lats):
@@ -900,6 +954,7 @@ class DispatchEngine:
             if home_sec < num_partitions - 1 and abs(p_lat - split_lats[home_sec]) <= buffer_deg:
                 reqs_by_sector[home_sec + 1].append(r)
 
+        total_reqs = sum(len(reqs) for reqs in reqs_by_sector)
         rides_by_veh = {r.vehicle_id: r for r in active_rides}
         policy = self.policy_provider.get_policy()
 
@@ -919,6 +974,13 @@ class DispatchEngine:
             if not sec_reqs or not sec_vehs:
                 continue
 
+            # Demand-proportional candidate vehicle limit across sectors
+            if total_reqs > 0:
+                prop_limit = round(total_cand_limit * (len(sec_reqs) / total_reqs))
+                sec_cand_limit = max(8, min(20, prop_limit))
+            else:
+                sec_cand_limit = cand_veh_limit_default
+
             # Query nearby vehicles within this sector
             coord = SpatialIndexCoordinator(self.spatial_index)
             coord.index_entities([
@@ -937,17 +999,56 @@ class DispatchEngine:
                 for c in cands:
                     nearby[c.entity_id].append((c.haversine_distance_meters, r))
 
-            cand_vehs = [
-                (min(d for d, _ in req_list), v, req_list)
-                for v in sec_vehs
-                if (req_list := nearby.get(v.vehicle_id))
-            ]
+            if effective_config.aging_weight_mps > 0.0:
+                cand_vehs = [
+                    (
+                        min(
+                            pair[0]
+                            - effective_config.aging_weight_mps
+                            * max(0, current_time - pair[1].earliest_pickup_time)
+                            for pair in req_list
+                        ),
+                        v,
+                        req_list,
+                    )
+                    for v in sec_vehs
+                    if (req_list := nearby.get(v.vehicle_id))
+                ]
+            else:
+                cand_vehs = [
+                    (min(d for d, _ in req_list), v, req_list)
+                    for v in sec_vehs
+                    if (req_list := nearby.get(v.vehicle_id))
+                ]
             cand_vehs.sort(key=operator.itemgetter(0))
-            cand_vehs = cand_vehs[:cand_veh_limit]
+            cand_vehs = cand_vehs[:sec_cand_limit]
 
             for _, veh, nearby_reqs in cand_vehs:
                 active_ride = rides_by_veh.get(veh.vehicle_id)
-                sorted_reqs = [r for _, r in sorted(nearby_reqs, key=operator.itemgetter(0))]
+                if active_ride is not None:
+                    plain_reqs = [r for _, r in nearby_reqs]
+                    sorted_reqs = _sort_requests_by_active_detour(
+                        plain_reqs,
+                        veh,
+                        active_ride,
+                        current_time=current_time,
+                        aging_weight_mps=effective_config.aging_weight_mps,
+                    )
+                else:
+                    if effective_config.aging_weight_mps > 0.0:
+                        sorted_reqs = [
+                            r
+                            for _, r in sorted(
+                                nearby_reqs,
+                                key=lambda pair: (
+                                    pair[0]
+                                    - effective_config.aging_weight_mps
+                                    * max(0, current_time - pair[1].earliest_pickup_time)
+                                ),
+                            )
+                        ]
+                    else:
+                        sorted_reqs = [r for _, r in sorted(nearby_reqs, key=operator.itemgetter(0))]
                 eval_reqs = sorted_reqs[:max_single_cap]
                 if not eval_reqs:
                     continue
