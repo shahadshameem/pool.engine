@@ -59,7 +59,7 @@ services:
       SERVICE_HOST: "0.0.0.0"
       SERVICE_PORT: "8000"
       DATABASE_URL: "postgresql://pool_user:pool_development_password@postgres:5432/pool_engine"
-      OSRM_BASE_URL: "http://osrm:5000"
+      OSRM_BASE_URL: "${OSRM_BASE_URL:-}"
       ROUTING_TIMEOUT_SECONDS: "0.45"
       AUTH_ENABLED: "false"
       MAX_BATCH_SIZE: "500"
