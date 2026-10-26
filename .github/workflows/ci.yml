@@ -71,10 +71,11 @@ jobs:
 
       - name: Validate Systemd service unit syntax
         run: |
+          sudo useradd -r -s /sbin/nologin poolengine || true
           sudo systemd-analyze verify deploy/systemd/pool-engine.service || true
 
   docker-and-deployment:
-    name: Docker Build, Healthcheck & Graceful Shutdown
+    name: Docker Build, Compose Healthcheck & Graceful Shutdown
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -88,64 +89,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Validate Docker Compose configuration
+        run: |
+          mkdir -p deploy/docker/osrm-data
+          docker compose -f deploy/docker/docker-compose.yml config
+
+      - name: Build Docker image directly
         run: |
           docker build -t pool-engine:ci -f deploy/docker/Dockerfile .
 
-      - name: Launch PostgreSQL container for integration testing
+      - name: Launch Docker Compose stack (PostgreSQL and Pool Engine)
         run: |
-          docker run -d \
-            --name pg-test \
-            --health-cmd "pg_isready -U pool_user -d pool_engine" \
-            --health-interval 5s \
-            --health-timeout 3s \
-            --health-retries 5 \
-            -e POSTGRES_DB=pool_engine \
-            -e POSTGRES_USER=pool_user \
-            -e POSTGRES_PASSWORD=pool_development_password \
-            -p 5432:5432 \
-            postgres:16-alpine
-          
-          # Wait until PostgreSQL is ready
-          for i in {1..30}; do
-            if docker inspect --format='{{json .State.Health.Status}}' pg-test | grep -q '"healthy"'; then
-              echo "PostgreSQL is healthy"
-              break
-            fi
-            sleep 1
-          done
+          docker compose -f deploy/docker/docker-compose.yml up -d --build postgres pool-engine
 
-      - name: Initialize database schema via container
-        run: |
-          docker run --rm \
-            --network host \
-            -e DATABASE_URL=postgresql://pool_user:pool_development_password@127.0.0.1:5432/pool_engine \
-            pool-engine:ci \
-            python /app/scripts/init_db.py
-
-      - name: Launch Pool Engine API container
-        run: |
-          docker run -d \
-            --name pool-engine-app \
-            --network host \
-            -e ENVIRONMENT=production \
-            -e SERVICE_HOST=0.0.0.0 \
-            -e SERVICE_PORT=8000 \
-            -e DATABASE_URL=postgresql://pool_user:pool_development_password@127.0.0.1:5432/pool_engine \
-            -e AUTH_ENABLED=false \
-            -e MAX_BATCH_SIZE=500 \
-            -e DEFAULT_DISPATCH_TIMEOUT_SECONDS=0.500 \
-            -e SHUTDOWN_TIMEOUT_SECONDS=10.0 \
-            pool-engine:ci
-
-          # Poll container health
+          # Wait for API container health
           for i in {1..30}; do
             if curl -s -f http://127.0.0.1:8000/v1/health/liveness; then
-              echo "Pool Engine container is responsive!"
+              echo "Pool Engine container is healthy and responding!"
               break
             fi
             sleep 1
           done
+
+      - name: Initialize database schema via container exec
+        run: |
+          docker compose -f deploy/docker/docker-compose.yml exec -T pool-engine python /app/scripts/init_db.py
 
       - name: Run smoke test against running container
         run: |
@@ -153,19 +121,21 @@ jobs:
           pip install -e ".[service,postgres]"
           python scripts/smoke_test.py --base-url http://127.0.0.1:8000
 
-      - name: Test graceful shutdown under SIGTERM
+      - name: Test graceful container shutdown under SIGTERM
         run: |
-          echo "Sending SIGTERM to pool-engine-app container..."
+          echo "Sending SIGTERM to pool-engine-api container via Compose..."
           STOP_START=$(date +%s%N)
-          docker stop --time 15 pool-engine-app
+          docker compose -f deploy/docker/docker-compose.yml stop -t 15 pool-engine
           STOP_END=$(date +%s%N)
           DURATION_MS=$(( (STOP_END - STOP_START) / 1000000 ))
           echo "Graceful shutdown completed in ${DURATION_MS}ms"
-          
-          # Verify exit status is 0 or 143 (SIGTERM)
-          EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' pool-engine-app)
+
+          # Verify exit status
+          EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' pool-engine-api)
           echo "Container exit code: ${EXIT_CODE}"
           if [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 143 ]; then
             echo "Unexpected exit code: ${EXIT_CODE}"
             exit 1
           fi
+
+          docker compose -f deploy/docker/docker-compose.yml down -v

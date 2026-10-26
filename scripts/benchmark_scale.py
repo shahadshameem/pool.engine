@@ -137,10 +137,17 @@ def measure_workload_memory_mb(
     requests: list[RideRequest],
     vehicles: list[Vehicle],
 ) -> float:
+    """Measure peak heap memory allocation delta for the full workload.
+
+    Scope: Python heap allocations tracked by tracemalloc during dispatch_batch.
+    Excludes external background daemon memory (OSRM C++ server, PostgreSQL daemon).
+    Executed in a dedicated standalone pass to eliminate tracemalloc bytecode
+    hook overhead from latency measurements.
+    """
     gc.collect()
     tracemalloc.start()
     mem_start = tracemalloc.get_traced_memory()[0]
-    _ = engine.dispatch_batch(requests[:50], vehicles[:25], [], 1700000000, deadline=time.monotonic() + 5.0)
+    _ = engine.dispatch_batch(requests, vehicles, [], 1700000000, deadline=time.monotonic() + 5.0)
     _, mem_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     return round((mem_peak - mem_start) / (1024.0 * 1024.0), 2)
@@ -214,6 +221,11 @@ def run_scale_benchmarks(
             "sla_ms": 500.0,
             "seeds": list(seeds),
             "trials_per_seed": trials_per_seed,
+            "total_trials_per_condition": len(seeds) * trials_per_seed,
+            "sample_size_note": (
+                "For N=9 trials per condition, p95 and p99 sample indices evaluate to the 9th "
+                "sample (sample maximum). Reliable production p99 certification requires N >= 100 trials."
+            ),
         },
         "benchmarks": [],
     }
@@ -296,8 +308,10 @@ def run_scale_benchmarks(
 
             lat_sorted = sorted(latencies)
             p50 = statistics.median(lat_sorted)
-            p95 = lat_sorted[int(0.95 * len(lat_sorted))]
-            p99 = lat_sorted[int(0.99 * len(lat_sorted))]
+            p95_idx = min(len(lat_sorted) - 1, int(0.95 * len(lat_sorted)))
+            p99_idx = min(len(lat_sorted) - 1, int(0.99 * len(lat_sorted)))
+            p95 = lat_sorted[p95_idx]
+            p99 = lat_sorted[p99_idx]
             max_lat = max(lat_sorted)
             sla_compliant = (p99 <= 500.0) and (expired_count == 0)
 
@@ -318,6 +332,9 @@ def run_scale_benchmarks(
                 "mean_vmt_km": round(statistics.mean(vmts), 2),
                 "mean_mem_mb": round(statistics.mean(mems), 2),
                 "sla_compliant": sla_compliant,
+                "trial_latencies_ms": [round(x, 2) for x in lat_sorted],
+                "trial_durations_ms": [round(x, 2) for x in durations],
+                "trial_matches": matches,
             }
             results["benchmarks"].append(summary)
 
