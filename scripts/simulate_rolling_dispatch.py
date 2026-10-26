@@ -333,7 +333,7 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
     unmatched_requests = [t for t in request_tracker.values() if t.matched_cycle is None]
     cumulative_match_rate = len(matched_requests) / total_requests if total_requests > 0 else 0.0
 
-    # Wait cycle distribution for matched requests
+    # Wait cycle & second distribution for matched requests
     wait_cycles = [
         t.matched_cycle - t.arrival_cycle
         for t in matched_requests
@@ -348,6 +348,10 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
     # Starvation index: requests waiting >= 3 cycles, >= 5 cycles
     starved_3_cycles = sum(1 for w in wait_cycles if w >= 3)
     starved_5_cycles = sum(1 for w in wait_cycles if w >= 5)
+
+    # Unmatched starvation metrics
+    unmatched_ge_3 = sum(1 for t in unmatched_requests if (cfg.num_cycles - t.arrival_cycle) >= 3)
+    unmatched_ge_5 = sum(1 for t in unmatched_requests if (cfg.num_cycles - t.arrival_cycle) >= 5)
 
     # Sector fairness breakdown
     sectors = ["Downtown", "Midtown", "Uptown"]
@@ -367,28 +371,53 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             "matched": sec_matched,
             "match_rate": round(sec_rate, 4),
             "avg_wait_cycles": round(avg_wait, 2),
+            "unmatched": sec_total - sec_matched,
         }
 
-    # Party size breakdown: single seat vs multi seat
+    # Party size breakdown: 1, 2, 3 seats
+    party_stats: dict[str, dict[str, Any]] = {}
+    for seats in [1, 2, 3]:
+        s_reqs = [t for t in request_tracker.values() if t.request.seat_count == seats]
+        s_matched = [t for t in s_reqs if t.matched_cycle is not None]
+        s_wait = [t.matched_cycle - t.arrival_cycle for t in s_matched if t.matched_cycle is not None]
+        party_stats[f"{seats}_seat"] = {
+            "total": len(s_reqs),
+            "matched": len(s_matched),
+            "match_rate": round(len(s_matched) / len(s_reqs), 4) if s_reqs else 0.0,
+            "avg_wait": round(statistics.mean(s_wait), 2) if s_wait else 0.0,
+        }
+
+    # Combined single vs multi
     single_reqs = [t for t in request_tracker.values() if t.request.seat_count == 1]
     multi_reqs = [t for t in request_tracker.values() if t.request.seat_count > 1]
     single_matched = [t for t in single_reqs if t.matched_cycle is not None]
     multi_matched = [t for t in multi_reqs if t.matched_cycle is not None]
-
-    party_stats = {
-        "single": {
-            "total": len(single_reqs),
-            "matched": len(single_matched),
-            "match_rate": round(len(single_matched) / len(single_reqs), 4) if single_reqs else 0.0,
-            "avg_wait": round(statistics.mean([t.matched_cycle - t.arrival_cycle for t in single_matched if t.matched_cycle is not None]), 2) if single_matched else 0.0,
-        },
-        "multi": {
-            "total": len(multi_reqs),
-            "matched": len(multi_matched),
-            "match_rate": round(len(multi_matched) / len(multi_reqs), 4) if multi_reqs else 0.0,
-            "avg_wait": round(statistics.mean([t.matched_cycle - t.arrival_cycle for t in multi_matched if t.matched_cycle is not None]), 2) if multi_matched else 0.0,
-        },
+    party_stats["single_overall"] = {
+        "total": len(single_reqs),
+        "matched": len(single_matched),
+        "match_rate": round(len(single_matched) / len(single_reqs), 4) if single_reqs else 0.0,
+        "avg_wait": round(statistics.mean([t.matched_cycle - t.arrival_cycle for t in single_matched if t.matched_cycle is not None]), 2) if single_matched else 0.0,
     }
+    party_stats["multi_overall"] = {
+        "total": len(multi_reqs),
+        "matched": len(multi_matched),
+        "match_rate": round(len(multi_matched) / len(multi_reqs), 4) if multi_reqs else 0.0,
+        "avg_wait": round(statistics.mean([t.matched_cycle - t.arrival_cycle for t in multi_matched if t.matched_cycle is not None]), 2) if multi_matched else 0.0,
+    }
+
+    # Vehicle capacity breakdown (4-seat sedans vs 6-seat vans)
+    capacity_stats: dict[str, dict[str, Any]] = {}
+    for cap in [4, 6]:
+        cap_vehs = [v for v in vehicles if v.total_seat_capacity == cap]
+        cap_asgns = sum(vehicle_assignments_count[v.vehicle_id] for v in cap_vehs)
+        cap_utilized = sum(1 for v in cap_vehs if vehicle_assignments_count[v.vehicle_id] > 0)
+        capacity_stats[f"{cap}_seat"] = {
+            "fleet_count": len(cap_vehs),
+            "utilized_count": cap_utilized,
+            "utilization_rate": round(cap_utilized / len(cap_vehs), 4) if cap_vehs else 0.0,
+            "total_assignments": cap_asgns,
+            "mean_assignments": round(cap_asgns / len(cap_vehs), 2) if cap_vehs else 0.0,
+        }
 
     # Boundary request breakdown
     boundary_reqs = [t for t in request_tracker.values() if t.is_boundary]
@@ -428,6 +457,7 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
         "cadence_seconds": cfg.cycle_interval_seconds,
         "total_requests": total_requests,
         "matched_count": len(matched_requests),
+        "unmatched_count": len(unmatched_requests),
         "cumulative_match_rate": round(cumulative_match_rate, 4),
         "total_vmt_savings_km": round(total_vmt_savings_meters / 1000.0, 2),
         "wait_cycles": {
@@ -435,11 +465,20 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             "median": statistics.median(wait_cycles) if wait_cycles else 0,
             "p95": sorted(wait_cycles)[int(0.95 * len(wait_cycles))] if wait_cycles else 0,
             "max": max(wait_cycles) if wait_cycles else 0,
-            "starved_ge_3_cycles": starved_3_cycles,
-            "starved_ge_5_cycles": starved_5_cycles,
+            "matched_starved_ge_3_cycles": starved_3_cycles,
+            "matched_starved_ge_5_cycles": starved_5_cycles,
+            "unmatched_starved_ge_3_cycles": unmatched_ge_3,
+            "unmatched_starved_ge_5_cycles": unmatched_ge_5,
+        },
+        "wait_seconds": {
+            "min": min(wait_seconds) if wait_seconds else 0,
+            "median": round(statistics.median(wait_seconds), 1) if wait_seconds else 0.0,
+            "p95": round(sorted(wait_seconds)[int(0.95 * len(wait_seconds))], 1) if wait_seconds else 0.0,
+            "max": max(wait_seconds) if wait_seconds else 0,
         },
         "sector_stats": sector_stats,
         "party_stats": party_stats,
+        "capacity_stats": capacity_stats,
         "boundary_stats": boundary_stats,
         "fleet_utilization": {
             "utilized_vehicles": utilized_vehs,
@@ -477,22 +516,49 @@ def print_simulation_report(res: dict[str, Any]) -> None:
 
     print("\n--- Summary Performance & Starvation Criteria ---")
     print(f"Total Requests: {res['total_requests']}")
-    print(f"Total Matched: {res['matched_count']} ({res['cumulative_match_rate'] * 100:.1f}%) | Total VMT Savings: {res['total_vmt_savings_km']} km")
+    print(
+        f"Total Matched: {res['matched_count']} ({res['cumulative_match_rate'] * 100:.1f}%) | "
+        f"Total Unmatched: {res['unmatched_count']} ({(res['unmatched_count']/res['total_requests']) * 100:.1f}%) | "
+        f"Total VMT Savings: {res['total_vmt_savings_km']} km"
+    )
     wc = res["wait_cycles"]
-    print(f"Wait Cycles: min={wc['min']}, median={wc['median']}, p95={wc['p95']}, max={wc['max']}")
-    print(f"Starved (>=3 cycles): {wc['starved_ge_3_cycles']}, Starved (>=5 cycles): {wc['starved_ge_5_cycles']}")
+    ws = res["wait_seconds"]
+    print(f"Wait Cycles (Matched): min={wc['min']}, median={wc['median']}, p95={wc['p95']}, max={wc['max']}")
+    print(f"Wait Seconds (Matched): min={ws['min']}s, median={ws['median']}s, p95={ws['p95']}s, max={ws['max']}s")
+    print(
+        f"Matched Starved (>=3 cycles): {wc['matched_starved_ge_3_cycles']}, "
+        f"Matched Starved (>=5 cycles): {wc['matched_starved_ge_5_cycles']}"
+    )
+    print(
+        f"Unmatched in Backlog (>=3 cycles): {wc['unmatched_starved_ge_3_cycles']}, "
+        f"Unmatched in Backlog (>=5 cycles): {wc['unmatched_starved_ge_5_cycles']}"
+    )
 
-    print("\n--- Regional Sector Fairness ---")
+    print("\n--- Regional Sector Fairness & Backlog ---")
     for sec, s in res["sector_stats"].items():
-        print(f"  {sec:10s}: {s['matched']}/{s['total']} ({s['match_rate'] * 100:.1f}%) | Avg wait: {s['avg_wait_cycles']} cycles")
+        print(
+            f"  {sec:10s}: {s['matched']}/{s['total']} matched ({s['match_rate'] * 100:.1f}%) | "
+            f"Unmatched backlog: {s['unmatched']} | Avg wait: {s['avg_wait_cycles']} cycles"
+        )
 
-    print("\n--- Request Type Fairness (Single vs Multi Party) ---")
+    print("\n--- Request Type Fairness by Party Size ---")
     for ptype, ps in res["party_stats"].items():
-        print(f"  {ptype.capitalize():10s}: {ps['matched']}/{ps['total']} ({ps['match_rate'] * 100:.1f}%) | Avg wait: {ps['avg_wait']} cycles")
+        print(
+            f"  {ptype.capitalize():15s}: {ps['matched']}/{ps['total']} matched "
+            f"({ps['match_rate'] * 100:.1f}%) | Avg wait: {ps['avg_wait']} cycles"
+        )
+
+    print("\n--- Vehicle Capacity Fairness (Sedans vs Vans) ---")
+    for cap_key, cs in res["capacity_stats"].items():
+        print(
+            f"  {cap_key.capitalize():10s}: {cs['utilized_count']}/{cs['fleet_count']} utilized "
+            f"({cs['utilization_rate'] * 100:.1f}%) | Total assignments: {cs['total_assignments']} "
+            f"(mean {cs['mean_assignments']}/veh)"
+        )
 
     print("\n--- Boundary Request Protection ---")
     for btype, bs in res["boundary_stats"].items():
-        print(f"  {btype.capitalize():10s}: {bs['matched']}/{bs['total']} ({bs['match_rate'] * 100:.1f}%)")
+        print(f"  {btype.capitalize():10s}: {bs['matched']}/{bs['total']} matched ({bs['match_rate'] * 100:.1f}%)")
 
     print("\n--- Fleet Utilization Fairness ---")
     fu = res["fleet_utilization"]
@@ -504,7 +570,7 @@ def print_simulation_report(res: dict[str, Any]) -> None:
     fe = res["fairness_evaluation"]
     print(f"  Latency: p50={cl['p50']} ms, p95={cl['p95']} ms, max={cl['max']} ms | All <= 500ms: {cl['sla_passed_all']}")
     print(f"  Fairness Ratio (min/max sector rate): {fe['fairness_ratio']} | Fairness Passed: {fe['fairness_passed']}")
-    print(f"  Starvation Zero Policy (0 requests >= 5 cycles): {fe['starvation_passed']}")
+    print(f"  Starvation Zero Policy (0 matched requests >= 5 cycles): {fe['starvation_passed']}")
 
 
 if __name__ == "__main__":
