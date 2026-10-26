@@ -1523,3 +1523,17 @@ def test_osrm_coalesced_prefetch_matrix_coordinate_ordering_integrity() -> None:
 
     adapter.close()
 
+
+def test_osrm_routing_adapter_default_batch_limits() -> None:
+    """Verifies default batch limits and that explicit constructor overrides are preserved."""
+    adapter = OsrmRoutingAdapter()
+    assert adapter.max_batch_coords == 24
+    assert adapter.max_groups_per_batch == 2
+    assert adapter.coalesce_groups is True
+    adapter.close()
+
+    custom_adapter = OsrmRoutingAdapter(max_batch_coords=48, max_groups_per_batch=4)
+    assert custom_adapter.max_batch_coords == 48
+    assert custom_adapter.max_groups_per_batch == 4
+    custom_adapter.close()
+

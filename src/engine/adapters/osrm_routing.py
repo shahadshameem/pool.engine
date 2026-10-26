@@ -303,8 +303,8 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         coord_precision: int = 6,
         max_workers: int = 12,
         transport: OsrmHttpTransport | None = None,
-        max_batch_coords: int = 64,
-        max_groups_per_batch: int = 8,
+        max_batch_coords: int = 24,
+        max_groups_per_batch: int = 2,
         coalesce_groups: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
