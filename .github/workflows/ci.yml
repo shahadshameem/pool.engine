@@ -83,10 +83,15 @@ jobs:
 
       - name: Validate Systemd service unit syntax
         run: |
-          # 1. Pre-create runtime user so systemd can resolve User=poolengine
+          # 1. Pre-create runtime user so systemd can resolve User=poolengine & Group=poolengine
           id -u poolengine >/dev/null 2>&1 || sudo useradd -r -s /sbin/nologin poolengine
 
-          # 2. Verify service unit using native systemd-analyze exit status.
+          # 2. Link actual uvicorn executable to expected deployment prefix so systemd
+          # can verify the executable target without masking genuine service unit errors
+          sudo mkdir -p /opt/pool-engine/.venv/bin
+          sudo ln -sf "$(which uvicorn)" /opt/pool-engine/.venv/bin/uvicorn
+
+          # 3. Verify service unit using native systemd-analyze exit status.
           # Use --recursive-errors=no when supported to validate pool-engine.service
           # directives without failing on external system units (e.g. postgresql.service).
           if systemd-analyze --help | grep -q -- "--recursive-errors"; then
