@@ -7,7 +7,11 @@ import pytest
 
 from engine.adapters.default_policy import DefaultPolicyProvider
 from engine.adapters.h3_spatial import H3SpatialIndexAdapter
-from engine.adapters.osrm_routing import DefaultOsrmTransport, OsrmRoutingAdapter
+from engine.adapters.osrm_routing import (
+    DefaultOsrmTransport,
+    OsrmHttpTransport,
+    OsrmRoutingAdapter,
+)
 from engine.contracts.routing import Coordinate, RouteLookupError, RouteTimeoutError
 from engine.dispatch import DispatchEngine
 from engine.domain.enums import RequestStatus, SearchStatus
@@ -107,12 +111,32 @@ def test_live_matrix_requests_and_chunking() -> None:
 
 
 def test_live_timeout_handling() -> None:
-    """Verifies that an unrealistically tight timeout triggers RouteTimeoutError."""
-    # 0.0001s (0.1ms) cannot complete over a live network connection
-    adapter = OsrmRoutingAdapter(base_url=LIVE_OSRM_URL, timeout_seconds=0.0001, max_retries=0)
+    """Verifies that an upstream transport timeout triggers RouteTimeoutError."""
+    class TimeoutSimulatingTransport(OsrmHttpTransport):
+        def __init__(self) -> None:
+            self.call_count = 0
 
-    with pytest.raises(RouteTimeoutError):
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            self.call_count += 1
+            raise TimeoutError(f"OSRM request timed out after {timeout}s")
+
+    transport = TimeoutSimulatingTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, timeout_seconds=0.05, max_retries=1)
+
+    with pytest.raises(RouteTimeoutError, match="timed out"):
         adapter.get_direct_leg(C_EMPIRE_STATE, C_NY_LIBRARY)
+
+    # Verifies retry policy: 1 initial attempt + 1 retry = 2 attempts before raising
+    assert transport.call_count == 2
+
+    # Verifies matrix query also converts transport TimeoutError to RouteTimeoutError
+    transport_matrix = TimeoutSimulatingTransport()
+    adapter_matrix = OsrmRoutingAdapter(transport=transport_matrix, timeout_seconds=0.05, max_retries=0)
+
+    with pytest.raises(RouteTimeoutError, match="timed out"):
+        adapter_matrix.get_distance_matrix([C_EMPIRE_STATE], [C_NY_LIBRARY])
+
+    assert transport_matrix.call_count == 1
 
 
 def test_live_dispatch_with_failure_isolation() -> None:
