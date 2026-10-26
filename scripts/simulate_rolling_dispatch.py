@@ -60,6 +60,7 @@ class RollingSimConfig:
     seed: int = 42
     use_osrm: bool = False
     osrm_url: str = "http://localhost:5000"
+    skewed_demand: bool = True  # Realistic uneven spatial distribution
 
 
 @dataclass
@@ -68,6 +69,7 @@ class RequestTracking:
     arrival_cycle: int
     arrival_time: int
     sector: str
+    is_boundary: bool
     matched_cycle: Optional[int] = None
     matched_time: Optional[int] = None
     assigned_vehicle_id: Optional[str] = None
@@ -100,11 +102,26 @@ def generate_sim_request(
     req_id: str,
     arrival_time: int,
     rng: random.Random,
-) -> tuple[RideRequest, str]:
-    sector_name = rng.choice(["Downtown", "Midtown", "Uptown"])
+    skewed_demand: bool = True,
+) -> tuple[RideRequest, str, bool]:
+    # Realistic uneven demand: 50% Midtown, 30% Downtown, 20% Uptown if skewed
+    if skewed_demand:
+        r_val = rng.random()
+        if r_val < 0.50:
+            sector_name = "Midtown"
+        elif r_val < 0.80:
+            sector_name = "Downtown"
+        else:
+            sector_name = "Uptown"
+    else:
+        sector_name = rng.choice(["Downtown", "Midtown", "Uptown"])
+
     center_lat, center_lon = HOTSPOTS[sector_name]
     p_lat = max(40.7000, min(40.7900, rng.gauss(center_lat, 0.006)))
     p_lon = max(-74.0200, min(-73.9000, rng.gauss(center_lon, 0.006)))
+
+    # Boundary check: within 600m (~0.0054 deg) of partition boundaries (40.7350 or 40.7650)
+    is_boundary = (abs(p_lat - 40.7350) <= 0.0054) or (abs(p_lat - 40.7650) <= 0.0054)
 
     d_sector = rng.choice(["Downtown", "Midtown", "Uptown"])
     d_center_lat, d_center_lon = HOTSPOTS[d_sector]
@@ -115,19 +132,28 @@ def generate_sim_request(
     duration = rng.randint(300, 1200)
     distance = int(duration * 11.11)  # ~40 km/h
 
+    # 75% 1-seat single requests, 25% multi-seat parties (2 to 4 seats)
+    r_seats = rng.random()
+    if r_seats < 0.75:
+        seats = 1
+    elif r_seats < 0.92:
+        seats = 2
+    else:
+        seats = 3
+
     req = RideRequest(
         request_id=req_id,
         user_id=f"user-{req_id}",
         pickup_location=GeoCoordinate(latitude=round(p_lat, 6), longitude=round(p_lon, 6)),
         dropoff_location=GeoCoordinate(latitude=round(d_lat, 6), longitude=round(d_lon, 6)),
-        seat_count=1 if rng.random() < 0.8 else 2,
+        seat_count=seats,
         earliest_pickup_time=arrival_time,
         latest_dropoff_time=arrival_time + duration + 900,  # 15 min dropoff window
         direct_distance_meters=distance,
         direct_duration_seconds=duration,
         status=RequestStatus.PENDING,
     )
-    return req, sector_name
+    return req, sector_name, is_boundary
 
 
 def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
@@ -154,7 +180,7 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
         ),
     )
 
-    # 1. Initialize Fleet
+    # 1. Initialize Fleet (80% 4-seat, 20% 6-seat vehicles)
     vehicles: list[Vehicle] = []
     for v_idx in range(cfg.num_vehicles):
         veh_id = f"veh-{v_idx:03d}"
@@ -162,10 +188,11 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
         c_lat, c_lon = HOTSPOTS[sector_name]
         v_lat = max(40.7000, min(40.7900, rng.gauss(c_lat, 0.007)))
         v_lon = max(-74.0200, min(-73.9000, rng.gauss(c_lon, 0.007)))
+        capacity = 4 if v_idx < int(0.80 * cfg.num_vehicles) else 6
         veh = Vehicle(
             vehicle_id=veh_id,
             driver_id=f"drv-{v_idx:03d}",
-            total_seat_capacity=4,
+            total_seat_capacity=capacity,
             current_location=GeoCoordinate(latitude=round(v_lat, 6), longitude=round(v_lon, 6)),
             is_active=True,
         )
@@ -183,13 +210,14 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
     for _ in range(cfg.initial_requests):
         req_id = f"req-{req_seq:04d}"
         req_seq += 1
-        req, sec = generate_sim_request(req_id, cfg.base_time, rng)
+        req, sec, is_b = generate_sim_request(req_id, cfg.base_time, rng, cfg.skewed_demand)
         storage.save_request(req)
         request_tracker[req_id] = RequestTracking(
             request=req,
             arrival_cycle=0,
             arrival_time=cfg.base_time,
             sector=sec,
+            is_boundary=is_b,
         )
 
     sim_time = cfg.base_time
@@ -201,13 +229,14 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             for _ in range(cfg.requests_per_cycle):
                 req_id = f"req-{req_seq:04d}"
                 req_seq += 1
-                req, sec = generate_sim_request(req_id, sim_time, rng)
+                req, sec, is_b = generate_sim_request(req_id, sim_time, rng, cfg.skewed_demand)
                 storage.save_request(req)
                 request_tracker[req_id] = RequestTracking(
                     request=req,
                     arrival_cycle=cycle,
                     arrival_time=sim_time,
                     sector=sec,
+                    is_boundary=is_b,
                 )
 
         # Execute dispatch cycle via orchestrator
@@ -340,17 +369,67 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             "avg_wait_cycles": round(avg_wait, 2),
         }
 
+    # Party size breakdown: single seat vs multi seat
+    single_reqs = [t for t in request_tracker.values() if t.request.seat_count == 1]
+    multi_reqs = [t for t in request_tracker.values() if t.request.seat_count > 1]
+    single_matched = [t for t in single_reqs if t.matched_cycle is not None]
+    multi_matched = [t for t in multi_reqs if t.matched_cycle is not None]
+
+    party_stats = {
+        "single": {
+            "total": len(single_reqs),
+            "matched": len(single_matched),
+            "match_rate": round(len(single_matched) / len(single_reqs), 4) if single_reqs else 0.0,
+            "avg_wait": round(statistics.mean([t.matched_cycle - t.arrival_cycle for t in single_matched if t.matched_cycle is not None]), 2) if single_matched else 0.0,
+        },
+        "multi": {
+            "total": len(multi_reqs),
+            "matched": len(multi_matched),
+            "match_rate": round(len(multi_matched) / len(multi_reqs), 4) if multi_reqs else 0.0,
+            "avg_wait": round(statistics.mean([t.matched_cycle - t.arrival_cycle for t in multi_matched if t.matched_cycle is not None]), 2) if multi_matched else 0.0,
+        },
+    }
+
+    # Boundary request breakdown
+    boundary_reqs = [t for t in request_tracker.values() if t.is_boundary]
+    interior_reqs = [t for t in request_tracker.values() if not t.is_boundary]
+    boundary_matched = [t for t in boundary_reqs if t.matched_cycle is not None]
+    interior_matched = [t for t in interior_reqs if t.matched_cycle is not None]
+
+    boundary_stats = {
+        "boundary": {
+            "total": len(boundary_reqs),
+            "matched": len(boundary_matched),
+            "match_rate": round(len(boundary_matched) / len(boundary_reqs), 4) if boundary_reqs else 0.0,
+        },
+        "interior": {
+            "total": len(interior_reqs),
+            "matched": len(interior_matched),
+            "match_rate": round(len(interior_matched) / len(interior_reqs), 4) if interior_reqs else 0.0,
+        },
+    }
+
     # Vehicle utilization fairness (Gini coefficient / distribution)
     asgn_counts = list(vehicle_assignments_count.values())
     utilized_vehs = sum(1 for c in asgn_counts if c > 0)
     fleet_utilization_rate = utilized_vehs / len(vehicles) if vehicles else 0.0
 
     latencies = [m.cycle_latency_ms for m in cycle_metrics_list]
+    total_vmt_savings_meters = sum(m.vmt_savings_meters for m in cycle_metrics_list)
+
+    # Fairness Criteria Evaluation
+    sec_rates = [s["match_rate"] for s in sector_stats.values() if s["total"] > 0]
+    fairness_ratio = (min(sec_rates) / max(sec_rates)) if sec_rates and max(sec_rates) > 0 else 0.0
+    fairness_passed = fairness_ratio >= 0.40
+    starvation_passed = starved_5_cycles == 0
 
     return {
+        "seed": cfg.seed,
+        "cadence_seconds": cfg.cycle_interval_seconds,
         "total_requests": total_requests,
         "matched_count": len(matched_requests),
         "cumulative_match_rate": round(cumulative_match_rate, 4),
+        "total_vmt_savings_km": round(total_vmt_savings_meters / 1000.0, 2),
         "wait_cycles": {
             "min": min(wait_cycles) if wait_cycles else 0,
             "median": statistics.median(wait_cycles) if wait_cycles else 0,
@@ -360,6 +439,8 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             "starved_ge_5_cycles": starved_5_cycles,
         },
         "sector_stats": sector_stats,
+        "party_stats": party_stats,
+        "boundary_stats": boundary_stats,
         "fleet_utilization": {
             "utilized_vehicles": utilized_vehs,
             "total_vehicles": len(vehicles),
@@ -373,8 +454,57 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             "max": round(max(latencies), 2),
             "sla_passed_all": all(m.sla_passed for m in cycle_metrics_list),
         },
+        "fairness_evaluation": {
+            "fairness_ratio": round(fairness_ratio, 3),
+            "fairness_passed": fairness_passed,
+            "starvation_passed": starvation_passed,
+        },
         "cycle_metrics": cycle_metrics_list,
     }
+
+
+def print_simulation_report(res: dict[str, Any]) -> None:
+    print(f"\n--- Cycle Progression (Seed {res['seed']}, {res['cadence_seconds']}s cadence) ---")
+    for m in res["cycle_metrics"]:
+        print(
+            f"Cycle {m.cycle_idx:02d} (T={m.sim_time}): "
+            f"ActiveReqs: {m.active_requests_count:3d} | "
+            f"NewMatches: {m.new_matches_count:2d} | "
+            f"CumulMatches: {m.cumulative_matches_count:3d} | "
+            f"Latency: {m.cycle_latency_ms:6.2f} ms | "
+            f"VMT Savings: {m.vmt_savings_meters / 1000.0:6.1f} km"
+        )
+
+    print("\n--- Summary Performance & Starvation Criteria ---")
+    print(f"Total Requests: {res['total_requests']}")
+    print(f"Total Matched: {res['matched_count']} ({res['cumulative_match_rate'] * 100:.1f}%) | Total VMT Savings: {res['total_vmt_savings_km']} km")
+    wc = res["wait_cycles"]
+    print(f"Wait Cycles: min={wc['min']}, median={wc['median']}, p95={wc['p95']}, max={wc['max']}")
+    print(f"Starved (>=3 cycles): {wc['starved_ge_3_cycles']}, Starved (>=5 cycles): {wc['starved_ge_5_cycles']}")
+
+    print("\n--- Regional Sector Fairness ---")
+    for sec, s in res["sector_stats"].items():
+        print(f"  {sec:10s}: {s['matched']}/{s['total']} ({s['match_rate'] * 100:.1f}%) | Avg wait: {s['avg_wait_cycles']} cycles")
+
+    print("\n--- Request Type Fairness (Single vs Multi Party) ---")
+    for ptype, ps in res["party_stats"].items():
+        print(f"  {ptype.capitalize():10s}: {ps['matched']}/{ps['total']} ({ps['match_rate'] * 100:.1f}%) | Avg wait: {ps['avg_wait']} cycles")
+
+    print("\n--- Boundary Request Protection ---")
+    for btype, bs in res["boundary_stats"].items():
+        print(f"  {btype.capitalize():10s}: {bs['matched']}/{bs['total']} ({bs['match_rate'] * 100:.1f}%)")
+
+    print("\n--- Fleet Utilization Fairness ---")
+    fu = res["fleet_utilization"]
+    print(f"  Utilized Vehicles: {fu['utilized_vehicles']}/{fu['total_vehicles']} ({fu['utilization_rate'] * 100:.1f}%)")
+    print(f"  Mean assignments/vehicle: {fu['mean_assignments_per_veh']} | Max on single veh: {fu['max_assignments_on_single_veh']}")
+
+    print("\n--- SLA Adherence (<= 500ms) & Fairness Gates ---")
+    cl = res["cycle_latencies_ms"]
+    fe = res["fairness_evaluation"]
+    print(f"  Latency: p50={cl['p50']} ms, p95={cl['p95']} ms, max={cl['max']} ms | All <= 500ms: {cl['sla_passed_all']}")
+    print(f"  Fairness Ratio (min/max sector rate): {fe['fairness_ratio']} | Fairness Passed: {fe['fairness_passed']}")
+    print(f"  Starvation Zero Policy (0 requests >= 5 cycles): {fe['starvation_passed']}")
 
 
 if __name__ == "__main__":
@@ -388,52 +518,26 @@ if __name__ == "__main__":
     parser.add_argument("--vehicles", type=int, default=60)
     parser.add_argument("--osrm", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--all-seeds", action="store_true")
     args = parser.parse_args()
 
-    cfg = RollingSimConfig(
-        num_cycles=args.cycles,
-        cycle_interval_seconds=args.interval,
-        initial_requests=args.initial_requests,
-        requests_per_cycle=args.requests_per_cycle,
-        num_vehicles=args.vehicles,
-        seed=args.seed,
-        use_osrm=args.osrm,
-    )
+    seeds = [42, 123, 999] if args.all_seeds else [args.seed]
 
-    print(f"=== Starting Rolling Dispatch Simulation ===")
-    print(f"Configuration: {cfg.num_cycles} cycles, {cfg.cycle_interval_seconds}s cadence, {cfg.num_vehicles} vehicles")
-    print(f"Initial: {cfg.initial_requests} requests, +{cfg.requests_per_cycle} reqs/cycle")
-    print(f"Router: {'OSRM Live (port 5000)' if cfg.use_osrm else 'Mock In-Memory'}")
-
-    res = run_rolling_simulation(cfg)
-
-    print("\n--- Cycle by Cycle Progression ---")
-    for m in res["cycle_metrics"]:
-        print(
-            f"Cycle {m.cycle_idx:02d} (T={m.sim_time}): "
-            f"ActiveReqs: {m.active_requests_count:3d} | "
-            f"NewMatches: {m.new_matches_count:2d} | "
-            f"CumulMatches: {m.cumulative_matches_count:3d} | "
-            f"Latency: {m.cycle_latency_ms:6.2f} ms | "
-            f"VMT Savings: {m.vmt_savings_meters / 1000.0:6.1f} km"
+    for s in seeds:
+        cfg = RollingSimConfig(
+            num_cycles=args.cycles,
+            cycle_interval_seconds=args.interval,
+            initial_requests=args.initial_requests,
+            requests_per_cycle=args.requests_per_cycle,
+            num_vehicles=args.vehicles,
+            seed=s,
+            use_osrm=args.osrm,
         )
 
-    print("\n--- Summary Performance & Fairness ---")
-    print(f"Total Requests: {res['total_requests']}")
-    print(f"Total Matched: {res['matched_count']} ({res['cumulative_match_rate'] * 100:.1f}%)")
-    wc = res["wait_cycles"]
-    print(f"Wait Cycles: min={wc['min']}, median={wc['median']}, p95={wc['p95']}, max={wc['max']}")
-    print(f"Starved (>=3 cycles): {wc['starved_ge_3_cycles']}, Starved (>=5 cycles): {wc['starved_ge_5_cycles']}")
+        print(f"\n=================================================================")
+        print(f"=== Starting Rolling Dispatch Simulation (Seed {s}, {cfg.cycle_interval_seconds}s cadence) ===")
+        print(f"Configuration: {cfg.num_cycles} cycles, {cfg.num_vehicles} vehicles, router={'OSRM Live' if cfg.use_osrm else 'Mock'}")
+        print(f"=================================================================")
 
-    print("\n--- Regional Sector Fairness ---")
-    for sec, s in res["sector_stats"].items():
-        print(f"  {sec:10s}: {s['matched']}/{s['total']} ({s['match_rate'] * 100:.1f}%) | Avg wait: {s['avg_wait_cycles']} cycles")
-
-    print("\n--- Fleet Utilization Fairness ---")
-    fu = res["fleet_utilization"]
-    print(f"  Utilized Vehicles: {fu['utilized_vehicles']}/{fu['total_vehicles']} ({fu['utilization_rate'] * 100:.1f}%)")
-    print(f"  Mean assignments/vehicle: {fu['mean_assignments_per_veh']} | Max on single veh: {fu['max_assignments_on_single_veh']}")
-
-    print("\n--- SLA Adherence (<= 500ms) ---")
-    cl = res["cycle_latencies_ms"]
-    print(f"  Latency: p50={cl['p50']} ms, p95={cl['p95']} ms, max={cl['max']} ms | All <= 500ms: {cl['sla_passed_all']}")
+        res = run_rolling_simulation(cfg)
+        print_simulation_report(res)
