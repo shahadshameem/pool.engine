@@ -345,6 +345,20 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
         if t.matched_time is not None
     ]
 
+    # All requests wait time distribution (including unmatched waiting at horizon end)
+    all_wait_cycles = [
+        (t.matched_cycle - t.arrival_cycle)
+        if t.matched_cycle is not None
+        else (cfg.num_cycles - t.arrival_cycle)
+        for t in request_tracker.values()
+    ]
+    all_wait_seconds = [
+        (t.matched_time - t.arrival_time)
+        if t.matched_time is not None
+        else (sim_time - t.arrival_time)
+        for t in request_tracker.values()
+    ]
+
     # Starvation index: requests waiting >= 3 cycles, >= 5 cycles
     starved_3_cycles = sum(1 for w in wait_cycles if w >= 3)
     starved_5_cycles = sum(1 for w in wait_cycles if w >= 5)
@@ -352,6 +366,11 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
     # Unmatched starvation metrics
     unmatched_ge_3 = sum(1 for t in unmatched_requests if (cfg.num_cycles - t.arrival_cycle) >= 3)
     unmatched_ge_5 = sum(1 for t in unmatched_requests if (cfg.num_cycles - t.arrival_cycle) >= 5)
+
+    # Infeasible vs feasible unselected classification
+    max_fleet_cap = max(v.total_seat_capacity for v in vehicles) if vehicles else 0
+    infeasible_unmatched = [t for t in unmatched_requests if t.request.seat_count > max_fleet_cap]
+    feasible_unmatched = [t for t in unmatched_requests if t.request.seat_count <= max_fleet_cap]
 
     # Sector fairness breakdown
     sectors = ["Downtown", "Midtown", "Uptown"]
@@ -476,6 +495,29 @@ def run_rolling_simulation(cfg: RollingSimConfig) -> dict[str, Any]:
             "p95": round(sorted(wait_seconds)[int(0.95 * len(wait_seconds))], 1) if wait_seconds else 0.0,
             "max": max(wait_seconds) if wait_seconds else 0,
         },
+        "all_requests_wait_cycles": {
+            "min": min(all_wait_cycles) if all_wait_cycles else 0,
+            "median": statistics.median(all_wait_cycles) if all_wait_cycles else 0,
+            "p95": sorted(all_wait_cycles)[int(0.95 * len(all_wait_cycles))] if all_wait_cycles else 0,
+            "max": max(all_wait_cycles) if all_wait_cycles else 0,
+        },
+        "all_requests_wait_seconds": {
+            "min": min(all_wait_seconds) if all_wait_seconds else 0,
+            "median": round(statistics.median(all_wait_seconds), 1) if all_wait_seconds else 0.0,
+            "p95": round(sorted(all_wait_seconds)[int(0.95 * len(all_wait_seconds))], 1) if all_wait_seconds else 0.0,
+            "max": max(all_wait_seconds) if all_wait_seconds else 0,
+        },
+        "unmatched_breakdown": {
+            "infeasible": len(infeasible_unmatched),
+            "feasible_unselected": len(feasible_unmatched),
+            "feasible_unselected_rate": round(len(feasible_unmatched) / len(unmatched_requests), 4) if unmatched_requests else 0.0,
+        },
+        "latency_vs_backlog": {
+            "initial_latency_ms": cycle_metrics_list[0].cycle_latency_ms if cycle_metrics_list else 0.0,
+            "final_latency_ms": cycle_metrics_list[-1].cycle_latency_ms if cycle_metrics_list else 0.0,
+            "initial_backlog": cycle_metrics_list[0].active_requests_count if cycle_metrics_list else 0,
+            "final_backlog": cycle_metrics_list[-1].active_requests_count if cycle_metrics_list else 0,
+        },
         "sector_stats": sector_stats,
         "party_stats": party_stats,
         "capacity_stats": capacity_stats,
@@ -523,8 +565,17 @@ def print_simulation_report(res: dict[str, Any]) -> None:
     )
     wc = res["wait_cycles"]
     ws = res["wait_seconds"]
+    awc = res["all_requests_wait_cycles"]
+    aws = res["all_requests_wait_seconds"]
+    ub = res["unmatched_breakdown"]
+    lvb = res["latency_vs_backlog"]
+
     print(f"Wait Cycles (Matched): min={wc['min']}, median={wc['median']}, p95={wc['p95']}, max={wc['max']}")
     print(f"Wait Seconds (Matched): min={ws['min']}s, median={ws['median']}s, p95={ws['p95']}s, max={ws['max']}s")
+    print(f"Wait Cycles (ALL, incl backlog): min={awc['min']}, median={awc['median']}, p95={awc['p95']}, max={awc['max']}")
+    print(f"Wait Seconds (ALL, incl backlog): min={aws['min']}s, median={aws['median']}s, p95={aws['p95']}s, max={aws['max']}s")
+    print(f"Unmatched Feasibility: Infeasible (over capacity)={ub['infeasible']} | Feasible but Unselected={ub['feasible_unselected']}")
+    print(f"Latency vs Backlog: Cycle 00 ({lvb['initial_backlog']} backlog) = {lvb['initial_latency_ms']:.2f}ms | Cycle 14 ({lvb['final_backlog']} backlog) = {lvb['final_latency_ms']:.2f}ms")
     print(
         f"Matched Starved (>=3 cycles): {wc['matched_starved_ge_3_cycles']}, "
         f"Matched Starved (>=5 cycles): {wc['matched_starved_ge_5_cycles']}"

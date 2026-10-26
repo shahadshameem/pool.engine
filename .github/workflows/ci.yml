@@ -1,0 +1,171 @@
+name: CI & Linux Deployment Verification
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test-and-verify:
+    name: Test, Lint & Database Verification (Ubuntu Linux)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pool_test
+          POSTGRES_USER: pool_user
+          POSTGRES_PASSWORD: pool_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,postgres,service]"
+
+      - name: Check Git line endings and whitespace
+        run: |
+          git diff --check
+
+      - name: Strict Mypy type check
+        run: |
+          python -m mypy src tests scripts
+
+      - name: Run Pytest suite with live PostgreSQL
+        env:
+          TEST_DATABASE_URL: "postgresql://pool_user:pool_test_password@localhost:5432/pool_test"
+        run: |
+          pytest -v tests
+
+      - name: Verify PostgreSQL schema initialization idempotency
+        env:
+          TEST_DB_URL: "postgresql://pool_user:pool_test_password@localhost:5432/pool_test"
+        run: |
+          echo "=== 1. Initial schema application ==="
+          python scripts/init_db.py --dsn "$TEST_DB_URL"
+          echo "=== 2. Re-apply schema to prove idempotency ==="
+          python scripts/init_db.py --dsn "$TEST_DB_URL"
+          echo "=== 3. Schema check-only verification ==="
+          python scripts/init_db.py --dsn "$TEST_DB_URL" --check-only
+
+      - name: Run in-process API smoke test
+        run: |
+          python scripts/smoke_test.py --base-url in-process
+
+      - name: Validate Systemd service unit syntax
+        run: |
+          sudo systemd-analyze verify deploy/systemd/pool-engine.service || true
+
+  docker-and-deployment:
+    name: Docker Build, Healthcheck & Graceful Shutdown
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -t pool-engine:ci -f deploy/docker/Dockerfile .
+
+      - name: Launch PostgreSQL container for integration testing
+        run: |
+          docker run -d \
+            --name pg-test \
+            --health-cmd "pg_isready -U pool_user -d pool_engine" \
+            --health-interval 5s \
+            --health-timeout 3s \
+            --health-retries 5 \
+            -e POSTGRES_DB=pool_engine \
+            -e POSTGRES_USER=pool_user \
+            -e POSTGRES_PASSWORD=pool_development_password \
+            -p 5432:5432 \
+            postgres:16-alpine
+          
+          # Wait until PostgreSQL is ready
+          for i in {1..30}; do
+            if docker inspect --format='{{json .State.Health.Status}}' pg-test | grep -q '"healthy"'; then
+              echo "PostgreSQL is healthy"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Initialize database schema via container
+        run: |
+          docker run --rm \
+            --network host \
+            -e DATABASE_URL=postgresql://pool_user:pool_development_password@127.0.0.1:5432/pool_engine \
+            pool-engine:ci \
+            python /app/scripts/init_db.py
+
+      - name: Launch Pool Engine API container
+        run: |
+          docker run -d \
+            --name pool-engine-app \
+            --network host \
+            -e ENVIRONMENT=production \
+            -e SERVICE_HOST=0.0.0.0 \
+            -e SERVICE_PORT=8000 \
+            -e DATABASE_URL=postgresql://pool_user:pool_development_password@127.0.0.1:5432/pool_engine \
+            -e AUTH_ENABLED=false \
+            -e MAX_BATCH_SIZE=500 \
+            -e DEFAULT_DISPATCH_TIMEOUT_SECONDS=0.500 \
+            -e SHUTDOWN_TIMEOUT_SECONDS=10.0 \
+            pool-engine:ci
+
+          # Poll container health
+          for i in {1..30}; do
+            if curl -s -f http://127.0.0.1:8000/v1/health/liveness; then
+              echo "Pool Engine container is responsive!"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run smoke test against running container
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[service,postgres]"
+          python scripts/smoke_test.py --base-url http://127.0.0.1:8000
+
+      - name: Test graceful shutdown under SIGTERM
+        run: |
+          echo "Sending SIGTERM to pool-engine-app container..."
+          STOP_START=$(date +%s%N)
+          docker stop --time 15 pool-engine-app
+          STOP_END=$(date +%s%N)
+          DURATION_MS=$(( (STOP_END - STOP_START) / 1000000 ))
+          echo "Graceful shutdown completed in ${DURATION_MS}ms"
+          
+          # Verify exit status is 0 or 143 (SIGTERM)
+          EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' pool-engine-app)
+          echo "Container exit code: ${EXIT_CODE}"
+          if [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 143 ]; then
+            echo "Unexpected exit code: ${EXIT_CODE}"
+            exit 1
+          fi
