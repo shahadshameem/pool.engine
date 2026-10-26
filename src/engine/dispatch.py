@@ -104,6 +104,10 @@ class CandidateGenerationConfig:
     exhaustive_fallback: bool = True
     initial_search_radius_meters: float = 5000.0
     propagate_routing_errors: bool = False
+    spatial_partitioning: bool = True
+    num_partitions: Optional[int] = None
+    max_candidate_vehicles_per_partition: Optional[int] = 13
+    boundary_buffer_meters: float = 600.0
 
     @classmethod
     def exact(
@@ -123,6 +127,9 @@ class CandidateGenerationConfig:
             exhaustive_fallback=False,
             initial_search_radius_meters=0.0,
             propagate_routing_errors=propagate_routing_errors,
+            spatial_partitioning=False,
+            num_partitions=None,
+            max_candidate_vehicles_per_partition=None,
         )
 
     @classmethod
@@ -137,6 +144,10 @@ class CandidateGenerationConfig:
         exhaustive_fallback: bool = True,
         initial_search_radius_meters: float = 5000.0,
         propagate_routing_errors: bool = False,
+        spatial_partitioning: bool = True,
+        num_partitions: Optional[int] = None,
+        max_candidate_vehicles_per_partition: Optional[int] = 13,
+        boundary_buffer_meters: float = 600.0,
     ) -> "CandidateGenerationConfig":
         """Constructs a BOUNDED mode configuration with explicit approximation limits."""
         return cls(
@@ -150,6 +161,10 @@ class CandidateGenerationConfig:
             exhaustive_fallback=exhaustive_fallback,
             initial_search_radius_meters=initial_search_radius_meters,
             propagate_routing_errors=propagate_routing_errors,
+            spatial_partitioning=spatial_partitioning,
+            num_partitions=num_partitions,
+            max_candidate_vehicles_per_partition=max_candidate_vehicles_per_partition,
+            boundary_buffer_meters=boundary_buffer_meters,
         )
 
 
@@ -738,6 +753,26 @@ class DispatchEngine:
                 is_approximated=True,
             )
 
+        # Stage 2: Spatial Partitioning for larger fleets in Bounded Mode
+        if (
+            effective_config.mode != DispatchMode.EXACT
+            and effective_config.spatial_partitioning
+            and len(eligible_vehicles) > 32
+        ):
+            return self._dispatch_partitioned_batch(
+                pending_requests=pending_requests,
+                eligible_vehicles=eligible_vehicles,
+                active_rides=active_rides,
+                current_time=current_time,
+                effective_batch_id=effective_batch_id,
+                effective_deadline=effective_deadline,
+                reserved_headroom=reserved_headroom,
+                effective_config=effective_config,
+                all_req_ids=all_req_ids,
+                start_monotonic=start_monotonic,
+                max_bundle_size=max_bundle_size,
+            )
+
         # Stage 2, 3, 4: Candidate Generation
         # Reserve headroom for set packing solver (headroom + 15ms)
         cand_headroom = reserved_headroom + 0.015
@@ -797,3 +832,245 @@ class DispatchEngine:
         )
 
         return match_result
+
+    def _dispatch_partitioned_batch(
+        self,
+        pending_requests: list[RideRequest],
+        eligible_vehicles: list[Vehicle],
+        active_rides: Sequence[Ride],
+        current_time: int,
+        effective_batch_id: str,
+        effective_deadline: float,
+        reserved_headroom: float,
+        effective_config: CandidateGenerationConfig,
+        all_req_ids: tuple[str, ...],
+        start_monotonic: float,
+        max_bundle_size: Optional[int] = None,
+    ) -> MatchResult:
+        """
+        Executes a spatially partitioned dispatch cycle for regional fleets:
+        1. Partitions requests and vehicles into K regional sectors along the principal spatial axis.
+        2. Assigns vehicles strictly to their home sector (disjoint vehicle ownership).
+        3. Buffers boundary requests within boundary_buffer_meters to adjacent sectors.
+        4. Launches unified concurrent matrix prefetch across all sector waypoint groups.
+        5. Evaluates candidate insertions and group bundles per sector.
+        6. Resolves conflicts globally via unified set-packing regret-K solver, guaranteeing zero
+           duplicate assignments, zero double-booked seats, and atomic commit semantics.
+        """
+        n_veh = len(eligible_vehicles)
+        if effective_config.num_partitions is not None:
+            num_partitions = effective_config.num_partitions
+        elif n_veh <= 60:
+            num_partitions = 2
+        else:
+            num_partitions = 3
+
+        cand_veh_limit = effective_config.max_candidate_vehicles_per_partition or 13
+        buffer_m = effective_config.boundary_buffer_meters
+        buffer_deg = buffer_m / 111000.0
+
+        # Sort pending request latitudes to determine partition quantile boundaries
+        latitudes = sorted(r.pickup_location.latitude for r in pending_requests)
+        n_lat = len(latitudes)
+        split_lats = [
+            latitudes[int(i * n_lat / num_partitions)]
+            for i in range(1, num_partitions)
+        ]
+
+        def get_home_sector(lat: float) -> int:
+            for s_idx, split_lat in enumerate(split_lats):
+                if lat < split_lat:
+                    return s_idx
+            return len(split_lats)
+
+        # Vehicle assignment: strictly disjoint home sector ownership
+        vehs_by_sector: list[list[Vehicle]] = [[] for _ in range(num_partitions)]
+        for v in eligible_vehicles:
+            vehs_by_sector[get_home_sector(v.current_location.latitude)].append(v)
+
+        # Request assignment: home sector + adjacent sectors if within boundary buffer
+        reqs_by_sector: list[list[RideRequest]] = [[] for _ in range(num_partitions)]
+        for r in pending_requests:
+            p_lat = r.pickup_location.latitude
+            home_sec = get_home_sector(p_lat)
+            reqs_by_sector[home_sec].append(r)
+
+            if home_sec > 0 and abs(p_lat - split_lats[home_sec - 1]) <= buffer_deg:
+                reqs_by_sector[home_sec - 1].append(r)
+            if home_sec < num_partitions - 1 and abs(p_lat - split_lats[home_sec]) <= buffer_deg:
+                reqs_by_sector[home_sec + 1].append(r)
+
+        rides_by_veh = {r.vehicle_id: r for r in active_rides}
+        policy = self.policy_provider.get_policy()
+
+        # Build candidate evaluation plans across all sectors
+        all_eval_plans: list[tuple[Vehicle, Ride | None, list[RideRequest], list[Coordinate]]] = []
+        all_waypoint_groups: list[list[Coordinate]] = []
+
+        max_single_cap = (
+            min(4, effective_config.max_single_requests_per_vehicle)
+            if effective_config.max_single_requests_per_vehicle is not None
+            else 4
+        )
+
+        for sec in range(num_partitions):
+            sec_reqs = reqs_by_sector[sec]
+            sec_vehs = vehs_by_sector[sec]
+            if not sec_reqs or not sec_vehs:
+                continue
+
+            # Query nearby vehicles within this sector
+            coord = SpatialIndexCoordinator(self.spatial_index)
+            coord.index_entities([
+                (v.vehicle_id, Coordinate(v.current_location.latitude, v.current_location.longitude))
+                for v in sec_vehs
+            ])
+
+            nearby: dict[str, list[tuple[float, RideRequest]]] = {v.vehicle_id: [] for v in sec_vehs}
+            for r in sec_reqs:
+                cands = coord.find_candidates_within_radius(
+                    Coordinate(r.pickup_location.latitude, r.pickup_location.longitude),
+                    effective_config.max_search_radius_meters or 5000.0,
+                    1,
+                    effective_config.max_vehicles_per_request or 8,
+                )
+                for c in cands:
+                    nearby[c.entity_id].append((c.haversine_distance_meters, r))
+
+            cand_vehs = [
+                (min(d for d, _ in req_list), v, req_list)
+                for v in sec_vehs
+                if (req_list := nearby.get(v.vehicle_id))
+            ]
+            cand_vehs.sort(key=operator.itemgetter(0))
+            cand_vehs = cand_vehs[:cand_veh_limit]
+
+            for _, veh, nearby_reqs in cand_vehs:
+                active_ride = rides_by_veh.get(veh.vehicle_id)
+                sorted_reqs = [r for _, r in sorted(nearby_reqs, key=operator.itemgetter(0))]
+                eval_reqs = sorted_reqs[:max_single_cap]
+                if not eval_reqs:
+                    continue
+
+                v_wps = [Coordinate(veh.current_location.latitude, veh.current_location.longitude)]
+                if active_ride is not None:
+                    v_wps.extend([
+                        Coordinate(s.location.latitude, s.location.longitude)
+                        for s in active_ride.stops
+                        if s.status in (StopStatus.SCHEDULED, StopStatus.ARRIVED, StopStatus.IN_GRACE_PERIOD)
+                    ])
+                for r in eval_reqs:
+                    v_wps.append(Coordinate(r.pickup_location.latitude, r.pickup_location.longitude))
+                    v_wps.append(Coordinate(r.dropoff_location.latitude, r.dropoff_location.longitude))
+
+                all_eval_plans.append((veh, active_ride, eval_reqs, v_wps))
+                all_waypoint_groups.append(v_wps)
+
+        # Launch unified concurrent prefetch across all sector groups
+        prefetch_handle = self.routing_provider.start_prefetch_matrices(
+            groups=all_waypoint_groups,
+            deadline=effective_deadline,
+            reserved_headroom=reserved_headroom,
+        )
+
+        all_candidates: list[CandidateAssignment] = []
+        search_status = SearchStatus.APPROXIMATED
+        is_approximated = True
+        shared_leg_cache: dict[tuple[str, str], tuple[int, int] | None] = {}
+        shared_routing_errors: list[RoutingProviderError] = []
+
+        try:
+            for idx, (veh, active_ride, eval_reqs, v_wps) in enumerate(all_eval_plans):
+                if time.monotonic() > effective_deadline - reserved_headroom:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    break
+
+                if prefetch_handle is not None:
+                    rem_budget = max(0.001, (effective_deadline - reserved_headroom) - time.monotonic())
+                    try:
+                        prefetch_handle.wait_group(idx, timeout=rem_budget)
+                    except TimeoutError:
+                        search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                        break
+                    except Exception:
+                        pass
+
+                if time.monotonic() > effective_deadline - reserved_headroom:
+                    search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    break
+
+                effective_bundle_size = (
+                    max_bundle_size
+                    if max_bundle_size is not None
+                    else effective_config.max_bundle_size
+                )
+                max_bundle_reqs = effective_config.max_requests_per_vehicle
+
+                if active_ride is not None:
+                    ins_cands = generate_active_ride_insertions(
+                        active_ride=active_ride,
+                        requests=eval_reqs,
+                        vehicle=veh,
+                        router=self.routing_provider,
+                        policy=policy,
+                        current_time=current_time,
+                        max_bundle_size=effective_bundle_size,
+                        deadline=effective_deadline,
+                        reserved_headroom=reserved_headroom,
+                        max_bundle_requests=max_bundle_reqs,
+                        shared_leg_cache=shared_leg_cache,
+                        shared_routing_errors=shared_routing_errors,
+                        propagate_routing_errors=effective_config.propagate_routing_errors,
+                    )
+                    all_candidates.extend(ins_cands)
+                else:
+                    bundle_cands = generate_group_bundles(
+                        requests=eval_reqs,
+                        vehicle=veh,
+                        router=self.routing_provider,
+                        policy=policy,
+                        current_time=current_time,
+                        max_bundle_size=effective_bundle_size,
+                        deadline=effective_deadline,
+                        reserved_headroom=reserved_headroom,
+                        max_bundle_requests=max_bundle_reqs,
+                        shared_leg_cache=shared_leg_cache,
+                        shared_routing_errors=shared_routing_errors,
+                        propagate_routing_errors=effective_config.propagate_routing_errors,
+                    )
+                    all_candidates.extend(bundle_cands)
+        finally:
+            if prefetch_handle is not None:
+                prefetch_handle.cancel()
+
+        # Global Set-Packing Conflict Resolution across all partition candidates
+        solver_reserved_headroom = min(reserved_headroom, 0.025)
+        solver_result = solve_set_packing_regret_k(
+            candidates=all_candidates,
+            all_request_ids=all_req_ids,
+            deadline=effective_deadline,
+            reserved_headroom=solver_reserved_headroom,
+        )
+
+        solve_duration_ms = (time.monotonic() - start_monotonic) * 1000.0
+
+        if solver_result.search_status == SearchStatus.INCOMPLETE_DEADLINE_EXPIRED:
+            search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+        elif time.monotonic() >= effective_deadline:
+            search_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+        elif shared_routing_errors and effective_config.mode == DispatchMode.EXACT:
+            search_status = SearchStatus.INCOMPLETE_ROUTING_ERROR
+
+        return MatchResult(
+            match_id=f"match-{uuid.uuid4()}",
+            batch_id=effective_batch_id,
+            solver_timestamp=current_time,
+            selected_assignments=solver_result.selected_assignments,
+            unassigned_request_ids=solver_result.unassigned_request_ids,
+            total_vmt_savings_meters=solver_result.total_vmt_savings_meters,
+            solve_duration_ms=round(solve_duration_ms, 2),
+            dispatch_mode=effective_config.mode,
+            search_status=search_status,
+            is_approximated=is_approximated,
+            routing_errors_count=len(shared_routing_errors),
+        )

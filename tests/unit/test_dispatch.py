@@ -502,3 +502,125 @@ def test_exact_mode_preserves_untruncated_candidate_vehicles() -> None:
     assert cfg.max_vehicles_per_request is None
     assert cfg.max_requests_per_vehicle is None
     assert cfg.max_search_radius_meters is None
+    assert cfg.spatial_partitioning is False
+
+
+def test_partitioned_dispatch_boundary_request_assigned_once() -> None:
+    """Verifies that a boundary request near partition borders is matched at most once without double-booking."""
+    from engine.dispatch import CandidateGenerationConfig
+
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=MockRoutingProvider(),
+        spatial_index=H3SpatialIndexAdapter(),
+        config=CandidateGenerationConfig.bounded(
+            spatial_partitioning=True,
+            num_partitions=2,
+            max_candidate_vehicles_per_partition=20,
+            boundary_buffer_meters=1000.0,
+        ),
+    )
+
+    # 40 vehicles spread across two sectors (lat 40.71 to 40.75)
+    vehs = [
+        _make_sample_vehicle(f"veh-sec0-{i}", 40.7200 + i * 0.0005, -74.0050)
+        for i in range(20)
+    ] + [
+        _make_sample_vehicle(f"veh-sec1-{i}", 40.7400 + i * 0.0005, -74.0050)
+        for i in range(20)
+    ]
+
+    # Requests: some in sec0, some in sec1, and one right on the boundary (~40.7300)
+    req_boundary = _make_sample_request("req-boundary", 40.7300, -74.0050, 40.7350, -74.0050)
+    req_sec0 = _make_sample_request("req-sec0", 40.7210, -74.0050, 40.7250, -74.0050)
+    req_sec1 = _make_sample_request("req-sec1", 40.7410, -74.0050, 40.7450, -74.0050)
+
+    res = engine.dispatch_batch(
+        requests=[req_boundary, req_sec0, req_sec1],
+        vehicles=vehs,
+        active_rides=[],
+        current_time=1000,
+        batch_id="batch-boundary-test",
+    )
+
+    # Verify no vehicle is assigned twice
+    assigned_vehs = [a.vehicle_id for a in res.selected_assignments]
+    assert len(assigned_vehs) == len(set(assigned_vehs))
+
+    # Verify each request is assigned at most once
+    matched_req_ids = [rid for a in res.selected_assignments for rid in a.request_ids]
+    assert len(matched_req_ids) == len(set(matched_req_ids))
+    assert "req-boundary" in matched_req_ids
+
+
+def test_partitioned_dispatch_starvation_prevention() -> None:
+    """Verifies that partitioned dispatch prevents regional starvation across multi-sector fleets."""
+    from engine.dispatch import CandidateGenerationConfig
+
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=MockRoutingProvider(),
+        spatial_index=H3SpatialIndexAdapter(),
+        config=CandidateGenerationConfig.bounded(
+            spatial_partitioning=True,
+            num_partitions=3,
+            max_candidate_vehicles_per_partition=10,
+        ),
+    )
+
+    # 45 vehicles: 15 in South (40.71), 15 in Mid (40.75), 15 in North (40.78)
+    vehs = [
+        _make_sample_vehicle(f"veh-south-{i}", 40.7100 + i * 0.0002, -74.0050) for i in range(15)
+    ] + [
+        _make_sample_vehicle(f"veh-mid-{i}", 40.7500 + i * 0.0002, -74.0050) for i in range(15)
+    ] + [
+        _make_sample_vehicle(f"veh-north-{i}", 40.7800 + i * 0.0002, -74.0050) for i in range(15)
+    ]
+
+    # Requests in all 3 regions
+    req_south = _make_sample_request("req-s", 40.7110, -74.0050, 40.7150, -74.0050)
+    req_mid = _make_sample_request("req-m", 40.7510, -74.0050, 40.7550, -74.0050)
+    req_north = _make_sample_request("req-n", 40.7810, -74.0050, 40.7850, -74.0050)
+
+    res = engine.dispatch_batch(
+        requests=[req_south, req_mid, req_north],
+        vehicles=vehs,
+        active_rides=[],
+        current_time=1000,
+    )
+
+    matched_ids = {rid for a in res.selected_assignments for rid in a.request_ids}
+    # All 3 regions must have their requests served without starvation
+    assert "req-s" in matched_ids
+    assert "req-m" in matched_ids
+    assert "req-n" in matched_ids
+
+
+def test_partitioned_dispatch_handles_empty_sectors() -> None:
+    """Verifies that sectors with 0 requests or vehicles do not raise exceptions."""
+    from engine.dispatch import CandidateGenerationConfig
+
+    engine = DispatchEngine(
+        policy_provider=DefaultPolicyProvider(),
+        routing_provider=MockRoutingProvider(),
+        spatial_index=H3SpatialIndexAdapter(),
+        config=CandidateGenerationConfig.bounded(
+            spatial_partitioning=True,
+            num_partitions=3,
+        ),
+    )
+
+    # 35 vehicles all clustered in south
+    vehs = [_make_sample_vehicle(f"veh-{i}", 40.7100 + i * 0.0001, -74.0050) for i in range(35)]
+    # Request in south
+    req = _make_sample_request("req-1", 40.7105, -74.0050, 40.7200, -74.0050)
+
+    res = engine.dispatch_batch(
+        requests=[req],
+        vehicles=vehs,
+        active_rides=[],
+        current_time=1000,
+    )
+
+    assert len(res.selected_assignments) == 1
+    assert res.selected_assignments[0].request_ids == ("req-1",)
