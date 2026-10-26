@@ -1097,3 +1097,429 @@ def test_osrm_prefetch_deadline_in_past_returns_none() -> None:
     assert handle is None
     adapter.close()
 
+
+def test_osrm_singleflight_concurrent_direct_leg_deduplication() -> None:
+    """Verifies that concurrent requests for the same uncached direct leg trigger exactly 1 HTTP call."""
+    import concurrent.futures
+    import threading
+    import time
+
+    class DelayTransport(OsrmHttpTransport):
+        def __init__(self, delay: float = 0.05) -> None:
+            self.delay = delay
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            with self._lock:
+                self.calls += 1
+            time.sleep(self.delay)
+            return 200, b'{"code": "Ok", "distances": [[2500.0]], "durations": [[320.0]]}'
+
+    transport = DelayTransport(delay=0.05)
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=10)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    def worker() -> tuple[int, int]:
+        return adapter.get_direct_leg(c1, c2)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futs = [ex.submit(worker) for _ in range(10)]
+        results = [f.result(timeout=2.0) for f in futs]
+
+    # All 10 callers should have received identical verified legs
+    assert all(r == (2500, 320) for r in results)
+    # Exactly 1 HTTP call should have been made to transport
+    assert transport.calls == 1
+    # Cache should be populated
+    hit, val = adapter.cache.lookup(adapter._cache_key(c1, c2))
+    assert hit is True
+    assert val == (2500, 320)
+    # In-flight dictionary should be clean
+    assert len(adapter._in_flight_legs) == 0
+
+    adapter.close()
+
+
+def test_osrm_singleflight_error_propagation_and_cleanup() -> None:
+    """Verifies that upstream errors/timeouts in singleflight leader propagate to all waiting followers."""
+    import concurrent.futures
+    import threading
+    import time
+
+    class FailingDelayTransport(OsrmHttpTransport):
+        def __init__(self) -> None:
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            with self._lock:
+                self.calls += 1
+            time.sleep(0.05)
+            return 500, b'{"code": "InternalError", "message": "Backend failure"}'
+
+    transport = FailingDelayTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=5, max_retries=0)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    def worker() -> Exception | None:
+        try:
+            adapter.get_direct_leg(c1, c2)
+            return None
+        except Exception as e:
+            return e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(worker) for _ in range(5)]
+        errors = [f.result(timeout=2.0) for f in futs]
+
+    assert len(errors) == 5
+    assert all(isinstance(e, RouteLookupError) for e in errors)
+    # Verify that no two threads share the same exception instance (prevents traceback mutation)
+    assert len({id(e) for e in errors}) == 5
+    assert transport.calls == 1
+    assert len(adapter._in_flight_legs) == 0
+
+    adapter.close()
+
+
+def test_osrm_singleflight_error_propagation_route_timeout() -> None:
+    """Verifies that RouteTimeoutError from leader clones distinct instances to all followers."""
+    import concurrent.futures
+    import threading
+    import time
+
+    class TimeoutTransport(OsrmHttpTransport):
+        def __init__(self) -> None:
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            with self._lock:
+                self.calls += 1
+            time.sleep(0.05)
+            raise RouteTimeoutError("OSRM socket timed out after 500ms")
+
+    transport = TimeoutTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=5, max_retries=0)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    def worker() -> Exception | None:
+        try:
+            adapter.get_direct_leg(c1, c2)
+            return None
+        except Exception as e:
+            return e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(worker) for _ in range(5)]
+        errors = [f.result(timeout=2.0) for f in futs]
+
+    assert len(errors) == 5
+    assert all(isinstance(e, RouteTimeoutError) for e in errors)
+    assert all("OSRM socket timed out" in str(e) for e in errors)
+    # Distinct instances across all threads
+    assert len({id(e) for e in errors}) == 5
+    assert transport.calls == 1
+    assert len(adapter._in_flight_legs) == 0
+
+    adapter.close()
+
+
+def test_osrm_singleflight_error_propagation_invalid_data() -> None:
+    """Verifies that InvalidRouteDataError from leader clones distinct instances to all followers."""
+    import concurrent.futures
+    import threading
+    import time
+
+    class MalformedTransport(OsrmHttpTransport):
+        def __init__(self) -> None:
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            with self._lock:
+                self.calls += 1
+            time.sleep(0.05)
+            return 200, b'{"code": "Ok", "distances": []}'
+
+    transport = MalformedTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=5, max_retries=0)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    def worker() -> Exception | None:
+        try:
+            adapter.get_direct_leg(c1, c2)
+            return None
+        except Exception as e:
+            return e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(worker) for _ in range(5)]
+        errors = [f.result(timeout=2.0) for f in futs]
+
+    assert len(errors) == 5
+    assert all(isinstance(e, InvalidRouteDataError) for e in errors)
+    assert len({id(e) for e in errors}) == 5
+    assert transport.calls == 1
+    assert len(adapter._in_flight_legs) == 0
+
+    adapter.close()
+
+
+def test_osrm_singleflight_close_releases_waiting_followers() -> None:
+    """Verifies that closing the adapter releases all waiting follower threads immediately with distinct errors."""
+    import concurrent.futures
+    import threading
+    import time
+
+    started_event = threading.Event()
+    continue_event = threading.Event()
+
+    class BlockingTransport(OsrmHttpTransport):
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            started_event.set()
+            continue_event.wait(timeout=2.0)
+            return 200, b'{"code": "Ok", "distances": [[1000.0]], "durations": [[100.0]]}'
+
+    transport = BlockingTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=6, timeout_seconds=2.0)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    def worker() -> Exception | None:
+        try:
+            adapter.get_direct_leg(c1, c2)
+            return None
+        except Exception as e:
+            return e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        # Leader thread starts and enters transport.get()
+        futs = [ex.submit(worker) for _ in range(5)]
+        assert started_event.wait(timeout=1.0) is True
+        # Give followers a moment to register and wait on the leader's event
+        time.sleep(0.05)
+        # Close adapter while in flight
+        adapter.close()
+        continue_event.set()
+
+        errors = [f.result(timeout=2.0) for f in futs]
+
+    assert len(errors) == 5
+    followers_closed = [e for e in errors if isinstance(e, RouteLookupError) and "closed" in str(e)]
+    assert len(followers_closed) >= 4
+    assert len({id(e) for e in followers_closed}) == len(followers_closed)
+
+
+def test_osrm_singleflight_follower_timeout_unblocks_cleanly() -> None:
+    """Verifies that a follower whose timeout expires unblocks with RouteTimeoutError without hanging."""
+    import concurrent.futures
+    import threading
+    import time
+
+    leader_started = threading.Event()
+    leader_can_finish = threading.Event()
+
+    class SlowTransport(OsrmHttpTransport):
+        def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+            leader_started.set()
+            leader_can_finish.wait(timeout=2.0)
+            return 200, b'{"code": "Ok", "distances": [[1000.0]], "durations": [[100.0]]}'
+
+    transport = SlowTransport()
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=2, timeout_seconds=0.08)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        # Start leader
+        f_leader = ex.submit(adapter.get_direct_leg, c1, c2)
+        assert leader_started.wait(timeout=1.0) is True
+
+        # Start follower while leader is still blocked
+        f_follower = ex.submit(adapter.get_direct_leg, c1, c2)
+
+        # Follower should time out quickly (around 0.08s) while leader is still blocked
+        t0 = time.monotonic()
+        with pytest.raises(RouteTimeoutError, match="timed out"):
+            f_follower.result(timeout=1.0)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5
+
+        # Release leader
+        leader_can_finish.set()
+        res_leader = f_leader.result(timeout=1.0)
+        assert res_leader == (1000, 100)
+
+    # In-flight cleanup verified
+    assert len(adapter._in_flight_legs) == 0
+    adapter.close()
+
+
+def test_osrm_start_prefetch_matrices_coalescing_and_subset_reuse() -> None:
+    """Verifies that multi-waypoint candidate groups coalesce into batched queries and reuse subsets."""
+    transport = FakeOsrmTransport()
+
+    c0 = Coordinate(latitude=40.70, longitude=-74.00)  # vehicle
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)  # req1 pickup
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)  # req1 dropoff
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)  # req2 pickup
+    c4 = Coordinate(latitude=40.74, longitude=-74.04)  # req2 dropoff
+    c5 = Coordinate(latitude=40.75, longitude=-74.05)  # req3 pickup
+
+    # Group 0 has 4 coordinates: c0, c1, c2, c3
+    group_0 = [c0, c1, c2, c3]
+    # Group 1 has 3 coordinates that are a strict subset: c1, c2, c3
+    group_1 = [c1, c2, c3]
+    # Group 2 overlaps on c2, c3 and adds c4, c5: [c2, c3, c4, c5]
+    group_2 = [c2, c3, c4, c5]
+
+    all_unique = [c0, c1, c2, c3, c4, c5]
+    n = len(all_unique)
+    dummy_dist = [[float((i + 1) * 1000 + (j + 1) * 100) if i != j else 0.0 for j in range(n)] for i in range(n)]
+    dummy_dur = [[float((i + 1) * 100 + (j + 1) * 10) if i != j else 0.0 for j in range(n)] for i in range(n)]
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {
+            "code": "Ok",
+            "distances": dummy_dist,
+            "durations": dummy_dur,
+        },
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=4, max_batch_coords=64)
+    handle = adapter.start_prefetch_matrices(groups=[group_0, group_1, group_2])
+    assert isinstance(handle, OsrmPrefetchHandle)
+
+    # Wait for all groups
+    assert handle.wait_group(0, timeout=1.0) is True
+    assert handle.wait_group(1, timeout=1.0) is True
+    assert handle.wait_group(2, timeout=1.0) is True
+
+    # Coalesced all 3 groups into 1 single HTTP request because group 1 is a subset
+    # and group 2 fit within max_batch_coords!
+    assert len(transport.call_history) == 1
+
+    # Verify legs from group 0, group 1, and group 2 are in cache
+    d01, t01 = adapter.get_direct_leg(c0, c1)
+    assert d01 > 0 and t01 > 0
+    d12, t12 = adapter.get_direct_leg(c1, c2)
+    assert d12 > 0 and t12 > 0
+    d45, t45 = adapter.get_direct_leg(c4, c5)
+    assert d45 > 0 and t45 > 0
+
+    # No additional HTTP requests were made for get_direct_leg!
+    assert len(transport.call_history) == 1
+
+    adapter.close()
+
+
+def test_osrm_coalesced_prefetch_partial_and_missing_routes() -> None:
+    """Verifies that coalesced prefetch stores negative cache entries for unroutable pairs without throwing."""
+    transport = FakeOsrmTransport()
+
+    c0 = Coordinate(latitude=40.70, longitude=-74.00)
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)
+
+    # c0 -> c3 is unroutable (None)
+    dist = [
+        [0.0, 1000.0, 1500.0, None],
+        [1000.0, 0.0, 1200.0, 1800.0],
+        [1500.0, 1200.0, 0.0, 1100.0],
+        [None, 1800.0, 1100.0, 0.0],
+    ]
+    dur = [
+        [0.0, 100.0, 150.0, None],
+        [100.0, 0.0, 120.0, 180.0],
+        [150.0, 120.0, 0.0, 110.0],
+        [None, 180.0, 110.0, 0.0],
+    ]
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {"code": "Ok", "distances": dist, "durations": dur},
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=2)
+    handle = adapter.start_prefetch_matrices(groups=[[c0, c1, c2, c3]])
+    assert handle is not None
+    assert handle.wait_group(0, timeout=1.0) is True
+
+    # Valid route is cached
+    d, t = adapter.get_direct_leg(c0, c1)
+    assert d == 1000 and t == 100
+
+    # Unroutable pair is negatively cached and raises RouteLookupError on direct leg query
+    with pytest.raises(RouteLookupError, match="could not resolve route"):
+        adapter.get_direct_leg(c0, c3)
+
+    adapter.close()
+
+
+def test_osrm_coalesced_prefetch_matrix_coordinate_ordering_integrity() -> None:
+    """Verifies that coalescing maintains exact coordinate mapping regardless of group input order."""
+    transport = FakeOsrmTransport()
+
+    c1 = Coordinate(latitude=40.71, longitude=-74.01)
+    c2 = Coordinate(latitude=40.72, longitude=-74.02)
+    c3 = Coordinate(latitude=40.73, longitude=-74.03)
+    c4 = Coordinate(latitude=40.74, longitude=-74.04)
+
+    # Group X: [c4, c1, c3]
+    # Group Y: [c3, c2, c4]
+    # Coalesced order: c4, c1, c3, c2
+    # Matrix coordinates: 0: c4, 1: c1, 2: c3, 3: c2
+    coords = [c4, c1, c3, c2]
+    dist_map = {
+        (c4, c1): (4100, 410),
+        (c1, c3): (1300, 130),
+        (c3, c2): (3200, 320),
+        (c2, c4): (2400, 240),
+        (c3, c4): (3400, 340),
+    }
+
+    dummy_dist = [[0.0] * 4 for _ in range(4)]
+    dummy_dur = [[0.0] * 4 for _ in range(4)]
+    for i, ci in enumerate(coords):
+        for j, cj in enumerate(coords):
+            if i == j:
+                continue
+            pair = (ci, cj)
+            if pair in dist_map:
+                dummy_dist[i][j] = float(dist_map[pair][0])
+                dummy_dur[i][j] = float(dist_map[pair][1])
+            else:
+                dummy_dist[i][j] = float(abs(i - j) * 1000)
+                dummy_dur[i][j] = float(abs(i - j) * 100)
+
+    transport.set_response(
+        "/table/v1/driving/",
+        200,
+        {"code": "Ok", "distances": dummy_dist, "durations": dummy_dur},
+    )
+
+    adapter = OsrmRoutingAdapter(transport=transport, max_workers=2)
+    handle = adapter.start_prefetch_matrices(groups=[[c4, c1, c3], [c3, c2, c4]])
+    assert handle is not None
+    assert handle.wait_group(0, timeout=1.0) is True
+    assert handle.wait_group(1, timeout=1.0) is True
+
+    # Verify exact legs match the specific coordinates irrespective of permutation
+    assert adapter.get_direct_leg(c4, c1) == (4100, 410)
+    assert adapter.get_direct_leg(c1, c3) == (1300, 130)
+    assert adapter.get_direct_leg(c3, c2) == (3200, 320)
+    assert adapter.get_direct_leg(c2, c4) == (2400, 240)
+    assert adapter.get_direct_leg(c3, c4) == (3400, 340)
+
+    adapter.close()
+

@@ -169,13 +169,18 @@ class LruLegCache:
         self.hits = 0
         self.misses = 0
 
-    def lookup(self, key: tuple[float, float, float, float]) -> tuple[bool, tuple[int, int] | None]:
+    def lookup(
+        self,
+        key: tuple[float, float, float, float],
+        count_miss: bool = True,
+    ) -> tuple[bool, tuple[int, int] | None]:
         with self._lock:
             if key in self._data:
                 self._data.move_to_end(key)
                 self.hits += 1
                 return True, self._data[key]
-            self.misses += 1
+            if count_miss:
+                self.misses += 1
             return False, None
 
     def get(self, key: tuple[float, float, float, float]) -> tuple[int, int] | None:
@@ -255,6 +260,31 @@ class OsrmPrefetchHandle(RoutingPrefetchHandle):
                 fut.cancel()
 
 
+def _clone_exception(exc: Exception) -> Exception:
+    """
+    Creates a new, unraised instance of the same exception type with matching args and cause.
+    Prevents concurrent follower threads in singleflight from sharing and concurrently
+    re-raising the exact same exception instance, which corrupts __traceback__.
+    """
+    cls = type(exc)
+    clone: Exception
+    try:
+        if exc.args:
+            clone = cls(*exc.args)
+        else:
+            clone = cls()
+    except Exception:
+        try:
+            clone = cls(str(exc))
+        except Exception:
+            clone = RouteLookupError(f"In-flight routing request failed: {exc}")
+
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and isinstance(cause, BaseException):
+        clone.__cause__ = cause
+    return clone
+
+
 class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
     """
     High-performance, provider-independent routing adapter backed by OSRM.
@@ -273,6 +303,9 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         coord_precision: int = 6,
         max_workers: int = 12,
         transport: OsrmHttpTransport | None = None,
+        max_batch_coords: int = 64,
+        max_groups_per_batch: int = 8,
+        coalesce_groups: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.profile = profile
@@ -281,6 +314,9 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         self.max_table_size = max(2, max_table_size)
         self.coord_precision = coord_precision
         self.max_workers = max(1, max_workers)
+        self.max_batch_coords = max(2, max_batch_coords)
+        self.max_groups_per_batch = max(1, max_groups_per_batch)
+        self.coalesce_groups = coalesce_groups
         self._cache = LruLegCache(maxsize=cache_maxsize)
         self.transport = (
             transport
@@ -289,6 +325,11 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         )
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._executor_lock = threading.Lock()
+        self._in_flight_lock = threading.Lock()
+        self._in_flight_legs: dict[
+            tuple[float, float, float, float],
+            tuple[threading.Event, list[Any]],
+        ] = {}
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         with self._executor_lock:
@@ -300,11 +341,16 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
             return self._executor
 
     def close(self) -> None:
-        """Closes thread pool and transport connections."""
+        """Closes thread pool, in-flight waiters, and transport connections."""
         with self._executor_lock:
             if self._executor is not None:
                 self._executor.shutdown(wait=False, cancel_futures=True)
                 self._executor = None
+        with self._in_flight_lock:
+            for ev, box in self._in_flight_legs.values():
+                box[1] = RouteLookupError("Routing adapter closed")
+                ev.set()
+            self._in_flight_legs.clear()
         self.transport.close()
 
     def __enter__(self) -> "OsrmRoutingAdapter":
@@ -432,48 +478,109 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                 f"to ({destination.latitude}, {destination.longitude}) [cached failure]"
             )
 
-        # Query OSRM Table service for single pair
-        orig_str = f"{origin.longitude:.{self.coord_precision}f},{origin.latitude:.{self.coord_precision}f}"
-        dest_str = f"{destination.longitude:.{self.coord_precision}f},{destination.latitude:.{self.coord_precision}f}"
-        path = (
-            f"/table/v1/{self.profile}/{orig_str};{dest_str}"
-            f"?sources=0&destinations=1&annotations=duration,distance"
-        )
+        # Singleflight leader/follower coordination
+        with self._in_flight_lock:
+            # Double-check cache under lock without inflating cache misses
+            found, cached = self._cache.lookup(key, count_miss=False)
+            if found:
+                if cached is not None:
+                    return cached
+                raise RouteLookupError(
+                    f"OSRM could not resolve route from ({origin.latitude}, {origin.longitude}) "
+                    f"to ({destination.latitude}, {destination.longitude}) [cached failure]"
+                )
 
-        data = self._execute_get(path)
+            if key in self._in_flight_legs:
+                event, result_box = self._in_flight_legs[key]
+                is_leader = False
+            else:
+                event = threading.Event()
+                result_box = [None, None]  # [result, exception]
+                self._in_flight_legs[key] = (event, result_box)
+                is_leader = True
 
-        distances = data.get("distances")
-        durations = data.get("durations")
-
-        if (
-            not isinstance(distances, list)
-            or not isinstance(durations, list)
-            or len(distances) == 0
-            or len(durations) == 0
-            or not isinstance(distances[0], list)
-            or not isinstance(durations[0], list)
-            or len(distances[0]) == 0
-            or len(durations[0]) == 0
-        ):
-            raise InvalidRouteDataError(f"OSRM table response missing distance/duration matrices: {data!r}")
-
-        raw_dist = distances[0][0]
-        raw_dur = durations[0][0]
-
-        if raw_dist is None or raw_dur is None:
-            self._cache.set(key, None)
-            raise RouteLookupError(
-                f"OSRM could not resolve route from ({origin.latitude}, {origin.longitude}) "
+        if not is_leader:
+            # Follower: wait for leader to complete
+            event.wait(timeout=self.timeout_seconds)
+            if result_box[1] is not None:
+                raise _clone_exception(result_box[1])
+            found, cached = self._cache.lookup(key, count_miss=False)
+            if found:
+                if cached is not None:
+                    return cached
+                raise RouteLookupError(
+                    f"OSRM could not resolve route from ({origin.latitude}, {origin.longitude}) "
+                    f"to ({destination.latitude}, {destination.longitude}) [cached failure]"
+                )
+            if result_box[0] is not None:
+                leg_res = result_box[0]
+                if isinstance(leg_res, tuple) and len(leg_res) == 2:
+                    return (int(leg_res[0]), int(leg_res[1]))
+            if event.is_set():
+                raise RouteLookupError(
+                    f"OSRM in-flight request was terminated without a result for direct leg "
+                    f"({origin.latitude}, {origin.longitude}) to ({destination.latitude}, {destination.longitude})"
+                )
+            raise RouteTimeoutError(
+                f"OSRM in-flight request timed out waiting for direct leg ({origin.latitude}, {origin.longitude}) "
                 f"to ({destination.latitude}, {destination.longitude})"
             )
 
+        # Leader: execute HTTP request
         try:
-            validated = validate_route_leg(origin, destination, (raw_dist, raw_dur))
-        except InvalidRouteDataError:
-            self._cache.set(key, None)
+            # Query OSRM Table service for single pair
+            orig_str = f"{origin.longitude:.{self.coord_precision}f},{origin.latitude:.{self.coord_precision}f}"
+            dest_str = f"{destination.longitude:.{self.coord_precision}f},{destination.latitude:.{self.coord_precision}f}"
+            path = (
+                f"/table/v1/{self.profile}/{orig_str};{dest_str}"
+                f"?sources=0&destinations=1&annotations=duration,distance"
+            )
+
+            data = self._execute_get(path)
+
+            distances = data.get("distances")
+            durations = data.get("durations")
+
+            if (
+                not isinstance(distances, list)
+                or not isinstance(durations, list)
+                or len(distances) == 0
+                or len(durations) == 0
+                or not isinstance(distances[0], list)
+                or not isinstance(durations[0], list)
+                or len(distances[0]) == 0
+                or len(durations[0]) == 0
+            ):
+                raise InvalidRouteDataError(f"OSRM table response missing distance/duration matrices: {data!r}")
+
+            raw_dist = distances[0][0]
+            raw_dur = durations[0][0]
+
+            if raw_dist is None or raw_dur is None:
+                self._cache.set(key, None)
+                raise RouteLookupError(
+                    f"OSRM could not resolve route from ({origin.latitude}, {origin.longitude}) "
+                    f"to ({destination.latitude}, {destination.longitude})"
+                )
+
+            try:
+                validated = validate_route_leg(origin, destination, (raw_dist, raw_dur))
+            except InvalidRouteDataError:
+                self._cache.set(key, None)
+                raise
+            self._cache.set(key, validated)
+            result_box[0] = validated
+            return validated
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                result_box[1] = exc
+            else:
+                result_box[1] = RouteLookupError(f"In-flight routing request cancelled: {exc}")
             raise
-        self._cache.set(key, validated)
-        return validated
+        finally:
+            with self._in_flight_lock:
+                self._in_flight_legs.pop(key, None)
+            event.set()
 
     def get_distance_matrix(
         self,
@@ -726,18 +833,28 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                 if not isinstance(distances, list) or not isinstance(durations, list):
                     continue
 
+                r_origs = [
+                    (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
+                    for c in chunk_origins
+                ]
+                r_dests = [
+                    (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
+                    for c in chunk_destinations
+                ]
                 batch_to_set: dict[tuple[float, float, float, float], tuple[int, int] | None] = {}
                 for r, orig in enumerate(chunk_origins):
                     if r >= len(distances) or not isinstance(distances[r], list):
                         continue
                     row_dist = distances[r]
                     row_dur = durations[r]
+                    orig_r = r_origs[r]
                     for c, dest in enumerate(chunk_destinations):
                         if c >= len(row_dist):
                             continue
                         raw_dist = row_dist[c]
                         raw_dur = row_dur[c]
-                        key = self._cache_key(orig, dest)
+                        dest_r = r_dests[c]
+                        key = (orig_r[0], orig_r[1], dest_r[0], dest_r[1])
                         if raw_dist is None or raw_dur is None:
                             batch_to_set[key] = None
                             continue
@@ -762,6 +879,8 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         """
         Initiates asynchronous bounded prefetching for multiple waypoint groups.
         Returns an OsrmPrefetchHandle allowing callers to stream/pipeline evaluation.
+        Coalesces overlapping candidate waypoint groups into batched matrix requests
+        to maximize HTTP connection pool efficiency and sub-second dispatch throughput.
         """
         if not groups:
             return None
@@ -769,47 +888,144 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
             return None
 
         executor = self._get_executor()
-        group_futures: list[concurrent.futures.Future[int] | None] = []
-        submitted_by_key: dict[tuple[tuple[float, float], ...], concurrent.futures.Future[int]] = {}
 
-        def _fetch_group(grp: Sequence[Coordinate]) -> int:
-            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
-                return 0
-            return self.prefetch_matrix(
-                origins=grp,
-                destinations=grp,
-                deadline=deadline,
-                reserved_headroom=reserved_headroom,
-            )
+        # If coalescing is disabled or all groups are pairwise legs (len <= 2),
+        # preserve individual per-group concurrent submission with exact deduplication.
+        all_pairs = all(len(g) <= 2 for g in groups)
+        if not self.coalesce_groups or all_pairs:
+            group_futures: list[concurrent.futures.Future[int] | None] = []
+            submitted_by_key: dict[tuple[tuple[float, float], ...], concurrent.futures.Future[int]] = {}
 
-        for group in groups:
+            def _fetch_group(grp: Sequence[Coordinate]) -> int:
+                if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                    return 0
+                return self.prefetch_matrix(
+                    origins=grp,
+                    destinations=grp,
+                    deadline=deadline,
+                    reserved_headroom=reserved_headroom,
+                )
+
+            for group in groups:
+                if len(group) < 2:
+                    group_futures.append(None)
+                    continue
+
+                group_key = tuple(sorted(set((c.latitude, c.longitude) for c in group)))
+                if group_key in submitted_by_key:
+                    group_futures.append(submitted_by_key[group_key])
+                    continue
+
+                keys = [
+                    self._cache_key(o, d)
+                    for o in group
+                    for d in group
+                    if (o.latitude, o.longitude) != (d.latitude, d.longitude)
+                ]
+                missing = self._cache.get_missing(keys)
+                if not missing:
+                    group_futures.append(None)
+                    continue
+
+                fut = executor.submit(_fetch_group, group)
+                submitted_by_key[group_key] = fut
+                group_futures.append(fut)
+
+            return OsrmPrefetchHandle(group_futures)
+
+        # Multi-group candidate evaluation plan coalescing:
+        # Consolidate candidate waypoint sets into batched coordinate queries.
+        effective_max_coords = min(self.max_table_size, self.max_batch_coords)
+        batches: list[list[Coordinate]] = []
+        batch_coord_sets: list[set[tuple[float, float]]] = []
+        batch_group_counts: list[int] = []
+        group_to_batch: list[int | None] = [None] * len(groups)
+
+        for idx, group in enumerate(groups):
             if len(group) < 2:
-                group_futures.append(None)
                 continue
 
-            group_key = tuple(sorted(set((c.latitude, c.longitude) for c in group)))
-            if group_key in submitted_by_key:
-                # Share in-flight future for identical coordinate groups
-                group_futures.append(submitted_by_key[group_key])
-                continue
-
-            # Check if all non-self legs are already in cache
+            # Check if all legs are already in cache
             keys = [
                 self._cache_key(o, d)
                 for o in group
                 for d in group
                 if (o.latitude, o.longitude) != (d.latitude, d.longitude)
             ]
-            missing = self._cache.get_missing(keys)
-            if not missing:
-                group_futures.append(None)
+            if not self._cache.get_missing(keys):
                 continue
 
-            fut = executor.submit(_fetch_group, group)
-            submitted_by_key[group_key] = fut
-            group_futures.append(fut)
+            g_set = set(
+                (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
+                for c in group
+            )
 
-        return OsrmPrefetchHandle(group_futures)
+            # Check if this group's coordinates are a subset of an existing batch
+            subset_batch_idx: int | None = None
+            for b_idx, b_set in enumerate(batch_coord_sets):
+                if g_set.issubset(b_set):
+                    subset_batch_idx = b_idx
+                    break
+
+            if subset_batch_idx is not None:
+                group_to_batch[idx] = subset_batch_idx
+                continue
+
+            # Try to add to the most recent batch if capacity allows
+            assigned = False
+            if batches:
+                last_idx = len(batches) - 1
+                combined = batch_coord_sets[last_idx] | g_set
+                if (
+                    len(combined) <= effective_max_coords
+                    and batch_group_counts[last_idx] < self.max_groups_per_batch
+                ):
+                    for c in group:
+                        ck = (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
+                        if ck not in batch_coord_sets[last_idx]:
+                            batch_coord_sets[last_idx].add(ck)
+                            batches[last_idx].append(c)
+                    batch_group_counts[last_idx] += 1
+                    group_to_batch[idx] = last_idx
+                    assigned = True
+
+            if not assigned:
+                # Start a new batch
+                new_coords: list[Coordinate] = []
+                new_set: set[tuple[float, float]] = set()
+                for c in group:
+                    ck = (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
+                    if ck not in new_set:
+                        new_set.add(ck)
+                        new_coords.append(c)
+                new_batch_idx = len(batches)
+                group_to_batch[idx] = new_batch_idx
+                batches.append(new_coords)
+                batch_coord_sets.append(new_set)
+                batch_group_counts.append(1)
+
+        if not batches:
+            return OsrmPrefetchHandle([None] * len(groups))
+
+        def _fetch_batch(coords: Sequence[Coordinate]) -> int:
+            if deadline is not None and time.monotonic() > deadline - reserved_headroom:
+                return 0
+            return self.prefetch_matrix(
+                origins=coords,
+                destinations=coords,
+                deadline=deadline,
+                reserved_headroom=reserved_headroom,
+            )
+
+        batch_futures = [executor.submit(_fetch_batch, b) for b in batches]
+        coalesced_group_futures: list[concurrent.futures.Future[int] | None] = []
+        for target_batch in group_to_batch:
+            if target_batch is not None:
+                coalesced_group_futures.append(batch_futures[target_batch])
+            else:
+                coalesced_group_futures.append(None)
+
+        return OsrmPrefetchHandle(coalesced_group_futures)
 
     def prefetch_matrices(
         self,
