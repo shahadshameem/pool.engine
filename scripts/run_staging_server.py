@@ -13,6 +13,7 @@ import os
 import socket
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -83,12 +84,17 @@ def run_preflight_checks(
             all_ok = False
 
     # 3. Check PostgreSQL if configured
-    if db_url and "127.0.0.1:5433" in db_url:
-        pg_ok = check_tcp_port("127.0.0.1", 5433)
+    if db_url:
+        parsed_db = urllib.parse.urlsplit(db_url)
+        db_host = parsed_db.hostname or "127.0.0.1"
+        if db_host == "localhost":
+            db_host = "127.0.0.1"
+        db_port = parsed_db.port or 5432
+        pg_ok = check_tcp_port(db_host, db_port)
         if pg_ok:
-            print("PASS: PostgreSQL service on port 5433 is reachable.")
+            print(f"PASS: PostgreSQL service at {db_host}:{db_port} is reachable.")
         else:
-            print("FAIL: PostgreSQL service on port 5433 is unreachable.")
+            print(f"FAIL: PostgreSQL service at {db_host}:{db_port} is unreachable.")
             all_ok = False
 
     return all_ok

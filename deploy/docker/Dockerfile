@@ -33,9 +33,10 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir /wheels/*.whl && \
     rm -rf /wheels
 
-# Copy application source and maintenance scripts
+# Copy application source, configuration, and maintenance scripts
 COPY src/ /app/src/
 COPY scripts/ /app/scripts/
+COPY config/ /app/config/
 
 ENV PYTHONPATH=/app/src \
     PYTHONUNBUFFERED=1 \
