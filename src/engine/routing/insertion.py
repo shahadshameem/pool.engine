@@ -159,7 +159,12 @@ def generate_active_ride_insertions(
         leg_dist, _ = leg
         remaining_existing_vmt += leg_dist
 
-    eligible_requests = [r for r in requests if r.seat_count <= vehicle.total_seat_capacity]
+    existing_ride_req_ids = {s.request_id for s in active_ride.stops if s.request_id}
+    eligible_requests = [
+        r
+        for r in requests
+        if r.request_id not in existing_ride_req_ids and r.seat_count <= vehicle.total_seat_capacity
+    ]
     if not eligible_requests:
         return []
 

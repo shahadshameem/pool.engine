@@ -3,10 +3,10 @@
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from engine.contracts.policy import DispatchPolicyProvider
-from engine.contracts.routing import RoadNetworkRoutingProvider
+from engine.contracts.routing import Coordinate, RoadNetworkRoutingProvider
 from engine.contracts.spatial import SpatialIndexProvider
 from engine.contracts.storage import AssignmentCommitResult, RideStorageProvider
 from engine.dispatch import CandidateGenerationConfig, DispatchEngine
@@ -95,9 +95,13 @@ class DispatchOrchestrator:
         cycle_id: Optional[str] = None,
         idempotency_token: Optional[str] = None,
         deadline: Optional[float] = None,
+        region_id: Optional[str] = None,
     ) -> OrchestrationResult:
         """
         Executes a single end-to-end dispatch orchestration cycle.
+        If region_id is provided, solves exclusively for entities in that region.
+        If region_id is None and multiple regions are configured, executes partitioned
+        solving per region to preserve the regional 500ms SLA.
         """
         start_monotonic = time.monotonic()
         effective_cycle_id = cycle_id or f"cycle-{uuid.uuid4()}"
@@ -124,10 +128,90 @@ class DispatchOrchestrator:
                 routing_errors_count=0,
             )
 
+        if region_id is None and hasattr(self.routing_provider, "regions") and len(self.routing_provider.regions) > 1:
+            # Multi-region partitioned dispatch execution
+            all_committed: list[Any] = []
+            all_rejected: list[Any] = []
+            all_unassigned: list[str] = []
+            total_savings = 0
+            total_errors = 0
+            final_status = SearchStatus.COMPLETE
+            is_approx = False
+
+            for reg_id in self.routing_provider.regions:
+                if time.monotonic() > effective_deadline - self.config.reserved_headroom_seconds:
+                    final_status = SearchStatus.INCOMPLETE_DEADLINE_EXPIRED
+                    is_approx = True
+                    break
+                sub_res = self.dispatch_cycle(
+                    current_time=current_time,
+                    cycle_id=f"{effective_cycle_id}-{reg_id}",
+                    idempotency_token=f"{effective_idempotency_token}-{reg_id}",
+                    deadline=effective_deadline,
+                    region_id=reg_id,
+                )
+                all_committed.extend(sub_res.committed_assignments)
+                all_rejected.extend(sub_res.rejected_assignments)
+                all_unassigned.extend(sub_res.unassigned_request_ids)
+                total_savings += sub_res.total_vmt_savings_meters
+                total_errors += sub_res.routing_errors_count
+                if sub_res.is_approximated:
+                    is_approx = True
+                if sub_res.search_status != SearchStatus.COMPLETE:
+                    final_status = sub_res.search_status
+
+            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
+            return OrchestrationResult(
+                cycle_id=effective_cycle_id,
+                batch_id=effective_batch_id,
+                timestamp=current_time,
+                committed_assignments=tuple(all_committed),
+                rejected_assignments=tuple(all_rejected),
+                unassigned_request_ids=tuple(sorted(all_unassigned)),
+                search_status=final_status,
+                is_approximated=is_approx,
+                total_vmt_savings_meters=total_savings,
+                cycle_duration_ms=round(elapsed_ms, 2),
+                routing_errors_count=total_errors,
+            )
+
         # Stage 1: Snapshot Retrieval
         raw_requests = self.storage.get_pending_requests(limit=self.config.request_limit)
         active_vehicles = self.storage.get_active_vehicles(limit=self.config.vehicle_limit)
         active_rides = self.storage.get_active_rides()
+
+        # Regional filtering if specific region_id is requested
+        if region_id is not None and hasattr(self.routing_provider, "find_region_for_coordinate"):
+            raw_requests = [
+                req
+                for req in raw_requests
+                if (
+                    self.routing_provider.find_region_for_coordinate(
+                        Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
+                    )
+                    is not None
+                    and self.routing_provider.find_region_for_coordinate(
+                        Coordinate(req.pickup_location.latitude, req.pickup_location.longitude)
+                    ).region_id
+                    == region_id
+                )
+            ]
+            active_vehicles = [
+                veh
+                for veh in active_vehicles
+                if (
+                    self.routing_provider.find_region_for_coordinate(
+                        Coordinate(veh.current_location.latitude, veh.current_location.longitude)
+                    )
+                    is not None
+                    and self.routing_provider.find_region_for_coordinate(
+                        Coordinate(veh.current_location.latitude, veh.current_location.longitude)
+                    ).region_id
+                    == region_id
+                )
+            ]
+            veh_id_set = {veh.vehicle_id for veh in active_vehicles}
+            active_rides = [ride for ride in active_rides if ride.vehicle_id in veh_id_set]
 
         # Sweep expired requests and holds if enabled
         pending_requests: list[RideRequest] = []

@@ -100,6 +100,23 @@ class InMemoryRideStorage(RideStorageProvider):
         with self._lock:
             self._join_requests[join_request.join_request_id] = join_request
 
+    def record_proposal_acceptance(
+        self,
+        join_request_id: str,
+        is_host: bool,
+        is_traveller: bool,
+    ) -> Optional[tuple[bool, bool]]:
+        with self._lock:
+            jr = self._join_requests.get(join_request_id)
+            if jr is None:
+                return None
+            new_host = jr.host_accepted or is_host
+            new_traveller = jr.traveller_accepted or is_traveller
+            self._join_requests[join_request_id] = jr.model_copy(
+                update={"host_accepted": new_host, "traveller_accepted": new_traveller}
+            )
+            return new_host, new_traveller
+
     def acquire_seat_hold_atomic(
         self,
         ride_id: str,
@@ -517,10 +534,15 @@ class InMemoryRideStorage(RideStorageProvider):
 
             # Find newly inserted requests (not already in existing ride's stops)
             existing_req_ids = {s.request_id for s in existing_ride.stops}
-            newly_added_req_ids = [r_id for r_id in assignment.request_ids if r_id not in existing_req_ids]
+            if not assignment.request_ids or any(r_id in existing_req_ids for r_id in assignment.request_ids):
+                return AssignmentCommitResult(
+                    success=False,
+                    candidate_id=assignment.candidate_id,
+                    rejection_reason="REQUEST_NOT_PENDING",
+                )
 
             reqs_to_update = []
-            for req_id in newly_added_req_ids:
+            for req_id in assignment.request_ids:
                 req = self._requests.get(req_id)
                 if req is None or req.status != RequestStatus.PENDING:
                     return AssignmentCommitResult(

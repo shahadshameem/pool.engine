@@ -21,6 +21,7 @@ class CreateRideRequestInput(BaseModel):
     latest_dropoff_time: int = Field(ge=0)
     direct_distance_meters: Optional[int] = Field(default=None, ge=0)
     direct_duration_seconds: Optional[int] = Field(default=None, ge=0)
+    region_id: Optional[str] = Field(default=None, description="Optional target regional market identifier.")
 
     @model_validator(mode="after")
     def validate_time_window(self) -> "CreateRideRequestInput":
@@ -58,6 +59,7 @@ class RegisterVehicleInput(BaseModel):
     current_location: GeoCoordinate
     is_active: bool = True
     luggage_capacity_units: int = Field(default=0, ge=0)
+    region_id: Optional[str] = Field(default=None, description="Optional target regional market identifier.")
 
 
 class UpdateLocationInput(BaseModel):
@@ -85,6 +87,7 @@ class DispatchRunInput(BaseModel):
     deadline_seconds: Optional[float] = Field(default=None, gt=0.0)
     request_limit: Optional[int] = Field(default=None, ge=1)
     vehicle_limit: Optional[int] = Field(default=None, ge=1)
+    region_id: Optional[str] = Field(default=None, description="Optional target regional market to solve exclusively.")
 
 
 class StaleAssignmentDiagnosticResponse(BaseModel):
@@ -113,3 +116,125 @@ class DispatchCycleResponse(BaseModel):
     committed_assignments: tuple[CandidateAssignment, ...]
     rejected_assignments: tuple[StaleAssignmentDiagnosticResponse, ...]
     unassigned_request_ids: tuple[str, ...]
+
+
+class CreateProposalInput(BaseModel):
+    """Input payload to create a match proposal and acquire an atomic seat hold."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ride_id: str
+    request_id: str
+    seat_count: int | None = None
+    idempotency_token: str | None = None
+
+
+class ProposalDecisionInput(BaseModel):
+    """Input payload when accepting or declining a match proposal."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    user_id: str | None = None
+    role: str | None = None  # "host" or "traveller"
+    idempotency_token: str | None = None
+    reason: str | None = None
+    current_time: int | None = None
+
+
+class ProposalDTO(BaseModel):
+    """Representation of an unconfirmed or confirmed marketplace proposal."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    proposal_id: str
+    ride_id: str
+    request_id: str | None = None
+    host_id: str | None = None
+    traveller_id: str | None = None
+    seat_count: int
+    submitted_at: int
+    expires_at: int
+    status: str
+    host_accepted: bool
+    traveller_accepted: bool
+    is_confirmed: bool
+    pickup_location: GeoCoordinate | None = None
+    dropoff_location: GeoCoordinate | None = None
+    is_masked: bool = False
+
+
+class ProposalDecisionResult(BaseModel):
+    """Result returned after a host or traveller accepts or declines a proposal."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    proposal_id: str
+    status: str
+    host_accepted: bool
+    traveller_accepted: bool
+    is_confirmed: bool
+    ride_id: str
+    expires_at: int | None = None
+    message: str
+
+
+class CreateHostRideInput(BaseModel):
+    """Input payload to register a private car host's planned commute or journey."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    driver_id: str
+    origin: GeoCoordinate
+    destination: GeoCoordinate
+    scheduled_departure_time: int
+    available_seats: int = Field(default=3, ge=1, le=8)
+    max_detour_seconds: int = Field(default=600, ge=0)
+    vehicle_id: str | None = None
+    ride_id: str | None = None
+    region_id: Optional[str] = Field(default=None, description="Optional target regional market identifier.")
+
+
+class HostRideDTO(BaseModel):
+    """Public details of a private car host's planned journey."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ride_id: str
+    driver_id: str
+    vehicle_id: str
+    origin: GeoCoordinate
+    destination: GeoCoordinate
+    scheduled_departure_time: int
+    available_seats: int
+    max_detour_seconds: int
+    direct_duration_seconds: int
+    direct_distance_meters: int
+    status: str
+    stops: list[RouteStop] = Field(default_factory=list)
+
+
+class EnRouteJoinInput(BaseModel):
+    """Input payload to evaluate an en-route join request for an active ride."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    request_id: str
+    current_time: int | None = None
+
+
+class EnRouteJoinResult(BaseModel):
+    """Result of an en-route join eligibility check."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    eligible: bool
+    rejection_reason: str | None = None
+    proposal: ProposalDTO | None = None
+    estimated_pickup_time: int | None = None
+    estimated_dropoff_time: int | None = None
+    host_detour_seconds: int = 0
+    message: str
+
+
+class UpdateVehicleLocationInput(BaseModel):
+    """Input payload to update a vehicle's simulated progress location."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
+    ride_id: str | None = None
+    completed_stop_ids: list[str] = Field(default_factory=list)
+    current_time: int | None = None
+    notes: str = "Simulated progress marker (not live GPS tracking)"

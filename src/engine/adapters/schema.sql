@@ -36,8 +36,24 @@ CREATE TABLE IF NOT EXISTS rides (
     active_passenger_count INTEGER NOT NULL DEFAULT 0 CHECK (active_passenger_count >= 0),
     total_vmt_meters INTEGER NOT NULL DEFAULT 0 CHECK (total_vmt_meters >= 0),
     version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    origin_latitude DOUBLE PRECISION,
+    origin_longitude DOUBLE PRECISION,
+    destination_latitude DOUBLE PRECISION,
+    destination_longitude DOUBLE PRECISION,
+    max_detour_seconds INTEGER,
+    direct_duration_seconds INTEGER,
+    direct_distance_meters INTEGER,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Idempotent schema evolution for host-corridor metadata
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS origin_latitude DOUBLE PRECISION;
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS origin_longitude DOUBLE PRECISION;
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS destination_latitude DOUBLE PRECISION;
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS destination_longitude DOUBLE PRECISION;
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS max_detour_seconds INTEGER;
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS direct_duration_seconds INTEGER;
+ALTER TABLE rides ADD COLUMN IF NOT EXISTS direct_distance_meters INTEGER;
 
 CREATE INDEX IF NOT EXISTS idx_rides_status ON rides (lifecycle_status);
 CREATE INDEX IF NOT EXISTS idx_rides_vehicle ON rides (vehicle_id);
@@ -97,8 +113,21 @@ CREATE TABLE IF NOT EXISTS join_requests (
     expires_at BIGINT NOT NULL,
     status VARCHAR(64) NOT NULL DEFAULT 'PENDING',
     idempotency_token VARCHAR(256) NOT NULL,
+    host_accepted BOOLEAN NOT NULL DEFAULT FALSE,
+    traveller_accepted BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Idempotent column additions for existing live databases
+DO $$
+BEGIN
+    ALTER TABLE join_requests ADD COLUMN IF NOT EXISTS host_accepted BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE join_requests ADD COLUMN IF NOT EXISTS traveller_accepted BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION
+    WHEN OTHERS THEN
+        NULL;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_join_requests_ride ON join_requests (ride_id, status);
 

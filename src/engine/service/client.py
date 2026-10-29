@@ -153,3 +153,6 @@ class AsgiTestClient:
 
     def delete(self, path: str, headers: Optional[dict[str, str]] = None) -> AsgiResponse:
         return self.request("DELETE", path, headers=headers)
+
+    def options(self, path: str, headers: Optional[dict[str, str]] = None) -> AsgiResponse:
+        return self.request("OPTIONS", path, headers=headers)

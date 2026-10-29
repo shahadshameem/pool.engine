@@ -1,13 +1,13 @@
 """Collaborative ride pooling: JoinRequest handling, atomic seat holds, and double-revalidation commit."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from engine.contracts.policy import DispatchPolicy, DispatchPolicyProvider
 from engine.contracts.routing import RoadNetworkRoutingProvider
 from engine.contracts.storage import RideStorageProvider
-from engine.domain.enums import JoinStatus, RequestStatus, StopType
-from engine.domain.models import JoinRequest, Ride, RideRequest, Vehicle
+from engine.domain.enums import JoinStatus, RequestStatus, RideStatus, StopType
+from engine.domain.models import JoinRequest, Ride, RideRequest, RouteStop, Vehicle
 from engine.lifecycle.transitions import LifecycleTransitionError
 from engine.optimization.tie_breaking import candidate_sort_key
 from engine.routing.invariants import check_detour_bound
@@ -295,84 +295,142 @@ def confirm_join_request(
             rejection_reason="REQUEST_NOT_FOUND",
         )
 
-    # 3. Double-Revalidation against active policy and current road/network conditions
-    active_policy = policy_provider.get_policy()
-    raw_candidates = generate_single_request_insertions(
-        active_ride=ride,
-        request=request,
-        vehicle=vehicle,
-        router=router,
-        policy=active_policy,
-        current_time=current_time,
-    )
-
-    # Double-revalidate: ensure every onboard/scheduled request satisfies active policy
-    candidates = []
-    for cand in raw_candidates:
-        cand_feasible = True
-        for s in cand.ordered_stops:
-            if s.stop_type == StopType.DROPOFF:
-                stored_req = storage.get_request(s.request_id)
-                if stored_req is not None:
-                    p_stop = next(
-                        (p for p in cand.ordered_stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
-                        None,
-                    )
-                    if p_stop is not None:
-                        p_time = p_stop.scheduled_arrival_time
-                    else:
-                        orig_p = next(
-                            (p for p in ride.stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
-                            None,
-                        )
-                        p_time = (
-                            orig_p.actual_arrival_time or orig_p.scheduled_arrival_time
-                            if orig_p is not None
-                            else ride.scheduled_departure_time
-                        )
-                    d_time = s.scheduled_arrival_time
-                    dur = max(0, d_time - p_time)
-                    if not check_detour_bound(
-                        actual_duration=dur,
-                        direct_duration=stored_req.direct_duration_seconds,
-                        policy=active_policy,
-                    ):
-                        cand_feasible = False
-                        break
-        if cand_feasible:
-            candidates.append(cand)
-
-    if not candidates:
-        # Revalidation failed! No feasible insertions satisfy active policy and capacity
+    # Invariant: Cancellation racing with confirmation releases hold and aborts cleanly
+    if request.status in (RequestStatus.CANCELLED, RequestStatus.EXPIRED):
         storage.release_seats_atomic(
             ride_id=ride.ride_id,
             join_request_id=join_request.join_request_id,
-            reason="REVALIDATION_FAILED",
+            reason="REQUEST_CANCELLED" if request.status == RequestStatus.CANCELLED else "REQUEST_EXPIRED",
         )
         rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
         storage.save_join_request(rejected_jr)
-
-        # Check whether capacity or detour caused failure
-        current_occ = ride.active_passenger_count
-        peak_occ = current_occ
-        for stop in ride.stops:
-            current_occ += stop.passenger_delta
-            if current_occ > peak_occ:
-                peak_occ = current_occ
-
-        rejection_reason = (
-            "OVER_CAPACITY"
-            if peak_occ + join_request.seat_count > vehicle.total_seat_capacity
-            else "DETOUR_BREACH"
-        )
         return ReservationResult(
             success=False,
             join_request=rejected_jr,
-            rejection_reason=rejection_reason,
+            rejection_reason="REQUEST_CANCELLED" if request.status == RequestStatus.CANCELLED else "REQUEST_EXPIRED",
         )
 
-    # Pick best candidate using deterministic tie-breaking sort key
-    best_candidate = sorted(candidates, key=candidate_sort_key())[0]
+    # Invariant: Ride cancelled or completed before confirmation releases hold
+    if ride.lifecycle_status in (RideStatus.CANCELLED, RideStatus.COMPLETED):
+        storage.release_seats_atomic(
+            ride_id=ride.ride_id,
+            join_request_id=join_request.join_request_id,
+            reason="RIDE_CANCELLED",
+        )
+        rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
+        storage.save_join_request(rejected_jr)
+        return ReservationResult(
+            success=False,
+            join_request=rejected_jr,
+            rejection_reason="RIDE_CANCELLED",
+        )
+
+    # 3. Double-Revalidation against active policy and current road/network conditions
+    active_policy = policy_provider.get_policy()
+
+    candidate_stops: Sequence[RouteStop]
+    if ride.is_host_ride:
+        from engine.routing.corridor import evaluate_host_corridor_match
+        corridor_res = evaluate_host_corridor_match(
+            ride=ride,
+            request=request,
+            vehicle=vehicle,
+            router=router,
+            policy=active_policy,
+            current_time=current_time,
+        )
+        if not corridor_res.is_eligible or not corridor_res.proposed_stops:
+            storage.release_seats_atomic(
+                ride_id=ride.ride_id,
+                join_request_id=join_request.join_request_id,
+                reason="REVALIDATION_FAILED",
+            )
+            rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
+            storage.save_join_request(rejected_jr)
+            return ReservationResult(
+                success=False,
+                join_request=rejected_jr,
+                rejection_reason=corridor_res.rejection_reason or "CORRIDOR_INCOMPATIBLE",
+            )
+        candidate_stops = corridor_res.proposed_stops
+    else:
+        raw_candidates = generate_single_request_insertions(
+            active_ride=ride,
+            request=request,
+            vehicle=vehicle,
+            router=router,
+            policy=active_policy,
+            current_time=current_time,
+        )
+
+        # Double-revalidate: ensure every onboard/scheduled request satisfies active policy
+        candidates = []
+        for cand in raw_candidates:
+            cand_feasible = True
+            for s in cand.ordered_stops:
+                if s.stop_type == StopType.DROPOFF:
+                    stored_req = storage.get_request(s.request_id)
+                    if stored_req is not None:
+                        p_stop = next(
+                            (p for p in cand.ordered_stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
+                            None,
+                        )
+                        if p_stop is not None:
+                            p_time = p_stop.scheduled_arrival_time
+                        else:
+                            orig_p = next(
+                                (p for p in ride.stops if p.request_id == s.request_id and p.stop_type == StopType.PICKUP),
+                                None,
+                            )
+                            p_time = (
+                                orig_p.actual_arrival_time or orig_p.scheduled_arrival_time
+                                if orig_p is not None
+                                else ride.scheduled_departure_time
+                            )
+                        d_time = s.scheduled_arrival_time
+                        dur = max(0, d_time - p_time)
+                        if not check_detour_bound(
+                            actual_duration=dur,
+                            direct_duration=stored_req.direct_duration_seconds,
+                            policy=active_policy,
+                        ):
+                            cand_feasible = False
+                            break
+            if cand_feasible:
+                candidates.append(cand)
+
+        if not candidates:
+            # Revalidation failed! No feasible insertions satisfy active policy and capacity
+            storage.release_seats_atomic(
+                ride_id=ride.ride_id,
+                join_request_id=join_request.join_request_id,
+                reason="REVALIDATION_FAILED",
+            )
+            rejected_jr = join_request.model_copy(update={"status": JoinStatus.REJECTED})
+            storage.save_join_request(rejected_jr)
+
+            # Check whether capacity or detour caused failure
+            current_occ = ride.active_passenger_count
+            peak_occ = current_occ
+            for stop in ride.stops:
+                current_occ += stop.passenger_delta
+                if current_occ > peak_occ:
+                    peak_occ = current_occ
+
+            rejection_reason = (
+                "OVER_CAPACITY"
+                if peak_occ + join_request.seat_count > vehicle.total_seat_capacity
+                else "DETOUR_BREACH"
+            )
+            return ReservationResult(
+                success=False,
+                join_request=rejected_jr,
+                rejection_reason=rejection_reason,
+            )
+
+        # Pick best candidate using deterministic tie-breaking sort key
+        best_candidate = sorted(candidates, key=candidate_sort_key())[0]
+        candidate_stops = best_candidate.ordered_stops
 
     # 4. Atomic Commit with OCC retry
     max_commit_retries = 3
@@ -384,7 +442,7 @@ def confirm_join_request(
             seat_count=join_request.seat_count,
             expected_version=ride.version,
             idempotency_token=token,
-            new_stops=best_candidate.ordered_stops,
+            new_stops=candidate_stops,
             current_time=current_time,
         )
 

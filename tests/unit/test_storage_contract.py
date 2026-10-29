@@ -324,6 +324,14 @@ def test_submit_join_request_occ_retry_uses_contract_without_private_holds_acces
         def save_join_request(self, join_request: JoinRequest) -> None:
             self._target.save_join_request(join_request)
 
+        def record_proposal_acceptance(
+            self,
+            join_request_id: str,
+            is_host: bool,
+            is_traveller: bool,
+        ) -> Optional[tuple[bool, bool]]:
+            return self._target.record_proposal_acceptance(join_request_id, is_host, is_traveller)
+
         def acquire_seat_hold_atomic(
             self,
             ride_id: str,

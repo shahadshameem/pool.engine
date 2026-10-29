@@ -5,6 +5,7 @@ from engine.adapters.in_memory_storage import InMemoryRideStorage
 from engine.adapters.mock_routing import MockRoutingProvider
 from engine.adapters.osrm_routing import DefaultOsrmTransport, OsrmHttpTransport, OsrmRoutingAdapter
 from engine.adapters.postgres_storage import PostgresRideStorage
+from engine.adapters.regional_router import RegionalRoutingRouter
 
 __all__ = [
     "DefaultOsrmTransport",
@@ -14,5 +15,5 @@ __all__ = [
     "OsrmHttpTransport",
     "OsrmRoutingAdapter",
     "PostgresRideStorage",
+    "RegionalRoutingRouter",
 ]
-

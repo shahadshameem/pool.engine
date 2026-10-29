@@ -13,9 +13,12 @@ from typing import Any, Mapping, Sequence
 import urllib.parse
 
 from engine.contracts.routing import (
+    BoundingBox,
     Coordinate,
+    InvalidCoordinateError,
     InvalidRouteDataError,
     MatrixResult,
+    OutOfRegionError,
     RoadNetworkRoutingProvider,
     RouteGeometry,
     RouteLookupError,
@@ -164,14 +167,14 @@ class LruLegCache:
 
     def __init__(self, maxsize: int = 50000) -> None:
         self.maxsize = max(1, maxsize)
-        self._data: OrderedDict[tuple[float, float, float, float], tuple[int, int] | None] = OrderedDict()
+        self._data: OrderedDict[tuple[Any, ...], tuple[int, int] | None] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
 
     def lookup(
         self,
-        key: tuple[float, float, float, float],
+        key: tuple[Any, ...],
         count_miss: bool = True,
     ) -> tuple[bool, tuple[int, int] | None]:
         with self._lock:
@@ -183,7 +186,7 @@ class LruLegCache:
                 self.misses += 1
             return False, None
 
-    def get(self, key: tuple[float, float, float, float]) -> tuple[int, int] | None:
+    def get(self, key: tuple[Any, ...]) -> tuple[int, int] | None:
         with self._lock:
             if key in self._data:
                 self._data.move_to_end(key)
@@ -192,7 +195,7 @@ class LruLegCache:
             self.misses += 1
             return None
 
-    def set(self, key: tuple[float, float, float, float], value: tuple[int, int] | None) -> None:
+    def set(self, key: tuple[Any, ...], value: tuple[int, int] | None) -> None:
         with self._lock:
             if key in self._data:
                 self._data.move_to_end(key)
@@ -203,14 +206,14 @@ class LruLegCache:
                 self._data.popitem(last=False)
 
     def get_missing(
-        self, keys: Sequence[tuple[float, float, float, float]]
-    ) -> list[tuple[float, float, float, float]]:
+        self, keys: Sequence[tuple[Any, ...]]
+    ) -> list[tuple[Any, ...]]:
         """Returns the sublist of keys that are not present in the cache."""
         with self._lock:
             return [k for k in keys if k not in self._data]
 
     def set_many(
-        self, items: Mapping[tuple[float, float, float, float], tuple[int, int] | None]
+        self, items: Mapping[tuple[Any, ...], tuple[int, int] | None]
     ) -> None:
         """Batch inserts items into the cache under a single lock acquisition."""
         with self._lock:
@@ -306,9 +309,15 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         max_batch_coords: int = 24,
         max_groups_per_batch: int = 2,
         coalesce_groups: bool = True,
+        bounding_box: BoundingBox | None = None,
+        max_snap_distance_meters: float = 5000.0,
+        dataset_id: str = "default",
+        probe_coordinate: Coordinate | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.profile = profile
+        self.dataset_id = dataset_id
+        self.probe_coordinate = probe_coordinate
         self.timeout_seconds = max(0.01, timeout_seconds)
         self.max_retries = max(0, max_retries)
         self.max_table_size = max(2, max_table_size)
@@ -317,6 +326,8 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         self.max_batch_coords = max(2, max_batch_coords)
         self.max_groups_per_batch = max(1, max_groups_per_batch)
         self.coalesce_groups = coalesce_groups
+        self.bounding_box = bounding_box
+        self.max_snap_distance_meters = max(1.0, float(max_snap_distance_meters))
         self._cache = LruLegCache(maxsize=cache_maxsize)
         self.transport = (
             transport
@@ -327,9 +338,73 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         self._executor_lock = threading.Lock()
         self._in_flight_lock = threading.Lock()
         self._in_flight_legs: dict[
-            tuple[float, float, float, float],
+            tuple[Any, ...],
             tuple[threading.Event, list[Any]],
         ] = {}
+
+    def validate_coordinate(self, coord: Coordinate, label: str = "Coordinate") -> None:
+        """Validates that coordinate is within the configured bounding box if present."""
+        self._validate_coordinate(coord, label)
+
+    def _validate_coordinate(self, coord: Coordinate, label: str = "Coordinate") -> None:
+        """Validates that coordinate is within the configured bounding box if present."""
+        if self.bounding_box is not None:
+            self.bounding_box.validate(coord, label)
+
+    def _validate_waypoint_snapping(
+        self,
+        waypoint: Any,
+        original_coord: Coordinate,
+        label: str = "Waypoint",
+    ) -> None:
+        """
+        Validates that a returned OSRM waypoint did not snap to an edge beyond max_snap_distance_meters
+        and that its snapped road network location falls within the bounding box (if configured).
+        """
+        if not isinstance(waypoint, dict):
+            raise InvalidRouteDataError(
+                f"OSRM returned malformed waypoint entry (expected dict): {waypoint!r}"
+            )
+
+        snap_dist = waypoint.get("distance")
+        if snap_dist is not None:
+            if isinstance(snap_dist, bool) or not isinstance(snap_dist, (int, float)):
+                raise InvalidRouteDataError(
+                    f"OSRM returned non-numeric waypoint snapping distance: {snap_dist!r}"
+                )
+            if math.isnan(snap_dist) or math.isinf(snap_dist):
+                raise InvalidRouteDataError(
+                    f"OSRM returned non-finite waypoint snapping distance: {snap_dist!r}"
+                )
+            if snap_dist < 0:
+                raise InvalidRouteDataError(
+                    f"OSRM returned negative waypoint snapping distance: {snap_dist}m"
+                )
+            if snap_dist > self.max_snap_distance_meters:
+                raise OutOfRegionError(
+                    f"{label} ({original_coord.latitude}, {original_coord.longitude}) snapped "
+                    f"{snap_dist:.1f}m away to road network, exceeding maximum allowed snapping distance of "
+                    f"{self.max_snap_distance_meters:.1f}m"
+                )
+
+        if self.bounding_box is not None:
+            loc = waypoint.get("location")
+            if loc is not None:
+                if not isinstance(loc, (list, tuple)) or len(loc) < 2:
+                    raise InvalidRouteDataError(
+                        f"OSRM returned malformed waypoint location list: {loc!r}"
+                    )
+                try:
+                    snapped_c = Coordinate(latitude=float(loc[1]), longitude=float(loc[0]))
+                except (InvalidCoordinateError, ValueError, TypeError) as err:
+                    raise InvalidRouteDataError(
+                        f"OSRM returned invalid coordinates in waypoint location {loc!r}: {err}"
+                    ) from err
+                if not self.bounding_box.contains(snapped_c):
+                    raise OutOfRegionError(
+                        f"{label} ({original_coord.latitude}, {original_coord.longitude}) snapped to "
+                        f"({snapped_c.latitude}, {snapped_c.longitude}) outside regional bounding box"
+                    )
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         with self._executor_lock:
@@ -385,24 +460,38 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         Lightweight connectivity probe verifying OSRM routing backend is reachable.
         Returns True if backend is healthy, False if unreachable or timed out.
         """
+        if self.probe_coordinate is not None:
+            probe_lat = self.probe_coordinate.latitude
+            probe_lon = self.probe_coordinate.longitude
+        elif self.bounding_box is not None:
+            probe_lat = (self.bounding_box.min_lat + self.bounding_box.max_lat) / 2.0
+            probe_lon = (self.bounding_box.min_lon + self.bounding_box.max_lon) / 2.0
+        else:
+            probe_lat = 0.0
+            probe_lon = 0.0
+
         try:
             status, _ = self.transport.get(
-                f"/nearest/v1/{self.profile}/-73.985130,40.758896?number=1",
+                f"/nearest/v1/{self.profile}/{probe_lon:.6f},{probe_lat:.6f}?number=1",
                 self.timeout_seconds,
             )
             return status in (200, 400)
         except Exception:
             return False
 
-    def _cache_key(self, origin: Coordinate, destination: Coordinate) -> tuple[float, float, float, float]:
+    def _cache_key(self, origin: Coordinate, destination: Coordinate) -> tuple[Any, ...]:
         if self.coord_precision == 6:
             return (
+                self.dataset_id,
+                self.profile,
                 origin.latitude,
                 origin.longitude,
                 destination.latitude,
                 destination.longitude,
             )
         return (
+            self.dataset_id,
+            self.profile,
             round(origin.latitude, self.coord_precision),
             round(origin.longitude, self.coord_precision),
             round(destination.latitude, self.coord_precision),
@@ -464,6 +553,9 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         Returns road network distance (meters) and travel duration (seconds)
         for a direct leg between origin and destination.
         """
+        self._validate_coordinate(origin, "Origin")
+        self._validate_coordinate(destination, "Destination")
+
         # Identical origin and destination: zero cost, zero duration
         if origin.latitude == destination.latitude and origin.longitude == destination.longitude:
             return 0, 0
@@ -538,6 +630,14 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
 
             data = self._execute_get(path)
 
+            # Validate waypoint snapping distances against regional limits
+            sources = data.get("sources")
+            destinations = data.get("destinations")
+            if isinstance(sources, list) and len(sources) > 0 and isinstance(sources[0], dict):
+                self._validate_waypoint_snapping(sources[0], origin, "Origin")
+            if isinstance(destinations, list) and len(destinations) > 0 and isinstance(destinations[0], dict):
+                self._validate_waypoint_snapping(destinations[0], destination, "Destination")
+
             distances = data.get("distances")
             durations = data.get("durations")
 
@@ -592,6 +692,11 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         Handles chunking when |origins| + |destinations| > max_table_size
         and leverages in-memory caching.
         """
+        for idx, orig in enumerate(origins):
+            self._validate_coordinate(orig, f"Origin[{idx}]")
+        for idx, dest in enumerate(destinations):
+            self._validate_coordinate(dest, f"Destination[{idx}]")
+
         m = len(origins)
         n = len(destinations)
 
@@ -681,6 +786,18 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
 
                 data = self._execute_get(path)
 
+                # Validate waypoint snapping distances against regional limits
+                sources = data.get("sources")
+                destinations_meta = data.get("destinations")
+                if isinstance(sources, list):
+                    for r, orig in enumerate(chunk_origins):
+                        if r < len(sources) and isinstance(sources[r], dict):
+                            self._validate_waypoint_snapping(sources[r], orig, f"Origin[{o_start + r}]")
+                if isinstance(destinations_meta, list):
+                    for c, dest in enumerate(chunk_destinations):
+                        if c < len(destinations_meta) and isinstance(destinations_meta[c], dict):
+                            self._validate_waypoint_snapping(destinations_meta[c], dest, f"Destination[{d_start + c}]")
+
                 distances = data.get("distances")
                 durations = data.get("durations")
 
@@ -765,6 +882,14 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         same_endpoints = (destinations is None or destinations is origins or destinations == origins)
         if destinations is None:
             destinations = origins
+
+        if self.bounding_box is not None:
+            origins = [c for c in origins if self.bounding_box.contains(c)]
+            if not same_endpoints:
+                destinations = [c for c in destinations if self.bounding_box.contains(c)]
+            else:
+                destinations = origins
+
         m = len(origins)
         n = len(destinations)
         if m == 0 or n == 0:
@@ -833,28 +958,38 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
                 if not isinstance(distances, list) or not isinstance(durations, list):
                     continue
 
-                r_origs = [
-                    (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
-                    for c in chunk_origins
-                ]
-                r_dests = [
-                    (round(c.latitude, self.coord_precision), round(c.longitude, self.coord_precision))
-                    for c in chunk_destinations
-                ]
-                batch_to_set: dict[tuple[float, float, float, float], tuple[int, int] | None] = {}
+                sources = data.get("sources")
+                destinations_meta = data.get("destinations")
+                invalid_origins: set[int] = set()
+                invalid_dests: set[int] = set()
+                if isinstance(sources, list):
+                    for r, orig in enumerate(chunk_origins):
+                        if r < len(sources) and isinstance(sources[r], dict):
+                            s_dist = sources[r].get("distance")
+                            if s_dist is not None and float(s_dist) > self.max_snap_distance_meters:
+                                invalid_origins.add(r)
+                if isinstance(destinations_meta, list):
+                    for c, dest in enumerate(chunk_destinations):
+                        if c < len(destinations_meta) and isinstance(destinations_meta[c], dict):
+                            d_dist = destinations_meta[c].get("distance")
+                            if d_dist is not None and float(d_dist) > self.max_snap_distance_meters:
+                                invalid_dests.add(c)
+
+                batch_to_set: dict[tuple[Any, ...], tuple[int, int] | None] = {}
                 for r, orig in enumerate(chunk_origins):
                     if r >= len(distances) or not isinstance(distances[r], list):
                         continue
                     row_dist = distances[r]
                     row_dur = durations[r]
-                    orig_r = r_origs[r]
                     for c, dest in enumerate(chunk_destinations):
                         if c >= len(row_dist):
                             continue
                         raw_dist = row_dist[c]
                         raw_dur = row_dur[c]
-                        dest_r = r_dests[c]
-                        key = (orig_r[0], orig_r[1], dest_r[0], dest_r[1])
+                        key = self._cache_key(orig, dest)
+                        if r in invalid_origins or c in invalid_dests:
+                            batch_to_set[key] = None
+                            continue
                         if raw_dist is None or raw_dur is None:
                             batch_to_set[key] = None
                             continue
@@ -1076,6 +1211,10 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         """
         if len(waypoints) == 0:
             raise InvalidRouteDataError("get_route requires at least one waypoint")
+
+        for idx, wp in enumerate(waypoints):
+            self._validate_coordinate(wp, f"Waypoint[{idx}]")
+
         if len(waypoints) == 1:
             return RouteGeometry(
                 points=list(waypoints),
@@ -1090,6 +1229,13 @@ class OsrmRoutingAdapter(RoadNetworkRoutingProvider):
         path = f"/route/v1/{self.profile}/{coords_str}?overview=full&geometries=geojson"
 
         data = self._execute_get(path)
+
+        # Validate waypoint snapping distances against regional limits
+        ret_waypoints = data.get("waypoints")
+        if isinstance(ret_waypoints, list):
+            for idx, orig_wp in enumerate(waypoints):
+                if idx < len(ret_waypoints) and isinstance(ret_waypoints[idx], dict):
+                    self._validate_waypoint_snapping(ret_waypoints[idx], orig_wp, f"Waypoint[{idx}]")
 
         routes = data.get("routes")
         if not isinstance(routes, list) or len(routes) == 0:

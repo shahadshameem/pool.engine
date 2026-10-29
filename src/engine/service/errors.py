@@ -95,6 +95,13 @@ class RoutingError(ServiceError):
     code = "ROUTING_BACKEND_ERROR"
 
 
+class OutOfRegionServiceError(ServiceError):
+    """Raised when requested coordinates fall outside the supported operational service region."""
+
+    status_code = 400
+    code = "OUT_OF_REGION"
+
+
 class RoutingTimeoutError(RoutingError):
     """Raised when the routing backend query exceeds its allotted deadline."""
 
@@ -121,3 +128,17 @@ class PayloadTooLargeError(ServiceError):
 
     status_code = 413
     code = "PAYLOAD_TOO_LARGE"
+
+
+class StorageUnavailableError(ServiceError):
+    """Raised when the storage backend or connection pool is exhausted or unavailable."""
+
+    status_code = 503
+    code = "STORAGE_UNAVAILABLE"
+
+
+class StorageTimeoutError(StorageUnavailableError):
+    """Raised when a storage connection checkout or query exceeds its timeout."""
+
+    status_code = 503
+    code = "STORAGE_POOL_EXHAUSTED"

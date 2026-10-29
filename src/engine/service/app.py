@@ -8,6 +8,7 @@ import time
 from typing import Any, Awaitable, Callable, Optional, Pattern
 from pydantic import ValidationError as PydanticValidationError
 
+from engine.contracts.storage import StorageProviderError
 from engine.domain.models import GeoCoordinate
 from engine.service.config import ServiceConfig
 from engine.service.errors import (
@@ -23,13 +24,19 @@ from engine.service.errors import (
 )
 from engine.service.schemas import (
     CancelRideRequestInput,
+    CreateHostRideInput,
+    CreateProposalInput,
     CreateRideRequestInput,
     DispatchRunInput,
+    EnRouteJoinInput,
+    ProposalDecisionInput,
     RegisterVehicleInput,
     UpdateLocationInput,
+    UpdateVehicleLocationInput,
     UpdateVehicleStatusInput,
 )
 from engine.service.security import (
+    AuthContext,
     AuthProvider,
     NoOpAuthProvider,
     sanitize_sensitive_strings,
@@ -81,12 +88,16 @@ class AsgiRouter:
 
 def _json_response(status_code: int, payload: Any) -> tuple[int, dict[str, str], bytes]:
     """Helper formatting JSON responses."""
-    if hasattr(payload, "model_dump"):
-        data = payload.model_dump(mode="json")
-    elif isinstance(payload, dict):
-        data = payload
-    else:
-        data = payload
+    def _to_jsonable(obj: Any) -> Any:
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(mode="json")
+        if isinstance(obj, dict):
+            return {k: _to_jsonable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [_to_jsonable(v) for v in obj]
+        return obj
+
+    data = _to_jsonable(payload)
     body = json.dumps(data, indent=2).encode("utf-8")
     headers = {
         "content-type": "application/json",
@@ -129,7 +140,7 @@ def create_app(
     eff_config = config or ServiceConfig.from_env()
     eff_service = service or build_service_from_env()
     eff_auth = auth_provider or (
-        build_auth_provider_from_env() if eff_config.require_auth else NoOpAuthProvider()
+        build_auth_provider_from_env(config=eff_config) if eff_config.require_auth else NoOpAuthProvider()
     )
     eff_telemetry = telemetry or eff_service.telemetry
     router = AsgiRouter()
@@ -157,7 +168,11 @@ def create_app(
     async def handle_readiness(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
-        readiness = eff_service.check_readiness(strict_routing=eff_config.strict_routing_readiness)
+        readiness = await asyncio.to_thread(
+            eff_service.check_readiness,
+            strict_routing=eff_config.strict_routing_readiness,
+            require_persistent_storage=eff_config.require_persistent_storage,
+        )
         status_code = 200 if readiness.get("ready") else 503
         return _json_response(status_code, readiness)
 
@@ -171,6 +186,27 @@ def create_app(
             raw_data = json.loads(body.decode("utf-8")) if body else {}
         except Exception as e:
             return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        # Enforce owner identity for authenticated non-admin users
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+            body_rider = raw_data.get("user_id") or raw_data.get("rider_id")
+            if body_rider and body_rider != auth_ctx.subject_id:
+                return _error_response(
+                    403,
+                    "FORBIDDEN",
+                    f"Authenticated user '{auth_ctx.subject_id}' cannot create ride request for user '{body_rider}'",
+                )
+            raw_data["user_id"] = auth_ctx.subject_id
+            raw_data.pop("rider_id", None)
+        else:
+            if "rider_id" in raw_data and "user_id" not in raw_data:
+                raw_data["user_id"] = raw_data.pop("rider_id")
+
+        if "earliest_departure_time" in raw_data and "earliest_pickup_time" not in raw_data:
+            raw_data["earliest_pickup_time"] = raw_data.pop("earliest_departure_time")
+        if "latest_arrival_time" in raw_data and "latest_dropoff_time" not in raw_data:
+            raw_data["latest_dropoff_time"] = raw_data.pop("latest_arrival_time")
 
         header_idemp = headers.get("idempotency-key")
         body_req_id = raw_data.get("request_id")
@@ -192,12 +228,16 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Request input validation failed", details)
 
-        is_existing = (
-            eff_service.storage.get_request(dto.request_id) is not None
-            if dto.request_id
-            else False
-        )
-        req = eff_service.create_request(dto)
+        def _execute_create() -> tuple[Any, bool]:
+            is_existing = (
+                eff_service.storage.get_request(dto.request_id) is not None
+                if dto.request_id
+                else False
+            )
+            req = eff_service.create_request(dto)
+            return req, is_existing
+
+        req, is_existing = await asyncio.to_thread(_execute_create)
         status_code = 200 if is_existing else 201
         return _json_response(status_code, req)
 
@@ -208,7 +248,8 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         req_id = params["request_id"]
-        req = eff_service.get_request(req_id)
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        req = await asyncio.to_thread(eff_service.get_request, req_id, auth_context=auth_ctx)
         return _json_response(200, req)
 
     router.add("GET", "/v1/requests/{request_id}", handle_get_request)
@@ -237,7 +278,14 @@ def create_app(
                 f"Idempotency-Key header ('{header_idemp}') does not match body idempotency_token ('{body_idemp}')",
             )
         eff_idemp = header_idemp or body_idemp
-        cancelled = eff_service.cancel_request(req_id, reason=reason, idempotency_token=eff_idemp)
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        cancelled = await asyncio.to_thread(
+            eff_service.cancel_request,
+            req_id,
+            reason=reason,
+            idempotency_token=eff_idemp,
+            auth_context=auth_ctx,
+        )
         return _json_response(200, cancelled)
 
     router.add("POST", "/v1/requests/{request_id}/cancel", handle_cancel_request)
@@ -251,6 +299,17 @@ def create_app(
         except Exception as e:
             return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
 
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+            body_driver = raw_data.get("driver_id")
+            if body_driver and body_driver != auth_ctx.subject_id:
+                return _error_response(
+                    403,
+                    "FORBIDDEN",
+                    f"Authenticated user '{auth_ctx.subject_id}' cannot register vehicle for driver '{body_driver}'",
+                )
+            raw_data["driver_id"] = auth_ctx.subject_id
+
         try:
             dto = RegisterVehicleInput.model_validate(raw_data)
         except PydanticValidationError as e:
@@ -260,7 +319,7 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Vehicle input validation failed", details)
 
-        veh = eff_service.register_vehicle(dto)
+        veh = await asyncio.to_thread(eff_service.register_vehicle, dto)
         return _json_response(201, veh)
 
     router.add("POST", "/v1/vehicles", handle_register_vehicle)
@@ -270,7 +329,19 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         veh_id = params["vehicle_id"]
-        veh = eff_service.get_vehicle(veh_id)
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        def _execute_get_vehicle() -> tuple[Any, Optional[tuple[int, dict[str, str], bytes]]]:
+            veh = eff_service.get_vehicle(veh_id)
+            if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+                if veh.driver_id != auth_ctx.subject_id:
+                    return None, _error_response(
+                        403, "FORBIDDEN", f"Caller is not authorized to inspect vehicle '{veh_id}'"
+                    )
+            return veh, None
+
+        veh, err = await asyncio.to_thread(_execute_get_vehicle)
+        if err is not None:
+            return err
         return _json_response(200, veh)
 
     router.add("GET", "/v1/vehicles/{vehicle_id}", handle_get_vehicle)
@@ -280,13 +351,15 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         veh_id = params["vehicle_id"]
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+
         try:
             raw_data = json.loads(body.decode("utf-8")) if body else {}
         except Exception as e:
             return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
 
         try:
-            dto = UpdateLocationInput.model_validate(raw_data)
+            dto = UpdateVehicleLocationInput.model_validate(raw_data)
         except PydanticValidationError as e:
             details = [
                 ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
@@ -295,16 +368,37 @@ def create_app(
             return _error_response(400, "VALIDATION_ERROR", "Location update validation failed", details)
 
         coord = GeoCoordinate(latitude=dto.latitude, longitude=dto.longitude)
-        updated = eff_service.update_vehicle_location(veh_id, coord)
+
+        def _execute_update_loc() -> tuple[Any, Optional[tuple[int, dict[str, str], bytes]]]:
+            veh = eff_service.get_vehicle(veh_id)
+            if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+                if veh.driver_id != auth_ctx.subject_id:
+                    return None, _error_response(
+                        403, "FORBIDDEN", f"Caller is not authorized to update vehicle '{veh_id}'"
+                    )
+            updated = eff_service.update_vehicle_location(
+                veh_id,
+                coord,
+                ride_id=dto.ride_id,
+                completed_stop_ids=dto.completed_stop_ids,
+            )
+            return updated, None
+
+        updated, err = await asyncio.to_thread(_execute_update_loc)
+        if err is not None:
+            return err
         return _json_response(200, updated)
 
     router.add("PATCH", "/v1/vehicles/{vehicle_id}/location", handle_update_vehicle_location)
+    router.add("POST", "/v1/vehicles/{vehicle_id}/location", handle_update_vehicle_location)
 
     # Route: PATCH /v1/vehicles/{vehicle_id}/status
     async def handle_update_vehicle_status(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         veh_id = params["vehicle_id"]
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+
         try:
             raw_data = json.loads(body.decode("utf-8")) if body else {}
         except Exception as e:
@@ -319,7 +413,19 @@ def create_app(
             ]
             return _error_response(400, "VALIDATION_ERROR", "Status update validation failed", details)
 
-        updated = eff_service.update_vehicle_status(veh_id, dto.is_active)
+        def _execute_update_status() -> tuple[Any, Optional[tuple[int, dict[str, str], bytes]]]:
+            veh = eff_service.get_vehicle(veh_id)
+            if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+                if veh.driver_id != auth_ctx.subject_id:
+                    return None, _error_response(
+                        403, "FORBIDDEN", f"Caller is not authorized to update status for vehicle '{veh_id}'"
+                    )
+            updated = eff_service.update_vehicle_status(veh_id, dto.is_active)
+            return updated, None
+
+        updated, err = await asyncio.to_thread(_execute_update_status)
+        if err is not None:
+            return err
         return _json_response(200, updated)
 
     router.add("PATCH", "/v1/vehicles/{vehicle_id}/status", handle_update_vehicle_status)
@@ -328,6 +434,17 @@ def create_app(
     async def handle_dispatch(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        if auth_ctx and auth_ctx.authenticated:
+            if (
+                "admin" not in auth_ctx.roles
+                and "dispatch_operator" not in auth_ctx.roles
+                and "dispatch" not in auth_ctx.roles
+            ):
+                return _error_response(
+                    403, "FORBIDDEN", "Dispatch optimization requires admin or dispatch_operator role"
+                )
+
         try:
             raw_data = json.loads(body.decode("utf-8")) if body else {}
         except Exception as e:
@@ -343,7 +460,7 @@ def create_app(
             return _error_response(400, "VALIDATION_ERROR", "Dispatch input validation failed", details)
 
         header_idemp = headers.get("idempotency-key")
-        result = eff_service.run_dispatch(dto, header_idempotency_key=header_idemp)
+        result = await asyncio.to_thread(eff_service.run_dispatch, dto, header_idempotency_key=header_idemp)
         return _json_response(200, result)
 
     router.add("POST", "/v1/dispatch", handle_dispatch)
@@ -353,10 +470,251 @@ def create_app(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
         ride_id = params["ride_id"]
-        ride = eff_service.get_ride(ride_id)
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+
+        def _execute_get_ride() -> tuple[Any, Optional[tuple[int, dict[str, str], bytes]]]:
+            ride = eff_service.get_ride(ride_id)
+            if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+                is_driver = bool(auth_ctx.subject_id and ride.driver_id == auth_ctx.subject_id)
+                is_passenger = any(
+                    bool(auth_ctx.subject_id and stop.request_id and auth_ctx.subject_id in stop.request_id)
+                    for stop in ride.stops
+                )
+                if not (is_driver or is_passenger):
+                    return None, _error_response(
+                        403, "FORBIDDEN", f"Caller is not authorized to inspect ride '{ride_id}'"
+                    )
+            return ride, None
+
+        ride, err = await asyncio.to_thread(_execute_get_ride)
+        if err is not None:
+            return err
         return _json_response(200, ride)
 
     router.add("GET", "/v1/rides/{ride_id}", handle_get_ride)
+
+    # Route: POST /v1/proposals
+    async def handle_create_proposal(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+            return _error_response(
+                403, "FORBIDDEN", "Manual proposal creation requires admin role"
+            )
+
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        header_idemp = headers.get("idempotency-key")
+        if header_idemp and not raw_data.get("idempotency_token"):
+            raw_data["idempotency_token"] = header_idemp
+
+        try:
+            dto = CreateProposalInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Proposal input validation failed", details)
+
+        proposal = await asyncio.to_thread(eff_service.create_proposal, dto)
+        return _json_response(201, proposal)
+
+    router.add("POST", "/v1/proposals", handle_create_proposal)
+
+    # Route: GET /v1/proposals/{proposal_id}
+    async def handle_get_proposal(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        proposal_id = params["proposal_id"]
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        caller_user_id = headers.get("x-user-id")
+        proposal = await asyncio.to_thread(
+            eff_service.get_proposal, proposal_id, auth_context=auth_ctx, caller_user_id=caller_user_id
+        )
+        return _json_response(200, proposal)
+
+    router.add("GET", "/v1/proposals/{proposal_id}", handle_get_proposal)
+
+    # Route: POST /v1/proposals/{proposal_id}/accept
+    async def handle_accept_proposal(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        proposal_id = params["proposal_id"]
+        raw_data = {}
+        if body:
+            try:
+                raw_data = json.loads(body.decode("utf-8"))
+            except Exception as e:
+                return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        header_idemp = headers.get("idempotency-key")
+        if header_idemp and not raw_data.get("idempotency_token"):
+            raw_data["idempotency_token"] = header_idemp
+
+        header_user = headers.get("x-user-id")
+        if header_user and not raw_data.get("user_id"):
+            raw_data["user_id"] = header_user
+
+        header_role = headers.get("x-role")
+        if header_role and not raw_data.get("role"):
+            raw_data["role"] = header_role
+
+        try:
+            dto = ProposalDecisionInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Proposal decision validation failed", details)
+
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        result = await asyncio.to_thread(
+            eff_service.accept_proposal, proposal_id, dto, auth_context=auth_ctx
+        )
+        return _json_response(200, result)
+
+    router.add("POST", "/v1/proposals/{proposal_id}/accept", handle_accept_proposal)
+
+    # Route: POST /v1/proposals/{proposal_id}/decline
+    async def handle_decline_proposal(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        proposal_id = params["proposal_id"]
+        raw_data = {}
+        if body:
+            try:
+                raw_data = json.loads(body.decode("utf-8"))
+            except Exception as e:
+                return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        header_user = headers.get("x-user-id")
+        if header_user and not raw_data.get("user_id"):
+            raw_data["user_id"] = header_user
+
+        header_role = headers.get("x-role")
+        if header_role and not raw_data.get("role"):
+            raw_data["role"] = header_role
+
+        try:
+            dto = ProposalDecisionInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Proposal decision validation failed", details)
+
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        result = await asyncio.to_thread(
+            eff_service.decline_proposal, proposal_id, dto, auth_context=auth_ctx
+        )
+        return _json_response(200, result)
+
+    router.add("POST", "/v1/proposals/{proposal_id}/decline", handle_decline_proposal)
+
+    # Route: POST /v1/host-rides
+    async def handle_create_host_ride(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        if auth_ctx and auth_ctx.authenticated and "admin" not in auth_ctx.roles:
+            body_driver = raw_data.get("driver_id")
+            if body_driver and body_driver != auth_ctx.subject_id:
+                return _error_response(
+                    403,
+                    "FORBIDDEN",
+                    f"Authenticated user '{auth_ctx.subject_id}' cannot create host ride for driver '{body_driver}'",
+                )
+            raw_data["driver_id"] = auth_ctx.subject_id
+        else:
+            header_user = headers.get("x-user-id")
+            if header_user and not raw_data.get("driver_id"):
+                raw_data["driver_id"] = header_user
+
+        try:
+            dto = CreateHostRideInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Host ride input validation failed", details)
+
+        host_ride = await asyncio.to_thread(eff_service.register_host_ride, dto)
+        return _json_response(201, host_ride)
+
+    router.add("POST", "/v1/host-rides", handle_create_host_ride)
+
+    # Route: GET /v1/host-rides/{ride_id}
+    async def handle_get_host_ride(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        ride_id = params["ride_id"]
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        host_ride = await asyncio.to_thread(eff_service.get_host_ride, ride_id, auth_context=auth_ctx)
+        return _json_response(200, host_ride)
+
+    router.add("GET", "/v1/host-rides/{ride_id}", handle_get_host_ride)
+
+    # Route: POST /v1/host-rides/{ride_id}/match
+    async def handle_match_host_ride(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        ride_id = params["ride_id"]
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        raw_data = {}
+        if body:
+            try:
+                raw_data = json.loads(body.decode("utf-8"))
+            except Exception as e:
+                return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        req_id = raw_data.get("request_id")
+        proposals = await asyncio.to_thread(
+            eff_service.match_host_ride, ride_id, request_id=req_id, auth_context=auth_ctx
+        )
+        return _json_response(200, {"proposals": proposals, "total_matched": len(proposals)})
+
+    router.add("POST", "/v1/host-rides/{ride_id}/match", handle_match_host_ride)
+
+    # Route: POST /v1/rides/{ride_id}/en-route-join
+    async def handle_en_route_join(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        ride_id = params["ride_id"]
+        auth_ctx: Optional[AuthContext] = scope.get("auth")
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        try:
+            dto = EnRouteJoinInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "En-route join input validation failed", details)
+
+        result = await asyncio.to_thread(
+            eff_service.evaluate_en_route_join, ride_id, dto, auth_context=auth_ctx
+        )
+        status_code = 200 if result.eligible else 409
+        return _json_response(status_code, result)
+
+    router.add("POST", "/v1/rides/{ride_id}/en-route-join", handle_en_route_join)
 
     async def asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
         """Standard ASGI 3 entry point."""
@@ -368,7 +726,13 @@ def create_app(
                 message = await receive()
                 msg_type = message.get("type")
                 if msg_type == "lifespan.startup":
-                    await send({"type": "lifespan.startup.complete"})
+                    try:
+                        await asyncio.to_thread(eff_service.open)
+                        await send({"type": "lifespan.startup.complete"})
+                    except Exception as exc:
+                        logger.error("Failed to initialize service during startup: %s", exc, exc_info=True)
+                        await send({"type": "lifespan.startup.failed", "message": str(exc)})
+                        return
                 elif msg_type == "lifespan.shutdown":
                     is_shutting_down = True
                     start_shutdown = time.monotonic()
@@ -380,7 +744,7 @@ def create_app(
                             )
                             break
                         await asyncio.sleep(0.02)
-                    eff_service.close()
+                    await asyncio.to_thread(eff_service.close)
                     await send({"type": "lifespan.shutdown.complete"})
                     return
             return
@@ -431,6 +795,45 @@ def create_app(
                 except Exception:
                     pass
 
+            # CORS origin validation and preflight handling
+            req_origin = headers_dict.get("origin")
+            origin_allowed = False
+            cors_headers: dict[str, str] = {}
+            if req_origin:
+                if "*" in eff_config.cors_allowed_origins:
+                    origin_allowed = True
+                    cors_headers["access-control-allow-origin"] = "*"
+                elif req_origin in eff_config.cors_allowed_origins:
+                    origin_allowed = True
+                    cors_headers["access-control-allow-origin"] = req_origin
+                    cors_headers["vary"] = "Origin"
+
+            if method == "OPTIONS":
+                if origin_allowed:
+                    cors_resp_headers = {
+                        **cors_headers,
+                        "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
+                        "access-control-allow-headers": "authorization, content-type, idempotency-key, x-api-key, x-user-id, x-role",
+                        "access-control-max-age": "86400",
+                        "content-length": "0",
+                    }
+                    header_tuples = [
+                        (k.encode("latin1"), v.encode("latin1")) for k, v in cors_resp_headers.items()
+                    ]
+                    await send({"type": "http.response.start", "status": 204, "headers": header_tuples})
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                    return
+                else:
+                    status, resp_headers, resp_body = _error_response(
+                        403, "CORS_ORIGIN_NOT_ALLOWED", f"Origin '{req_origin}' is not permitted by CORS policy"
+                    )
+                    header_tuples = [
+                        (k.encode("latin1"), v.encode("latin1")) for k, v in resp_headers.items()
+                    ]
+                    await send({"type": "http.response.start", "status": status, "headers": header_tuples})
+                    await send({"type": "http.response.body", "body": resp_body, "more_body": False})
+                    return
+
             # Match route
             handler, path_params, method_mismatch = router.match(method, path)
 
@@ -443,10 +846,11 @@ def create_app(
                     404, "ROUTE_NOT_FOUND", f"Endpoint '{method} {path}' does not exist"
                 )
             else:
-                # Enforce authentication if required
+                # Establish authentication context and enforce if required
+                auth_ctx = eff_auth.authenticate(scope, headers_dict)
+                scope["auth"] = auth_ctx
                 auth_error: Optional[tuple[int, dict[str, str], bytes]] = None
                 if eff_config.require_auth and path not in PUBLIC_HEALTH_PATHS:
-                    auth_ctx = eff_auth.authenticate(scope, headers_dict)
                     if not auth_ctx.authenticated:
                         auth_error = _error_response(
                             401,
@@ -531,6 +935,20 @@ def create_app(
                                 status, resp_headers, resp_body = _error_response(
                                     e.status_code, e.code, e.message, e.details
                                 )
+                            except StorageProviderError as e:
+                                err_str = str(e).lower()
+                                if "exhausted" in err_str or "timeout" in err_str:
+                                    status, resp_headers, resp_body = _error_response(
+                                        503,
+                                        "STORAGE_POOL_EXHAUSTED",
+                                        "Database connection pool exhausted; please retry shortly.",
+                                    )
+                                else:
+                                    status, resp_headers, resp_body = _error_response(
+                                        503,
+                                        "STORAGE_UNAVAILABLE",
+                                        "Database storage provider is currently unavailable.",
+                                    )
                             except Exception as e:
                                 sanitized_detail = sanitize_sensitive_strings(str(e))
                                 logger.error(
@@ -556,6 +974,12 @@ def create_app(
                 duration_ms=duration_ms,
             )
 
+            # Attach CORS response headers if origin is permitted
+            if origin_allowed:
+                for cors_k, cors_v in cors_headers.items():
+                    if cors_k not in resp_headers:
+                        resp_headers[cors_k] = cors_v
+
             # Send ASGI HTTP response
             header_tuples = [
                 (k.encode("latin1"), v.encode("latin1")) for k, v in resp_headers.items()
@@ -578,3 +1002,7 @@ def create_app(
             active_request_count -= 1
 
     return asgi_app
+
+
+# Canonical ASGI module-level entrypoint for standard ASGI servers (e.g. uvicorn engine.service.app:app)
+app = create_app()

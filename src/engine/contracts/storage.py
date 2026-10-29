@@ -123,6 +123,19 @@ class RideStorageProvider(ABC):
         pass
 
     @abstractmethod
+    def record_proposal_acceptance(
+        self,
+        join_request_id: str,
+        is_host: bool,
+        is_traveller: bool,
+    ) -> Optional[tuple[bool, bool]]:
+        """Atomically records participant acceptance (host/traveller) for a proposal.
+
+        Returns (host_accepted, traveller_accepted) if found, or None if not found.
+        """
+        pass
+
+    @abstractmethod
     def acquire_seat_hold_atomic(
         self,
         ride_id: str,

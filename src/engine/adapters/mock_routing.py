@@ -4,6 +4,7 @@ import math
 from typing import Sequence
 
 from engine.contracts.routing import (
+    BoundingBox,
     Coordinate,
     MatrixResult,
     RoadNetworkRoutingProvider,
@@ -22,12 +23,19 @@ class MockRoutingProvider(RoadNetworkRoutingProvider):
         average_speed_kmh: float = 40.0,
         circuity_factor: float = 1.25,
         earth_radius_meters: float = 6371000.0,
+        bounding_box: BoundingBox | None = None,
     ) -> None:
         self.average_speed_kmh = max(1.0, average_speed_kmh)
         self.circuity_factor = max(1.0, circuity_factor)
         self.earth_radius_meters = earth_radius_meters
+        self.bounding_box = bounding_box
         self._speed_mps = (self.average_speed_kmh * 1000.0) / 3600.0
         self._cache: dict[tuple[float, float, float, float], tuple[int, int]] = {}
+
+    def validate_coordinate(self, coord: Coordinate, label: str = "Coordinate") -> None:
+        """Validates that coordinate is within the configured bounding box if present."""
+        if self.bounding_box is not None:
+            self.bounding_box.validate(coord, label)
 
     def _haversine_distance(self, c1: Coordinate, c2: Coordinate) -> float:
         """Computes great-circle distance in meters between two coordinates."""
@@ -48,6 +56,10 @@ class MockRoutingProvider(RoadNetworkRoutingProvider):
         destination: Coordinate
     ) -> tuple[int, int]:
         """Returns deterministic road distance (meters) and duration (seconds)."""
+        if self.bounding_box is not None:
+            self.bounding_box.validate(origin, "Origin")
+            self.bounding_box.validate(destination, "Destination")
+
         key = (origin.latitude, origin.longitude, destination.latitude, destination.longitude)
         if key in self._cache:
             return self._cache[key]

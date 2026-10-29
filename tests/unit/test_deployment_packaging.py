@@ -139,6 +139,16 @@ def test_create_app_zero_arguments() -> None:
         assert resp.json()["status"] == "alive"
 
 
+def test_direct_module_level_app_entrypoint() -> None:
+    """Verifies that the module-level 'app' callable is exported for direct ASGI runners (uvicorn engine.service.app:app)."""
+    from engine.service.app import app
+    client = AsgiTestClient(app)
+    resp = client.get("/v1/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+
 def test_sanitize_dsn_masks_password() -> None:
     dsn = "postgresql://myuser:supersecretpassword@db.prod.internal:5432/pool_db"
     sanitized = sanitize_dsn(dsn)
@@ -181,3 +191,25 @@ def test_smoke_test_detects_unauthorized_failure() -> None:
         # Passing wrong or missing key should trigger failure exit code 1
         exit_code = run_smoke_test(base_url="in-process", api_key=None)
         assert exit_code == 1
+
+
+def test_build_service_requires_persistent_storage() -> None:
+    from engine.service.service import build_service_from_env
+
+    env = {
+        "REQUIRE_PERSISTENT_STORAGE": "true",
+        "DATABASE_URL": "",
+    }
+    with pytest.raises(ValueError, match="Persistent storage is required"):
+        build_service_from_env(env)
+
+
+def test_build_service_requires_real_routing() -> None:
+    from engine.service.service import build_service_from_env
+
+    env = {
+        "REQUIRE_REAL_ROUTING": "true",
+        "OSRM_BASE_URL": "",
+    }
+    with pytest.raises(ValueError, match="Real road network routing is required"):
+        build_service_from_env(env)

@@ -91,6 +91,16 @@ class Ride(BaseModel):
     active_passenger_count: int = Field(default=0, ge=0)
     total_vmt_meters: int = Field(default=0, ge=0)
     version: int = Field(default=1, ge=1)
+    origin_location: GeoCoordinate | None = None
+    destination_location: GeoCoordinate | None = None
+    max_detour_seconds: int | None = None
+    direct_duration_seconds: int | None = None
+    direct_distance_meters: int | None = None
+
+    @property
+    def is_host_ride(self) -> bool:
+        """Indicates whether this ride is a private host's fixed-corridor journey."""
+        return self.destination_location is not None
 
 
 class RideRequest(BaseModel):
@@ -123,6 +133,8 @@ class JoinRequest(BaseModel):
     expires_at: int
     status: JoinStatus = JoinStatus.PENDING
     idempotency_token: str
+    host_accepted: bool = False
+    traveller_accepted: bool = False
 
 
 class MatchResult(BaseModel):
