@@ -135,12 +135,8 @@ Kubernetes and ingress proxies require separate probes to manage pod restart vs.
 
 ### 4.3 Targeted Regional Readiness Probe (`GET /v1/health/readiness?region=<region_id>`)
 - **Semantics:** Allows regional traffic routers (e.g. AWS ALB / Cloudflare Worker / NGINX) to route traffic to the pool engine for Market A even if Market B is degraded.
-- **Behavior:**
-  ```http
-  GET /v1/health/readiness?region=us-nyc-manhattan HTTP/1.1
-  Host: pool-engine:8000
-  ```
-  Returns:
+- **Operational Verification (Phase 7):**
+  With both Manhattan (port 5000) and Kerala (port 5001) active, probing either region returns HTTP 200:
   ```json
   {
     "ready": true,
@@ -148,15 +144,27 @@ Kubernetes and ingress proxies require separate probes to manage pod restart vs.
     "components": {
       "storage": "healthy",
       "routing": "healthy",
-      "target_region": "us-nyc-manhattan",
+      "target_region": "in-kl-tvm",
       "regions": {
-        "us-nyc-manhattan": { "healthy": true, "provider_type": "osrm", ... },
-        "in-kl-tvm": { "healthy": false, "provider_type": "osrm", ... }
+        "us-nyc-manhattan": {
+          "healthy": true,
+          "provider_type": "osrm",
+          "dataset_id": "manhattan-car-ch",
+          "endpoint_url": "http://127.0.0.1:5000",
+          "profile": "driving"
+        },
+        "in-kl-tvm": {
+          "healthy": true,
+          "provider_type": "osrm",
+          "dataset_id": "kerala-car-ch",
+          "endpoint_url": "http://127.0.0.1:5001",
+          "profile": "driving"
+        }
       }
     }
   }
   ```
-  HTTP Status: **200 OK** (Ready for Manhattan traffic).
+  HTTP Status: **200 OK** (Verified via automated test suite `tests/integration/test_osrm_regional_boundaries.py`).
 
 ---
 

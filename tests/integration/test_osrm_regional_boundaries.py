@@ -38,6 +38,13 @@ MANHATTAN_BBOX = BoundingBox(
     max_lon=-73.9000,
 )
 
+KERALA_BBOX = BoundingBox(
+    min_lat=8.1800,
+    min_lon=76.8000,
+    max_lat=8.6500,
+    max_lon=77.0500,
+)
+
 
 def _is_port_open(host: str, port: int) -> bool:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -54,20 +61,41 @@ def _is_port_open(host: str, port: int) -> bool:
 # 1. Kerala OSRM Availability Verification
 # ===========================================================================
 
-def test_kerala_osrm_port_5001_status_is_blocked() -> None:
+def test_kerala_osrm_port_5001_status_and_live_routing() -> None:
     """
-    Verifies the operational availability of the Kerala OSRM service on port 5001.
-    Per Phase 3 specifications, if port 5001 is inactive or dataset is absent,
-    real Kerala routing verification must be formally documented as BLOCKED
-    without downloading external map data.
+    Verifies operational availability and routing correctness of the Kerala OSRM service on port 5001.
+    When port 5001 is active, verifies real road-network routing within Thiruvananthapuram.
     """
     is_open = _is_port_open("127.0.0.1", 5001)
     if not is_open:
-        # Expected: port 5001 is offline in this environment
         pytest.skip(
             "Kerala OSRM service on port 5001 is unavailable. "
             "Real Kerala routing verification is safely marked BLOCKED pending dataset provision."
         )
+
+    adapter = OsrmRoutingAdapter(
+        base_url="http://127.0.0.1:5001",
+        bounding_box=KERALA_BBOX,
+        max_snap_distance_meters=5000.0,
+    )
+
+    # 1. Short Route: Secretariat area to Central Railway Station
+    dist, dur = adapter.get_direct_leg(KERALA_TVM_ORIGIN, KERALA_TVM_DEST)
+    assert 5000 < dist < 12000  # ~8.7 km
+    assert 400 < dur < 1800     # ~10-15 min
+
+    # 2. Long Route: Kovalam to Technopark
+    kovalam = Coordinate(latitude=8.4000, longitude=76.9780)
+    technopark = Coordinate(latitude=8.5560, longitude=76.8820)
+    dist_long, dur_long = adapter.get_direct_leg(kovalam, technopark)
+    assert 18000 < dist_long < 30000  # ~23.4 km
+    assert 1000 < dur_long < 3000     # ~25-35 min
+
+    # 3. Reject Manhattan coordinates on Kerala instance
+    with pytest.raises(OutOfRegionError, match=r"outside regional bounding box"):
+        adapter.get_direct_leg(MANHATTAN_TIMES_SQUARE, KERALA_TVM_DEST)
+
+    adapter.close()
 
 
 # ===========================================================================
@@ -208,3 +236,90 @@ def test_api_rejects_out_of_region_request_with_rfc7807_error() -> None:
     assert host_data["error"]["code"] == "OUT_OF_REGION"
 
     router.close()
+
+
+@pytest.mark.skipif(
+    not (_is_port_open("127.0.0.1", 5000) and _is_port_open("127.0.0.1", 5001)),
+    reason="Both Manhattan (port 5000) and Kerala (port 5001) live OSRM daemons required",
+)
+def test_live_multi_region_concurrent_routing_and_isolation() -> None:
+    """
+    Verifies multi-region routing isolation, concurrent dispatch handling,
+    and cross-region rejection across simultaneously active Manhattan and Kerala OSRM instances.
+    """
+    env = {
+        "ROUTING_REGIONS_FILE": "config/regions.json",
+        "REQUIRE_REAL_ROUTING": "true",
+    }
+    service = build_service_from_env(env)
+    app = create_app(service)
+    client = AsgiTestClient(app)
+
+    # 1. Readiness probe across all regions
+    ready_resp = client.get("/v1/health/readiness")
+    assert ready_resp.status_code == 200
+    ready_data = ready_resp.json()
+    assert ready_data["ready"] is True
+    regions = ready_data["components"]["regions"]
+    assert regions["us-nyc-manhattan"]["healthy"] is True
+    assert regions["in-kl-tvm"]["healthy"] is True
+
+    # 2. Targeted readiness probe for in-kl-tvm
+    ready_kl = client.get("/v1/health/readiness?region=in-kl-tvm")
+    assert ready_kl.status_code == 200
+    assert ready_kl.json()["components"]["target_region"] == "in-kl-tvm"
+
+    # 3. Targeted readiness probe for us-nyc-manhattan
+    ready_nyc = client.get("/v1/health/readiness?region=us-nyc-manhattan")
+    assert ready_nyc.status_code == 200
+    assert ready_nyc.json()["components"]["target_region"] == "us-nyc-manhattan"
+
+    # 4. In-region Manhattan request
+    nyc_resp = client.post(
+        "/v1/requests",
+        json={
+            "request_id": "req-live-nyc-001",
+            "user_id": "rider-nyc-1",
+            "pickup_location": {"latitude": 40.7580, "longitude": -73.9855},
+            "dropoff_location": {"latitude": 40.7070, "longitude": -74.0090},
+            "seat_count": 1,
+            "earliest_pickup_time": 1700000000,
+            "latest_dropoff_time": 1700003600,
+        },
+    )
+    assert nyc_resp.status_code == 201
+    assert nyc_resp.json()["direct_distance_meters"] > 7000
+
+    # 5. In-region Kerala request
+    kl_resp = client.post(
+        "/v1/requests",
+        json={
+            "request_id": "req-live-kl-001",
+            "user_id": "rider-kl-1",
+            "pickup_location": {"latitude": 8.4000, "longitude": 76.9780},
+            "dropoff_location": {"latitude": 8.4875, "longitude": 76.9528},
+            "seat_count": 1,
+            "earliest_pickup_time": 1700000000,
+            "latest_dropoff_time": 1700003600,
+        },
+    )
+    assert kl_resp.status_code == 201
+    assert kl_resp.json()["direct_distance_meters"] > 10000
+
+    # 6. Cross-region request (NYC pickup, Kerala dropoff)
+    cross_resp = client.post(
+        "/v1/requests",
+        json={
+            "request_id": "req-cross-region-001",
+            "user_id": "rider-cross-1",
+            "pickup_location": {"latitude": 40.7580, "longitude": -73.9855},
+            "dropoff_location": {"latitude": 8.4875, "longitude": 76.9528},
+            "seat_count": 1,
+            "earliest_pickup_time": 1700000000,
+            "latest_dropoff_time": 1700003600,
+        },
+    )
+    assert cross_resp.status_code == 400
+    assert cross_resp.json()["error"]["code"] == "OUT_OF_REGION"
+
+    service.close()

@@ -85,7 +85,7 @@ Internal connection strings, database passwords, and filesystem stack traces are
 3. Ingress load balancers querying `/v1/health/readiness?region=in-kl-tvm` receive HTTP 503 and shift Kerala traffic to failover or return a clean outage notification.
 4. **Recovery Action:** Restart Kerala OSRM daemon:
    ```powershell
-   & "C:\Users\shaha\AppData\Local\osrm_portable\osrm-v26.10.0-win32-x64-Release\osrm-routed.exe" `
+   & "C:\Users\shaha\AppData\Local\osrm_portable\osrm-routed-kerala.exe" `
      -a CH -p 5001 -t 4 "C:\Users\shaha\AppData\Local\osrm_portable\kerala.osrm"
    ```
 5. Probing `/v1/health/readiness?region=in-kl-tvm` automatically flips back to HTTP 200 without requiring an application restart.
