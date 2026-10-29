@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 from typing import Any, Awaitable, Callable, Optional, Pattern
 from pydantic import ValidationError as PydanticValidationError
 
@@ -168,10 +169,15 @@ def create_app(
     async def handle_readiness(
         scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
+        query_string = scope.get("query_string", b"").decode("utf-8")
+        query_params = urllib.parse.parse_qs(query_string)
+        target_region = query_params.get("region", [None])[0]
+
         readiness = await asyncio.to_thread(
             eff_service.check_readiness,
             strict_routing=eff_config.strict_routing_readiness,
             require_persistent_storage=eff_config.require_persistent_storage,
+            region_id=target_region,
         )
         status_code = 200 if readiness.get("ready") else 503
         return _json_response(status_code, readiness)

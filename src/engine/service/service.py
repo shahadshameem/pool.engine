@@ -85,12 +85,14 @@ class PoolEngineService:
         self,
         strict_routing: bool = False,
         require_persistent_storage: bool = False,
+        region_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Operational readiness probe verifying persistent storage and routing readiness.
         Storage failure is an essential dependency outage and marks ready=False (503).
         Routing outages are reported as degraded without making the entire service unready
         unless strict_routing=True.
+        If region_id is provided, verifies routing readiness specifically for that target region.
         Sanitizes connection strings so passwords or internal credentials are never leaked.
         """
         storage_status = "healthy"
@@ -112,7 +114,17 @@ class PoolEngineService:
         routing_status = "healthy"
         routing_error = None
         try:
-            if hasattr(self.router, "check_health"):
+            if region_id is not None and hasattr(self.router, "get_provider"):
+                try:
+                    regional_provider = self.router.get_provider(region_id)
+                    is_healthy = regional_provider.check_health()
+                    if not is_healthy:
+                        routing_status = "degraded"
+                        routing_error = f"Routing backend for region '{region_id}' is unhealthy"
+                except KeyError:
+                    routing_status = "degraded"
+                    routing_error = f"Target region '{region_id}' is not configured"
+            elif hasattr(self.router, "check_health"):
                 is_healthy = self.router.check_health()
                 if not is_healthy:
                     routing_status = "degraded"
@@ -129,6 +141,8 @@ class PoolEngineService:
             "storage": storage_status,
             "routing": routing_status,
         }
+        if region_id is not None:
+            components["target_region"] = region_id
         if storage_error:
             components["storage_error"] = storage_error
         if routing_error:
@@ -1082,6 +1096,33 @@ class PoolEngineService:
         orig_c = Coordinate(latitude=input_data.origin.latitude, longitude=input_data.origin.longitude)
         dest_c = Coordinate(latitude=input_data.destination.latitude, longitude=input_data.destination.longitude)
         try:
+            self.router.validate_coordinate(orig_c, "Host origin")
+            self.router.validate_coordinate(dest_c, "Host destination")
+            if hasattr(self.router, "find_region_for_coordinate"):
+                reg_orig = self.router.find_region_for_coordinate(orig_c)
+                reg_dest = self.router.find_region_for_coordinate(dest_c)
+                if input_data.region_id is not None:
+                    if reg_orig is None or reg_orig.region_id != input_data.region_id:
+                        raise OutOfRegionServiceError(
+                            f"Host origin coordinate ({orig_c.latitude}, {orig_c.longitude}) "
+                            f"does not match declared region '{input_data.region_id}'"
+                        )
+                    if reg_dest is None or reg_dest.region_id != input_data.region_id:
+                        raise OutOfRegionServiceError(
+                            f"Host destination coordinate ({dest_c.latitude}, {dest_c.longitude}) "
+                            f"does not match declared region '{input_data.region_id}'"
+                        )
+                if reg_orig is not None and reg_dest is not None and reg_orig.region_id != reg_dest.region_id:
+                    raise OutOfRegionServiceError(
+                        f"Cross-region journey from '{reg_orig.region_id}' to '{reg_dest.region_id}' is unsupported"
+                    )
+        except OutOfRegionError as err:
+            self.telemetry.record_routing_failure("router", "out_of_region")
+            raise OutOfRegionServiceError(
+                f"Requested host ride coordinates fall outside operational service region: {err}"
+            ) from err
+
+        try:
             direct_leg = self.router.get_direct_leg(orig_c, dest_c)
         except OutOfRegionError as err:
             self.telemetry.record_routing_failure("router", "out_of_region")
@@ -1248,6 +1289,26 @@ class PoolEngineService:
             requests_to_evaluate.append(req)
         else:
             pending = self.storage.get_pending_requests()
+            if hasattr(self.router, "find_region_for_coordinate"):
+                host_loc = ride.origin_location or vehicle.current_location
+                host_reg = self.router.find_region_for_coordinate(
+                    Coordinate(host_loc.latitude, host_loc.longitude)
+                )
+                if host_reg is not None:
+                    pending = [
+                        r
+                        for r in pending
+                        if (
+                            self.router.find_region_for_coordinate(
+                                Coordinate(r.pickup_location.latitude, r.pickup_location.longitude)
+                            )
+                            is not None
+                            and self.router.find_region_for_coordinate(
+                                Coordinate(r.pickup_location.latitude, r.pickup_location.longitude)
+                            ).region_id
+                            == host_reg.region_id
+                        )
+                    ]
             requests_to_evaluate.extend(pending)
 
         created_proposals: list[ProposalDTO] = []
@@ -1399,19 +1460,24 @@ def build_service_from_env(env: Optional[Mapping[str, str]] = None) -> PoolEngin
 
         storage = InMemoryRideStorage()
 
+    cfg = ServiceConfig.from_env(source)
+    is_multi_region = bool(
+        cfg.regions
+        and ("ROUTING_REGIONS" in source or "ROUTING_REGIONS_FILE" in source or len(cfg.regions) > 1)
+    )
+
     osrm_url = source.get("OSRM_BASE_URL")
     require_real_routing = (
         source.get("REQUIRE_REAL_ROUTING", "").lower().strip() in ("true", "1", "yes")
     )
-    if require_real_routing and not osrm_url:
+    if require_real_routing and not is_multi_region and not osrm_url:
         raise ValueError(
             "Real road network routing is required (REQUIRE_REAL_ROUTING=true), but OSRM_BASE_URL is not set."
         )
 
     timeout_raw = source.get("ROUTING_TIMEOUT_SECONDS")
     timeout_seconds = float(timeout_raw) if timeout_raw else 0.500
-    cfg = ServiceConfig.from_env(source)
-    if cfg.regions and ("ROUTING_REGIONS" in source or "ROUTING_REGIONS_FILE" in source or len(cfg.regions) > 1):
+    if is_multi_region:
         from engine.adapters.regional_router import RegionalRoutingRouter
 
         regional_router = RegionalRoutingRouter(regions=cfg.regions)

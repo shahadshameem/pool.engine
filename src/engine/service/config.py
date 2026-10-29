@@ -219,12 +219,13 @@ class ServiceConfig(BaseModel):
         raw_regions = source.get("ROUTING_REGIONS")
         if not raw_regions and "ROUTING_REGIONS_FILE" in source:
             file_path = source["ROUTING_REGIONS_FILE"].strip()
-            if os.path.exists(file_path):
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        raw_regions = f.read()
-                except Exception as err:
-                    raise ValueError(f"Failed to read ROUTING_REGIONS_FILE '{file_path}': {err}") from err
+            if not os.path.exists(file_path):
+                raise ValueError(f"Configured ROUTING_REGIONS_FILE '{file_path}' does not exist")
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    raw_regions = f.read()
+            except Exception as err:
+                raise ValueError(f"Failed to read ROUTING_REGIONS_FILE '{file_path}': {err}") from err
 
         if raw_regions and raw_regions.strip():
             try:
