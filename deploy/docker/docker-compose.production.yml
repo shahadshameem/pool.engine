@@ -1,0 +1,132 @@
+# ==============================================================================
+# Pool Engine — Production Compose Specification (Contabo VPS / Linux)
+# ==============================================================================
+# Dedicated production multi-container deployment for Kerala Pilot (in-kl-tvm).
+# Coordinates Pool Engine API (multi-worker), PostgreSQL 16, and Kerala OSRM.
+# ==============================================================================
+
+version: "3.8"
+
+networks:
+  poolengine-prod-net:
+    driver: bridge
+    internal: false
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Database: PostgreSQL 16 Alpine
+  # ---------------------------------------------------------------------------
+  postgres-production:
+    image: postgres:16-alpine
+    container_name: pool-engine-prod-postgres
+    restart: unless-stopped
+    networks:
+      - poolengine-prod-net
+    environment:
+      POSTGRES_DB: pool_engine_prod
+      POSTGRES_USER: pool_prod_user
+      POSTGRES_PASSWORD: ${PRODUCTION_DB_PASSWORD:?PRODUCTION_DB_PASSWORD is required}
+    volumes:
+      - pgdata_production:/var/lib/postgresql/data
+      - ../../src/engine/adapters/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pool_prod_user -d pool_engine_prod"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1536M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # 2. Routing Engine: Kerala OSRM Backend (Internal Port 5000)
+  # ---------------------------------------------------------------------------
+  osrm-kerala:
+    image: osrm/osrm-backend:v5.27.1
+    container_name: pool-engine-prod-osrm-kerala
+    restart: unless-stopped
+    networks:
+      - poolengine-prod-net
+    volumes:
+      - osrm_kerala_data:/data:ro
+    command: osrm-routed --algorithm ch -t 4 /data/kerala.osrm
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:5000/nearest/v1/driving/76.9366,8.5241?number=1' > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+        reservations:
+          cpus: "0.5"
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
+  # 3. Core Engine: Pool Engine ASGI API (Multi-Worker Uvicorn)
+  # ---------------------------------------------------------------------------
+  pool-engine-api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: pool-engine-prod-api
+    restart: unless-stopped
+    networks:
+      - poolengine-prod-net
+    command: ["uvicorn", "engine.service.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    ports:
+      # Expose only to localhost loopback for host reverse proxy (Caddy/Coolify)
+      - "127.0.0.1:8000:8000"
+    environment:
+      ENVIRONMENT: production
+      SERVICE_HOST: "0.0.0.0"
+      SERVICE_PORT: "8000"
+      DATABASE_URL: "postgresql://pool_prod_user:${PRODUCTION_DB_PASSWORD}@postgres-production:5432/pool_engine_prod"
+      REQUIRE_PERSISTENT_STORAGE: "true"
+      REQUIRE_REAL_ROUTING: "true"
+      ROUTING_REGIONS_FILE: "config/regions.production.json"
+      STRICT_ROUTING_READINESS: "true"
+      DB_POOL_MIN_SIZE: "2"
+      DB_POOL_MAX_SIZE: "20"
+      DB_POOL_TIMEOUT_SECONDS: "10.0"
+      ROUTING_TIMEOUT_SECONDS: "0.500"
+      AUTH_ENABLED: "${AUTH_ENABLED:-true}"
+      FIREBASE_PROJECT_ID: "${FIREBASE_PROJECT_ID:-waymate-v3}"
+      API_KEYS: "${API_KEYS:-}"
+      MASK_COORDINATES_IN_LOGS: "true"
+      ENABLE_TELEMETRY: "true"
+      MAX_BATCH_SIZE: "500"
+      DEFAULT_DISPATCH_TIMEOUT_SECONDS: "0.500"
+      SHUTDOWN_TIMEOUT_SECONDS: "5.0"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-https://waymate.in,https://app.waymate.in}"
+    depends_on:
+      postgres-production:
+        condition: service_healthy
+      osrm-kerala:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health/liveness')\" || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+volumes:
+  pgdata_production:
+    name: pool_engine_pgdata_prod
+  osrm_kerala_data:
+    name: pool_engine_osrm_kerala_data

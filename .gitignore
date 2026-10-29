@@ -70,6 +70,7 @@ yarn-error.log*
 .env.*
 !.env.example
 !.env.staging.example
+!.env.production.example
 
 # OS artifacts
 .DS_Store
