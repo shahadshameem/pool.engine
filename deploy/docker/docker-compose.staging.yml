@@ -1,0 +1,132 @@
+# ==============================================================================
+# Pool Engine — Multi-Region Containerized Staging Deployment
+# ==============================================================================
+# Fully isolated, reproducible multi-region staging environment for Linux/CI/Cloud.
+# Coordinates Pool Engine API, PostgreSQL 16, Manhattan OSRM, and Kerala OSRM.
+# ==============================================================================
+
+version: "3.8"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Database: PostgreSQL 16
+  # ---------------------------------------------------------------------------
+  postgres-staging:
+    image: postgres:16-alpine
+    container_name: pool-engine-staging-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pool_engine_staging
+      POSTGRES_USER: pool_staging_user
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:-staging_insecure_development_password}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata_staging:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pool_staging_user -d pool_engine_staging"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Routing Engine: Manhattan OSRM Backend (Port 5000)
+  # ---------------------------------------------------------------------------
+  osrm-manhattan:
+    image: osrm/osrm-backend:v5.27.1
+    container_name: pool-engine-staging-osrm-manhattan
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./osrm-data/manhattan:/data:ro
+    command: osrm-routed --algorithm ch -t 4 /data/manhattan.osrm
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5000 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Routing Engine: Kerala OSRM Backend (Port 5001)
+  # ---------------------------------------------------------------------------
+  osrm-kerala:
+    image: osrm/osrm-backend:v5.27.1
+    container_name: pool-engine-staging-osrm-kerala
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:5000"
+    volumes:
+      - ./osrm-data/kerala:/data:ro
+    command: osrm-routed --algorithm ch -t 4 /data/kerala.osrm
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5000 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Core Service: Pool Engine ASGI API (Port 8000)
+  # ---------------------------------------------------------------------------
+  pool-engine-api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    container_name: pool-engine-staging-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      ENVIRONMENT: staging
+      SERVICE_HOST: "0.0.0.0"
+      SERVICE_PORT: "8000"
+      DATABASE_URL: "postgresql://pool_staging_user:${STAGING_DB_PASSWORD:-staging_insecure_development_password}@postgres-staging:5432/pool_engine_staging"
+      REQUIRE_PERSISTENT_STORAGE: "true"
+      REQUIRE_REAL_ROUTING: "true"
+      ROUTING_REGIONS_FILE: "config/regions.staging.json"
+      STRICT_ROUTING_READINESS: "false"
+      DB_POOL_MIN_SIZE: "2"
+      DB_POOL_MAX_SIZE: "20"
+      DB_POOL_TIMEOUT_SECONDS: "10.0"
+      ROUTING_TIMEOUT_SECONDS: "0.500"
+      AUTH_ENABLED: "false"
+      MASK_COORDINATES_IN_LOGS: "true"
+      ENABLE_TELEMETRY: "true"
+      MAX_BATCH_SIZE: "500"
+      DEFAULT_DISPATCH_TIMEOUT_SECONDS: "0.500"
+      SHUTDOWN_TIMEOUT_SECONDS: "5.0"
+    depends_on:
+      postgres-staging:
+        condition: service_healthy
+      osrm-manhattan:
+        condition: service_healthy
+      osrm-kerala:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health/liveness')\" || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+volumes:
+  pgdata_staging:
