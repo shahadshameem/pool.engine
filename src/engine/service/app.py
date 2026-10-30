@@ -35,6 +35,10 @@ from engine.service.schemas import (
     UpdateLocationInput,
     UpdateVehicleLocationInput,
     UpdateVehicleStatusInput,
+    UpdateVehicleCapacityInput,
+    SyncRideCapacityInput,
+    ReconcileRideInput,
+    ReconcileBatchInput,
 )
 from engine.service.security import (
     AuthContext,
@@ -435,6 +439,119 @@ def create_app(
         return _json_response(200, updated)
 
     router.add("PATCH", "/v1/vehicles/{vehicle_id}/status", handle_update_vehicle_status)
+
+    # Route: PATCH /v1/vehicles/{vehicle_id}/capacity
+    async def handle_update_vehicle_capacity(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        veh_id = params["vehicle_id"]
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        try:
+            dto = UpdateVehicleCapacityInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Vehicle capacity validation failed", details)
+
+        updated = await asyncio.to_thread(eff_service.update_vehicle_capacity, veh_id, dto.total_seat_capacity)
+        return _json_response(200, updated)
+
+    router.add("PATCH", "/v1/vehicles/{vehicle_id}/capacity", handle_update_vehicle_capacity)
+
+    # Route: POST & PATCH /v1/rides/{ride_id}/capacity and /v1/rides/{ride_id}/sync-capacity
+    async def handle_sync_ride_capacity(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        ride_id = params["ride_id"]
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        try:
+            dto = SyncRideCapacityInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Sync capacity validation failed", details)
+
+        idem_token = dto.idempotency_token or headers.get("idempotency-key")
+        result = await asyncio.to_thread(
+            eff_service.sync_ride_capacity,
+            ride_id,
+            dto.available_seats,
+            dto.version,
+            idem_token,
+        )
+        if result.get("rejected"):
+            return _error_response(409, "STALE_VERSION", result.get("message", "Stale sync version rejected"))
+        return _json_response(200, result)
+
+    router.add("PATCH", "/v1/rides/{ride_id}/capacity", handle_sync_ride_capacity)
+    router.add("POST", "/v1/rides/{ride_id}/sync-capacity", handle_sync_ride_capacity)
+
+    # Route: POST /v1/rides/{ride_id}/reconcile
+    async def handle_reconcile_ride(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        ride_id = params["ride_id"]
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        raw_data["ride_id"] = ride_id
+        try:
+            dto = ReconcileRideInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Reconcile input validation failed", details)
+
+        idem_token = dto.idempotency_token or headers.get("idempotency-key")
+        eff_dto = dto.model_copy(update={"idempotency_token": idem_token})
+        result = await asyncio.to_thread(eff_service.reconcile_ride, eff_dto)
+        if result.get("rejected"):
+            return _error_response(409, "STALE_VERSION", result.get("message", "Stale reconciliation rejected"))
+        return _json_response(200, result)
+
+    router.add("POST", "/v1/rides/{ride_id}/reconcile", handle_reconcile_ride)
+
+    # Route: POST /v1/reconcile/batch
+    async def handle_reconcile_batch(
+        scope: Scope, body: bytes, headers: dict[str, str], params: dict[str, str]
+    ) -> tuple[int, dict[str, str], bytes]:
+        try:
+            raw_data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return _error_response(400, "VALIDATION_ERROR", f"Malformed JSON payload: {e}")
+
+        try:
+            dto = ReconcileBatchInput.model_validate(raw_data)
+        except PydanticValidationError as e:
+            details = [
+                ErrorDetail(field=".".join(str(loc) for loc in err["loc"]), issue=err["msg"])
+                for err in e.errors()
+            ]
+            return _error_response(400, "VALIDATION_ERROR", "Batch reconcile input validation failed", details)
+
+        results = []
+        for ride_input in dto.rides:
+            res = await asyncio.to_thread(eff_service.reconcile_ride, ride_input)
+            results.append(res)
+        return _json_response(200, {"reconciled_count": len(results), "results": results})
+
+    router.add("POST", "/v1/reconcile/batch", handle_reconcile_batch)
 
     # Route: POST /v1/dispatch
     async def handle_dispatch(

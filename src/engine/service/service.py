@@ -47,6 +47,7 @@ from engine.service.schemas import (
     ProposalDTO,
     ProposalDecisionInput,
     ProposalDecisionResult,
+    ReconcileRideInput,
     RegisterVehicleInput,
     StaleAssignmentDiagnosticResponse,
     UpdateVehicleLocationInput,
@@ -73,6 +74,9 @@ class PoolEngineService:
         self.router = router
         self.telemetry: EngineTelemetryProvider = telemetry or StructuredLoggerTelemetry()
         self._dispatch_cache: dict[str, DispatchCycleResponse] = {}
+        self._capacity_sync_versions: dict[str, int] = {}
+        self._capacity_idempotency_tokens: set[str] = set()
+        self._pending_capacities: dict[str, dict[str, Any]] = {}
 
     def open(self) -> None:
         """Initializes and pre-warms underlying storage pools and routing transports."""
@@ -450,11 +454,8 @@ class PoolEngineService:
 
         existing = self.storage.get_vehicle(input_data.vehicle_id)
         if existing is not None:
-            if (
-                existing.driver_id == input_data.driver_id
-                and existing.total_seat_capacity == input_data.total_seat_capacity
-                and existing.luggage_capacity_units == input_data.luggage_capacity_units
-            ):
+            if existing.driver_id == input_data.driver_id:
+                # Same vehicle and driver: idempotent hit, retain current synchronized capacity
                 self.telemetry.record_idempotency_hit(input_data.vehicle_id, "register_vehicle")
                 return existing
             self.telemetry.record_conflict("vehicle_duplicate", input_data.vehicle_id)
@@ -462,10 +463,14 @@ class PoolEngineService:
                 f"Vehicle '{input_data.vehicle_id}' already registered with different configuration"
             )
 
+        eff_capacity = input_data.total_seat_capacity
+        if input_data.vehicle_id in self._pending_capacities:
+            eff_capacity = self._pending_capacities[input_data.vehicle_id]["available_seats"]
+
         new_vehicle = Vehicle(
             vehicle_id=input_data.vehicle_id,
             driver_id=input_data.driver_id,
-            total_seat_capacity=input_data.total_seat_capacity,
+            total_seat_capacity=eff_capacity,
             current_location=input_data.current_location,
             is_active=input_data.is_active,
             luggage_capacity_units=input_data.luggage_capacity_units,
@@ -542,6 +547,118 @@ class PoolEngineService:
         self.storage.save_vehicle(updated)
         return updated
 
+    def update_vehicle_capacity(self, vehicle_id: str, total_seat_capacity: int) -> Vehicle:
+        """Updates the total passenger seat capacity of an existing vehicle."""
+        veh = self.get_vehicle(vehicle_id)
+        updated = veh.model_copy(update={"total_seat_capacity": max(0, total_seat_capacity)})
+        self.storage.save_vehicle(updated)
+        return updated
+
+    def sync_ride_capacity(
+        self,
+        ride_id: str,
+        available_seats: int,
+        version: Optional[int] = None,
+        idempotency_token: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Reconciles authoritative Firestore available seats with Pool Engine state.
+        Updates vehicle seat capacity and ride operational status if full.
+        Enforces monotonic version validation and idempotency tokens to prevent
+        outdated or duplicated synchronization requests from overwriting newer capacity.
+        """
+        if idempotency_token and idempotency_token in self._capacity_idempotency_tokens:
+            return {
+                "synced": True,
+                "ride_id": ride_id,
+                "available_seats": available_seats,
+                "idempotent_replay": True,
+                "message": "Capacity update already processed (idempotent hit)",
+            }
+
+        last_ver = self._capacity_sync_versions.get(ride_id, 0)
+        if version is not None and version < last_ver:
+            return {
+                "synced": False,
+                "rejected": True,
+                "reason": "stale_version",
+                "current_version": last_ver,
+                "received_version": version,
+                "message": f"Sync rejected: received version {version} is older than current version {last_ver}",
+            }
+
+        ride = self.storage.get_ride(ride_id)
+        if ride is not None:
+            if ride.vehicle_id:
+                veh = self.storage.get_vehicle(ride.vehicle_id)
+                if veh is not None:
+                    updated_veh = veh.model_copy(update={"total_seat_capacity": max(0, available_seats)})
+                    self.storage.save_vehicle(updated_veh)
+            new_status = RideStatus.FULL if available_seats == 0 and ride.status == RideStatus.ACTIVE else ride.status
+            updated_ride = ride.model_copy(update={"status": new_status})
+            self.storage.save_ride(updated_ride)
+
+            if version is not None:
+                self._capacity_sync_versions[ride_id] = version
+            if idempotency_token:
+                self._capacity_idempotency_tokens.add(idempotency_token)
+
+            return {
+                "synced": True,
+                "ride_id": ride_id,
+                "available_seats": available_seats,
+                "status": new_status.value,
+                "version": version or last_ver,
+            }
+
+        veh = self.storage.get_vehicle(ride_id)
+        if veh is not None:
+            updated_veh = veh.model_copy(update={"total_seat_capacity": max(0, available_seats)})
+            self.storage.save_vehicle(updated_veh)
+
+            if version is not None:
+                self._capacity_sync_versions[ride_id] = version
+            if idempotency_token:
+                self._capacity_idempotency_tokens.add(idempotency_token)
+
+            return {
+                "synced": True,
+                "vehicle_id": ride_id,
+                "total_seat_capacity": max(0, available_seats),
+                "version": version or last_ver,
+            }
+
+        # Neither ride nor vehicle in storage yet: buffer capacity for when it is registered or queried
+        if version is not None:
+            self._capacity_sync_versions[ride_id] = version
+        if idempotency_token:
+            self._capacity_idempotency_tokens.add(idempotency_token)
+        self._pending_capacities[ride_id] = {
+            "available_seats": max(0, available_seats),
+            "version": version or last_ver,
+            "idempotency_token": idempotency_token,
+        }
+        return {
+            "synced": True,
+            "buffered": True,
+            "ride_id": ride_id,
+            "available_seats": max(0, available_seats),
+            "version": version or last_ver,
+            "message": f"Capacity update buffered for uninitialized ride/vehicle '{ride_id}'",
+        }
+
+    def reconcile_ride(self, input_data: ReconcileRideInput) -> dict[str, Any]:
+        """
+        Authoritatively reconciles a ride's available seats from Firestore.
+        Ensures monotonic version protection and idempotency.
+        """
+        return self.sync_ride_capacity(
+            ride_id=input_data.ride_id,
+            available_seats=input_data.available_seats,
+            version=input_data.version,
+            idempotency_token=input_data.idempotency_token,
+        )
+
     def run_dispatch(
         self,
         input_data: DispatchRunInput,
@@ -551,6 +668,9 @@ class PoolEngineService:
         Executes a bounded batch optimization cycle via DispatchOrchestrator.
         Enforces idempotency token consistency and returns structured match results.
         """
+        if input_data.authoritative_capacities:
+            for cap in input_data.authoritative_capacities:
+                self.reconcile_ride(cap)
         if header_idempotency_key is not None and input_data.idempotency_token is not None:
             if header_idempotency_key != input_data.idempotency_token:
                 raise ValidationError(

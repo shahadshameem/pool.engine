@@ -1,0 +1,56 @@
+{
+  "total_requests": 1000,
+  "achieved_rps": 460.5264369865021,
+  "elapsed_seconds": 2.171427999972366,
+  "status_distribution": {
+    "200": 453,
+    "400": 97,
+    "201": 450
+  },
+  "valid_routes_success_count": 903,
+  "rejected_routes_count": 97,
+  "server_errors_or_timeouts": 0,
+  "error_rate_pct": 0.0,
+  "latency_valid_routes_ms": {
+    "count": 903,
+    "mean": 194.95191007781906,
+    "p50": 207.17419998254627,
+    "p95": 235.4470998980105,
+    "p99": 247.19220004044473,
+    "max": 251.46279996261
+  },
+  "latency_rejected_routes_ms": {
+    "count": 97,
+    "mean": 189.1825855685609,
+    "p50": 205.0878000445664,
+    "p95": 232.67249995842576,
+    "p99": 251.83630001265556,
+    "max": 251.83630001265556
+  },
+  "regions": {
+    "us-nyc-manhattan": {
+      "valid_count": 472,
+      "latency_ms": {
+        "count": 472,
+        "mean": 196.81963008424952,
+        "p50": 207.07399997627363,
+        "p95": 234.95539999566972,
+        "p99": 246.0304000414908,
+        "max": 251.46279996261
+      }
+    },
+    "in-kl-tvm": {
+      "valid_count": 431,
+      "latency_ms": {
+        "count": 431,
+        "mean": 192.90651833063765,
+        "p50": 207.3761000065133,
+        "p95": 235.47529999632388,
+        "p99": 248.02560009993613,
+        "max": 250.79600000754
+      }
+    }
+  },
+  "profile": "smoke",
+  "concurrency": 100
+}

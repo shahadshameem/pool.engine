@@ -389,10 +389,21 @@ def build_auth_provider_from_env(
     elif api_key_provider is not None:
         return api_key_provider
 
-    if is_prod and not allow_unauth:
+    # Default development fallback key: strictly restricted to local development
+    if environment == "development" and (
+        getattr(config, "require_auth", False)
+        or source.get("REQUIRE_AUTH", "").lower() in ("true", "1", "yes")
+        or source.get("AUTH_ENABLED", "").lower() in ("true", "1", "yes")
+    ):
+        return ApiKeyAuthProvider({
+            "waymate-dev-secret-key-2026": ("waymate-backend", ("admin", "dispatch_operator"))
+        })
+
+    if environment in ("staging", "production") and not allow_unauth:
         raise ValueError(
-            "Production environment requires a configured authentication provider (Firebase or API keys). "
-            "NoOpAuthProvider is prohibited in production unless allow_unauthenticated_in_production=True."
+            f"Production environment requires a configured authentication provider (Firebase or API keys). "
+            f"Deployment environment '{environment}' requires explicit, securely-configured authentication credentials. "
+            "Default development credentials and NoOpAuthProvider are strictly prohibited."
         )
 
     return NoOpAuthProvider()

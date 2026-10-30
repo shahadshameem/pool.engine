@@ -20,9 +20,10 @@ services:
       POSTGRES_USER: pool_staging_user
       POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:-staging_insecure_development_password}
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${STAGING_POSTGRES_PORT:-5434}:5432"
     volumes:
       - pgdata_staging:/var/lib/postgresql/data
+      - ../../src/engine/adapters/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pool_staging_user -d pool_engine_staging"]
       interval: 5s
@@ -38,7 +39,7 @@ services:
   # Routing Engine: Manhattan OSRM Backend (Port 5000)
   # ---------------------------------------------------------------------------
   osrm-manhattan:
-    image: osrm/osrm-backend:v5.27.1
+    image: osrm/osrm-backend:latest
     container_name: pool-engine-staging-osrm-manhattan
     restart: unless-stopped
     ports:
@@ -47,7 +48,7 @@ services:
       - ./osrm-data/manhattan:/data:ro
     command: osrm-routed --algorithm ch -t 4 /data/manhattan.osrm
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 5000 || exit 1"]
+      test: ["CMD-SHELL", "/bin/bash -c '</dev/tcp/127.0.0.1/5000' || exit 1"]
       interval: 5s
       timeout: 2s
       retries: 5
@@ -61,7 +62,7 @@ services:
   # Routing Engine: Kerala OSRM Backend (Port 5001)
   # ---------------------------------------------------------------------------
   osrm-kerala:
-    image: osrm/osrm-backend:v5.27.1
+    image: osrm/osrm-backend:latest
     container_name: pool-engine-staging-osrm-kerala
     restart: unless-stopped
     ports:
@@ -70,7 +71,7 @@ services:
       - ./osrm-data/kerala:/data:ro
     command: osrm-routed --algorithm ch -t 4 /data/kerala.osrm
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 5000 || exit 1"]
+      test: ["CMD-SHELL", "/bin/bash -c '</dev/tcp/127.0.0.1/5000' || exit 1"]
       interval: 5s
       timeout: 2s
       retries: 5
@@ -105,6 +106,7 @@ services:
       DB_POOL_TIMEOUT_SECONDS: "10.0"
       ROUTING_TIMEOUT_SECONDS: "0.500"
       AUTH_ENABLED: "false"
+      FIREBASE_PROJECT_ID: "${FIREBASE_PROJECT_ID:-waymate-v2}"
       MASK_COORDINATES_IN_LOGS: "true"
       ENABLE_TELEMETRY: "true"
       MAX_BATCH_SIZE: "500"

@@ -88,3 +88,8 @@ $RECYCLE.BIN/
 # Explicitly ensure Spec Kit and Agent configurations are tracked
 !.specify/
 !.agents/
+
+# OSRM raw extracts and compiled graphs (build on VPS via scripts/build_kerala_graph_docker.sh)
+deploy/docker/osrm-data/**/*.osm
+deploy/docker/osrm-data/**/*.osrm*
+!deploy/docker/osrm-data/**/.gitkeep

@@ -1,0 +1,46 @@
+# ==============================================================================
+# Caddy Reverse Proxy Configuration for WayMate Pool Engine
+# Location: /etc/caddy/Caddyfile
+# Automatic HTTPS, TLS certificate management, and rate limiting
+# ==============================================================================
+
+api-pool.waymate.in {
+    # Automatic TLS with Let's Encrypt / ZeroSSL
+    tls admin@waymate.in
+
+    # Global request size limiter (1MB)
+    request_body {
+        max_size 1MB
+    }
+
+    # Security Headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # Reverse proxy to the Pool Engine ASGI service on local loopback
+    reverse_proxy 127.0.0.1:8000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Health check transport
+        transport http {
+            dial_timeout 3s
+            response_header_timeout 10s
+        }
+    }
+
+    # Structured JSON Logging
+    log {
+        output file /var/log/caddy/pool_engine_access.log {
+            roll_size 50mb
+            roll_keep 10
+        }
+        format json
+    }
+}

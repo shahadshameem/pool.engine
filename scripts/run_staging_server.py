@@ -105,6 +105,8 @@ def start_staging_service(
     port: int = DEFAULT_PORT,
     regions_file: str = DEFAULT_REGIONS_CONFIG,
     db_url: str = "postgresql://postgres:postgres@127.0.0.1:5433/pool_engine_test",
+    api_keys: str | None = None,
+    allow_insecure_dev_keys: bool = False,
 ) -> None:
     """Launches the Uvicorn ASGI server with staging configuration."""
     os.environ["ENVIRONMENT"] = "staging"
@@ -115,7 +117,21 @@ def start_staging_service(
     os.environ["STRICT_ROUTING_READINESS"] = "false"
     os.environ["DATABASE_URL"] = db_url
     os.environ["REQUIRE_PERSISTENT_STORAGE"] = "true"
-    os.environ["AUTH_ENABLED"] = "false"
+    os.environ["AUTH_ENABLED"] = "true"
+
+    if api_keys:
+        os.environ["API_KEYS"] = api_keys
+    elif "API_KEYS" not in os.environ:
+        if allow_insecure_dev_keys:
+            print("[SECURITY WARNING] Running staging server with temporary development credentials (--allow-insecure-dev-keys). Never use in production.")
+            os.environ["API_KEYS"] = "waymate-dev-secret-key-2026:admin"
+        else:
+            raise ValueError(
+                "Staging environment requires explicit API_KEYS configuration. "
+                "Provide --api-keys <keys> or set the API_KEYS environment variable. "
+                "(For offline local testing only, pass --allow-insecure-dev-keys)."
+            )
+
     os.environ["MASK_COORDINATES_IN_LOGS"] = "true"
     os.environ["ENABLE_TELEMETRY"] = "true"
 
@@ -139,6 +155,16 @@ def main() -> int:
         default="postgresql://postgres:postgres@127.0.0.1:5433/pool_engine_test",
         help="PostgreSQL connection string",
     )
+    parser.add_argument(
+        "--api-keys",
+        default=None,
+        help="Configured API keys for staging (e.g. 'staging-key-1:admin,staging-key-2:dispatch')",
+    )
+    parser.add_argument(
+        "--allow-insecure-dev-keys",
+        action="store_true",
+        help="Explicitly permit temporary development keys for local offline staging simulation only",
+    )
 
     args = parser.parse_args()
 
@@ -151,7 +177,14 @@ def main() -> int:
         return 1
 
     try:
-        start_staging_service(args.host, args.port, args.regions_file, args.db_url)
+        start_staging_service(
+            args.host,
+            args.port,
+            args.regions_file,
+            args.db_url,
+            api_keys=args.api_keys,
+            allow_insecure_dev_keys=args.allow_insecure_dev_keys,
+        )
         return 0
     except KeyboardInterrupt:
         print("\nStaging service terminated by user.")

@@ -186,6 +186,10 @@ class ServiceConfig(BaseModel):
         auth_env = source.get("REQUIRE_AUTH") or source.get("AUTH_ENABLED")
         if auth_env is not None:
             kwargs["require_auth"] = auth_env.lower() in ("true", "1", "yes")
+        else:
+            env_name = source.get("ENVIRONMENT", "development").lower()
+            if env_name in ("staging", "production"):
+                kwargs["require_auth"] = True
         if "ALLOW_UNAUTHENTICATED_IN_PRODUCTION" in source:
             kwargs["allow_unauthenticated_in_production"] = source[
                 "ALLOW_UNAUTHENTICATED_IN_PRODUCTION"

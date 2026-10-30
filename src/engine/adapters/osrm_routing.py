@@ -44,6 +44,66 @@ class OsrmHttpTransport(ABC):
         pass
 
 
+class ServerCircuitState:
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+
+class ServerCircuitBreaker:
+    """Thread-safe circuit breaker protecting downstream routing backend (OSRM)."""
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout_seconds: float = 10.0,
+        half_open_success_threshold: int = 2,
+    ) -> None:
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout_seconds = recovery_timeout_seconds
+        self.half_open_success_threshold = half_open_success_threshold
+        self.state = ServerCircuitState.CLOSED
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = 0.0
+        self._lock = threading.Lock()
+
+    def can_execute(self) -> bool:
+        with self._lock:
+            now = time.monotonic()
+            if self.state == ServerCircuitState.OPEN:
+                if now - self.last_failure_time >= self.recovery_timeout_seconds:
+                    self.state = ServerCircuitState.HALF_OPEN
+                    self.success_count = 0
+                    return True
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            if self.state == ServerCircuitState.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.half_open_success_threshold:
+                    self.state = ServerCircuitState.CLOSED
+                    self.failure_count = 0
+            elif self.state == ServerCircuitState.CLOSED:
+                self.failure_count = 0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.monotonic()
+            if self.state == ServerCircuitState.HALF_OPEN or self.failure_count >= self.failure_threshold:
+                self.state = ServerCircuitState.OPEN
+
+    def reset(self) -> None:
+        with self._lock:
+            self.state = ServerCircuitState.CLOSED
+            self.failure_count = 0
+            self.success_count = 0
+            self.last_failure_time = 0.0
+
+
 class DefaultOsrmTransport(OsrmHttpTransport):
     """
     Standard HTTP transport for OSRM with bounded Keep-Alive connection pooling
@@ -64,6 +124,7 @@ class DefaultOsrmTransport(OsrmHttpTransport):
         self.port = parsed.port or (443 if self.scheme == "https" else 80)
         self.path_prefix = parsed.path.rstrip("/")
         self.max_connections = max(1, max_connections)
+        self.circuit_breaker = ServerCircuitBreaker()
         self._pool: queue.LifoQueue[http.client.HTTPConnection | http.client.HTTPSConnection] = queue.LifoQueue(
             maxsize=self.max_connections
         )
@@ -122,6 +183,9 @@ class DefaultOsrmTransport(OsrmHttpTransport):
                 self._total_created = max(0, self._total_created - 1)
 
     def get(self, path_and_query: str, timeout: float) -> tuple[int, bytes]:
+        if not self.circuit_breaker.can_execute():
+            raise RouteTimeoutError("OSRM backend circuit breaker is OPEN due to repeated routing failures")
+
         full_path = self.path_prefix + (path_and_query if path_and_query.startswith("/") else "/" + path_and_query)
         headers = {"Accept": "application/json", "User-Agent": "PoolEngine-OSRM/1.0"}
 
@@ -133,6 +197,7 @@ class DefaultOsrmTransport(OsrmHttpTransport):
                 resp = conn.getresponse()
                 body = resp.read()
                 healthy = True
+                self.circuit_breaker.record_success()
                 return resp.status, body
             except (
                 http.client.RemoteDisconnected,
@@ -143,10 +208,15 @@ class DefaultOsrmTransport(OsrmHttpTransport):
                 healthy = False
                 if attempt == 0:
                     continue
+                self.circuit_breaker.record_failure()
+                raise
+            except Exception:
+                self.circuit_breaker.record_failure()
                 raise
             finally:
                 self._put_connection(conn, healthy=healthy)
 
+        self.circuit_breaker.record_failure()
         raise RuntimeError("Unexpected transport loop termination")
 
     def close(self) -> None:

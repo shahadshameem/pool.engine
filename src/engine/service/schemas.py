@@ -77,6 +77,52 @@ class UpdateVehicleStatusInput(BaseModel):
     is_active: bool
 
 
+class UpdateVehicleCapacityInput(BaseModel):
+    """Payload for updating a vehicle's seat capacity."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total_seat_capacity: int = Field(ge=0, le=50)
+
+
+class SyncRideCapacityInput(BaseModel):
+    """Payload for synchronizing authoritative available seats for a ride/vehicle."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    available_seats: int = Field(ge=0, le=50)
+    version: Optional[int] = Field(
+        default=None,
+        description="Monotonic update version or epoch millisecond timestamp from Firestore.",
+    )
+    idempotency_token: Optional[str] = Field(
+        default=None,
+        description="Optional idempotency token preventing duplicate re-application.",
+    )
+
+
+class ReconcileRideInput(BaseModel):
+    """Payload for authoritative reconciliation of ride capacity from Firestore."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ride_id: str
+    available_seats: int = Field(ge=0, le=50)
+    total_seats: Optional[int] = Field(default=None, ge=0, le=50)
+    version: Optional[int] = Field(
+        default=None,
+        description="Monotonic update version from Firestore (e.g. timestamp ms).",
+    )
+    idempotency_token: Optional[str] = None
+    vehicle_id: Optional[str] = None
+    driver_id: Optional[str] = None
+    status: Optional[str] = None
+
+
+class ReconcileBatchInput(BaseModel):
+    """Payload for bulk reconciliation of multiple rides/vehicles."""
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    rides: list[ReconcileRideInput]
+
+
 class DispatchRunInput(BaseModel):
     """Payload for requesting an optimized dispatch batch solve and commit cycle."""
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -88,6 +134,10 @@ class DispatchRunInput(BaseModel):
     request_limit: Optional[int] = Field(default=None, ge=1)
     vehicle_limit: Optional[int] = Field(default=None, ge=1)
     region_id: Optional[str] = Field(default=None, description="Optional target regional market to solve exclusively.")
+    authoritative_capacities: Optional[list[ReconcileRideInput]] = Field(
+        default=None,
+        description="Optional list of authoritative ride capacities from Firestore to reconcile prior to solving.",
+    )
 
 
 class StaleAssignmentDiagnosticResponse(BaseModel):
