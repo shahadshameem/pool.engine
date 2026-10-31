@@ -1,0 +1,455 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    function isAdmin() {
+      return isAuthenticated() && (
+        ('admin' in request.auth.token && request.auth.token.admin == true)
+      );
+    }
+    function hasMfa() {
+      return isAuthenticated() && (
+        'firebase' in request.auth.token &&
+        'sign_in_second_factor' in request.auth.token.firebase &&
+        request.auth.token.firebase.sign_in_second_factor == 'phone'
+      );
+    }
+    function existingData() {
+      return resource != null ? resource.data : {};
+    }
+    function incomingData() {
+      return request.resource.data;
+    }
+
+    // UNIQUE PHONE NUMBERS REGISTRY (Enforces unique phone numbers across users)
+    match /phoneNumbers/{phoneNumber} {
+      allow get: if isAuthenticated();
+      allow list: if isAdmin();
+      // Only authenticated user can claim phone number if not already claimed by another user
+      allow create: if isAuthenticated()
+                    && incomingData().uid == request.auth.uid
+                    && !exists(/databases/$(database)/documents/phoneNumbers/$(phoneNumber));
+      allow update: if isAuthenticated()
+                    && existingData().uid == request.auth.uid
+                    && incomingData().uid == request.auth.uid;
+      allow delete: if isAuthenticated()
+                    && (existingData().uid == request.auth.uid || isAdmin());
+    }
+
+    // UNIQUE EMAILS REGISTRY (Guarantees email uniqueness at Firestore layer)
+    match /emails/{email} {
+      allow get: if isAuthenticated();
+      allow list: if isAdmin();
+      allow create: if isAuthenticated()
+                    && incomingData().uid == request.auth.uid
+                    && incomingData().email == request.auth.token.email
+                    && !exists(/databases/$(database)/documents/emails/$(email));
+      allow update: if false;
+      allow delete: if isAuthenticated()
+                    && (existingData().uid == request.auth.uid || isAdmin());
+    }
+
+    // USERS COLLECTION
+    match /users/{userId} {
+      // Authenticated users can read profiles (needed for driver/passenger details)
+      allow read: if isAuthenticated();
+
+      // Update: Admin or owner.
+      // - Prevents setting verified or admin status directly.
+      // - Email cannot be spoofed (must match auth token or remain unchanged).
+      // - Phone cannot be claimed by another user (must be empty, unchanged, or owned in phoneNumbers).
+      // - Gender is immutable once set.
+      allow update: if isAdmin() || (
+                    isOwner(userId)
+                    && (!("email" in incomingData()) || (resource != null && "email" in resource.data && incomingData().email == resource.data.email) || (request.auth.token != null && "email" in request.auth.token && incomingData().email == request.auth.token.email))
+                    && (!("phone" in incomingData()) || incomingData().phone == "" || incomingData().phone == null)
+                    && (!("collegeVerified" in incomingData()) || (resource != null && "collegeVerified" in resource.data && incomingData().collegeVerified == resource.data.collegeVerified))
+                    && (!("emailVerified" in incomingData()) || (resource != null && "emailVerified" in resource.data && incomingData().emailVerified == resource.data.emailVerified))
+                    && (!("genderVerificationStatus" in incomingData()) || (resource != null && "genderVerificationStatus" in resource.data && incomingData().genderVerificationStatus == resource.data.genderVerificationStatus))
+                    && (!("accountStatus" in incomingData()) || (resource != null && "accountStatus" in resource.data && incomingData().accountStatus == resource.data.accountStatus))
+                    && (!("role" in incomingData()) || (resource != null && "role" in resource.data && incomingData().role == resource.data.role))
+                    && (!("admin" in incomingData()) || (resource != null && "admin" in resource.data && incomingData().admin == resource.data.admin))
+                    && (!("gender" in incomingData()) || resource == null || !("gender" in resource.data) || resource.data.gender == null || resource.data.gender == "" || incomingData().gender == resource.data.gender));
+
+      // Create: owner or admin.
+      allow create: if isAdmin() || (
+                    isOwner(userId)
+                    && (!("email" in incomingData()) || (request.auth.token != null && "email" in request.auth.token && incomingData().email == request.auth.token.email))
+                    && (!("phone" in incomingData()) || incomingData().phone == "" || incomingData().phone == null)
+                    && (!("collegeVerified" in incomingData()) || incomingData().collegeVerified == false)
+                    && (!("emailVerified" in incomingData()) || incomingData().emailVerified == false)
+                    && (!("genderVerificationStatus" in incomingData()) || incomingData().genderVerificationStatus in ["pending", "unverified", "verified"])
+                    && (!("accountStatus" in incomingData()) || incomingData().accountStatus == "active")
+                    && (!("role" in incomingData()) || incomingData().role != "admin")
+                    && (!("admin" in incomingData()) || incomingData().admin == false));
+
+      // Allow owner or admin to delete user document
+      allow delete: if isOwner(userId) || isAdmin();
+
+      // Protected Private User Details (phone, homeLocation, fcmTokens) - DPDPA 2023
+      match /private/{docId} {
+        allow read, write: if isOwner(userId) || isAdmin();
+      }
+
+      // Consent Records & Consent State (DPDPA 2023)
+      match /consentRecords/{recordId} {
+        allow read, create: if isOwner(userId);
+      }
+      match /consentState/{docId} {
+        allow read, write: if isOwner(userId);
+      }
+      match /blockedUsers/{blockedId} {
+        allow read, write: if isOwner(userId) || isAdmin();
+      }
+    }
+
+    // RIDES COLLECTION
+    match /rides/{rideId} {
+      // Authenticated users can read/search rides
+      allow read: if isAuthenticated();
+
+      // Create: ownerId must strictly be the authenticated UID & genderPolicy must match user's profile gender (or 'any')
+      allow create: if isAdmin() || (
+                    isAuthenticated() && incomingData().ownerId == request.auth.uid
+                    && (!('driverPhone' in incomingData()) || incomingData().driverPhone == "" || incomingData().driverPhone == null)
+                    && (!('genderPolicy' in incomingData()) || incomingData().genderPolicy in ['any', 'female_only', 'female'])
+                    && (!('genderPolicy' in incomingData()) || incomingData().genderPolicy == 'any' ||
+                        (incomingData().genderPolicy in ['female_only', 'female'] &&
+                         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                         'gender' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+                         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.gender == 'female'))
+                    && (!('availableSeats' in incomingData()) || incomingData().availableSeats >= 0)
+                    && (!('availableSeats' in incomingData()) || !('totalSeats' in incomingData()) || incomingData().availableSeats <= incomingData().totalSeats)
+                    && (!('totalSeats' in incomingData()) || incomingData().totalSeats > 0)
+                    && (!('departureTimestamp' in incomingData()) || !(incomingData().departureTimestamp is timestamp) || incomingData().departureTimestamp > (request.time - duration.value(2, 'm')))
+                    && (!('from' in incomingData()) || !('to' in incomingData()) || incomingData().from != incomingData().to)
+                    && (!('from' in incomingData()) || (incomingData().from.size() >= 2 && incomingData().from.size() <= 150))
+                    && (!('to' in incomingData()) || (incomingData().to.size() >= 2 && incomingData().to.size() <= 150))
+                    && (!('notes' in incomingData()) || incomingData().notes.size() <= 500)
+                    && (
+                      !('totalSeats' in incomingData()) ||
+                      ('vehicleType' in incomingData() && incomingData().vehicleType == 'bike' ? incomingData().totalSeats <= 1 :
+                       'vehicleType' in incomingData() && incomingData().vehicleType == 'auto' ? incomingData().totalSeats <= 3 :
+                       incomingData().totalSeats <= 6)
+                    ));
+
+      // Update: owner can modify their ride; accepted passengers can release their seat during cancellation;
+      // or status transition to 'expired' / 'completed' on past departure
+      allow update: if isAdmin() || (
+                    isAuthenticated() && (
+                      (
+                        existingData().ownerId == request.auth.uid
+                        && incomingData().ownerId == existingData().ownerId
+                        && (!('totalSeats' in incomingData()) || !('totalSeats' in existingData()) || incomingData().totalSeats == existingData().totalSeats)
+                        && (!('availableSeats' in incomingData()) || incomingData().availableSeats >= 0)
+                        && (!('availableSeats' in incomingData()) || !('totalSeats' in incomingData()) || incomingData().availableSeats <= incomingData().totalSeats)
+                      ) || (
+                        // Passenger releasing seat during cancellation
+                        incomingData().ownerId == existingData().ownerId
+                        && (!('totalSeats' in incomingData()) || !('totalSeats' in existingData()) || incomingData().totalSeats == existingData().totalSeats)
+                        && incomingData().availableSeats > existingData().availableSeats
+                        && (!('totalSeats' in incomingData()) || incomingData().availableSeats <= incomingData().totalSeats)
+                      ) || (
+                        existingData().status in ['active', 'full', 'OPEN']
+                        && incomingData().status in ['expired', 'completed']
+                        && incomingData().ownerId == existingData().ownerId
+                        && (!('totalSeats' in incomingData()) || !('totalSeats' in existingData()) || incomingData().totalSeats == existingData().totalSeats)
+                        && incomingData().availableSeats == existingData().availableSeats
+                      ) || (
+                        // Any confirmed participant (creator or co-rider) can start or complete the trip
+                        existingData().status in ['active', 'full', 'OPEN', 'started']
+                        && incomingData().status in ['started', 'completed']
+                        && incomingData().ownerId == existingData().ownerId
+                        && (!('totalSeats' in incomingData()) || !('totalSeats' in existingData()) || incomingData().totalSeats == existingData().totalSeats)
+                        && incomingData().availableSeats == existingData().availableSeats
+                        && (
+                          request.auth.uid == existingData().ownerId
+                          || (
+                            'acceptedPassengers' in existingData()
+                            && existingData().acceptedPassengers != null
+                          )
+                        )
+                      )
+                    ));
+
+      // Delete: owner or admin can delete
+      allow delete: if isAuthenticated() && (existingData().ownerId == request.auth.uid || isAdmin());
+
+      // LIVE LOCATIONS SUBCOLLECTION (Real-time GPS Tracking between Confirmed Participants)
+      match /liveLocations/{userId} {
+        // Read: Confirmed participants (creator or co-rider) or admin
+        allow read: if isAuthenticated() && (
+          isAdmin() ||
+          request.auth.uid == userId ||
+          (
+            exists(/databases/$(database)/documents/rides/$(rideId)) &&
+            (
+              get(/databases/$(database)/documents/rides/$(rideId)).data.ownerId == request.auth.uid ||
+              (
+                'acceptedPassengers' in get(/databases/$(database)/documents/rides/$(rideId)).data &&
+                get(/databases/$(database)/documents/rides/$(rideId)).data.acceptedPassengers != null
+              )
+            )
+          )
+        );
+
+        // Write: User can only update their own live location document
+        allow write: if isAuthenticated() && (
+          isAdmin() ||
+          request.auth.uid == userId
+        );
+
+        // Delete: User themselves, any confirmed participant, or admin on trip completion
+        allow delete: if isAuthenticated() && (
+          isAdmin() ||
+          request.auth.uid == userId ||
+          (
+            exists(/databases/$(database)/documents/rides/$(rideId)) &&
+            (
+              get(/databases/$(database)/documents/rides/$(rideId)).data.ownerId == request.auth.uid ||
+              (
+                'acceptedPassengers' in get(/databases/$(database)/documents/rides/$(rideId)).data &&
+                get(/databases/$(database)/documents/rides/$(rideId)).data.acceptedPassengers != null
+              )
+            )
+          )
+        );
+      }
+    }
+
+    // RIDE REQUESTS COLLECTION
+    match /rideRequests/{requestId} {
+      // Read: authenticated users can read requests
+      allow read: if isAuthenticated();
+
+      // Create: requesterId must strictly be the auth uid, status must start as 'pending',
+      // target ride must exist, be active/OPEN, have capacity, not be expired, and match gender policy
+      allow create: if isAuthenticated()
+                    && incomingData().requesterId == request.auth.uid
+                    && incomingData().rideOwnerId != request.auth.uid
+                    && incomingData().status == 'pending'
+                    && incomingData().seatsRequested > 0
+                    && exists(/databases/$(database)/documents/rides/$(incomingData().rideId))
+                    && get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data.status in ['active', 'OPEN']
+                    && (
+                      !('departureTimestamp' in get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data) ||
+                      !(get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data.departureTimestamp is timestamp) ||
+                      get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data.departureTimestamp > request.time
+                    )
+                    && (
+                      !('availableSeats' in get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data) ||
+                      get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data.availableSeats >= incomingData().seatsRequested
+                    )
+                    && (
+                      !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+                      !('accountStatus' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data) ||
+                      get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountStatus == 'active'
+                    )
+                    && (
+                      !('genderPolicy' in get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data) ||
+                      get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data.genderPolicy == 'any' ||
+                      (
+                        get(/databases/$(database)/documents/rides/$(incomingData().rideId)).data.genderPolicy in ['female_only', 'female'] &&
+                        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                        'gender' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data &&
+                        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.gender == 'female'
+                      )
+                    );
+
+      // Update:
+      // 1. Requester can cancel/update message, but CANNOT self-accept
+      // 2. Ride host can accept, reject, or cancel requests for their ride
+      // 3. Admin can update
+      allow update: if isAdmin() || (isAuthenticated() && (
+                      (
+                        existingData().requesterId == request.auth.uid
+                        && incomingData().requesterId == existingData().requesterId
+                        && incomingData().rideOwnerId == existingData().rideOwnerId
+                        && incomingData().rideId == existingData().rideId
+                        && incomingData().status in ['pending', 'cancelled']
+                        && incomingData().seatsRequested == existingData().seatsRequested
+                      ) || (
+                        existingData().rideOwnerId == request.auth.uid
+                        && incomingData().requesterId == existingData().requesterId
+                        && incomingData().rideOwnerId == existingData().rideOwnerId
+                        && incomingData().rideId == existingData().rideId
+                        && incomingData().status in ['accepted', 'rejected', 'cancelled']
+                        && incomingData().seatsRequested == existingData().seatsRequested
+                      )
+                    ));
+
+      // Delete: only the requester or admin can delete their request
+      allow delete: if (isAuthenticated() && existingData().requesterId == request.auth.uid) || isAdmin();
+    }
+
+    // RIDE CONTACTS COLLECTION (Deterministic Contact Exchange for Confirmed Participants)
+    match /rideContacts/{requestId} {
+      // Read: ONLY the host or passenger can read when the request is accepted
+      allow read: if isAuthenticated() && (
+        isAdmin() || (
+          ('hostId' in resource.data && 'passengerId' in resource.data && 'status' in resource.data) &&
+          (request.auth.uid == resource.data.hostId || request.auth.uid == resource.data.passengerId) &&
+          resource.data.status == 'accepted' &&
+          exists(/databases/$(database)/documents/rideRequests/$(requestId)) &&
+          ('status' in get(/databases/$(database)/documents/rideRequests/$(requestId)).data) &&
+          get(/databases/$(database)/documents/rideRequests/$(requestId)).data.status == 'accepted'
+        )
+      );
+
+      // Create: passenger creates pending contact record, OR host creates/sets accepted contact record
+      allow create: if isAuthenticated() && (
+        isAdmin() || (
+          ('passengerId' in incomingData() && incomingData().passengerId == request.auth.uid) &&
+          ('status' in incomingData() && incomingData().status == 'pending') &&
+          (!('hostPhone' in incomingData()) || incomingData().hostPhone == null || incomingData().hostPhone == "") &&
+          exists(/databases/$(database)/documents/rideRequests/$(requestId)) &&
+          ('requesterId' in get(/databases/$(database)/documents/rideRequests/$(requestId)).data) &&
+          get(/databases/$(database)/documents/rideRequests/$(requestId)).data.requesterId == request.auth.uid
+        ) || (
+          ('hostId' in incomingData() && incomingData().hostId == request.auth.uid) &&
+          ('status' in incomingData() && incomingData().status == 'accepted') &&
+          exists(/databases/$(database)/documents/rideRequests/$(requestId)) &&
+          ('rideOwnerId' in get(/databases/$(database)/documents/rideRequests/$(requestId)).data) &&
+          get(/databases/$(database)/documents/rideRequests/$(requestId)).data.rideOwnerId == request.auth.uid &&
+          ('status' in get(/databases/$(database)/documents/rideRequests/$(requestId)).data) &&
+          get(/databases/$(database)/documents/rideRequests/$(requestId)).data.status in ['pending', 'accepted']
+        )
+      );
+
+      // Update: host accepts and shares hostPhone, or cancellation occurs
+      allow update: if isAuthenticated() && (
+        isAdmin() || (
+          // Host accepting
+          ('hostId' in resource.data && resource.data.hostId == request.auth.uid) &&
+          ('status' in incomingData() && incomingData().status == 'accepted') &&
+          exists(/databases/$(database)/documents/rideRequests/$(requestId)) &&
+          ('rideOwnerId' in get(/databases/$(database)/documents/rideRequests/$(requestId)).data) &&
+          get(/databases/$(database)/documents/rideRequests/$(requestId)).data.rideOwnerId == request.auth.uid &&
+          ('status' in get(/databases/$(database)/documents/rideRequests/$(requestId)).data) &&
+          get(/databases/$(database)/documents/rideRequests/$(requestId)).data.status in ['pending', 'accepted']
+        ) || (
+          // Cancellation / Rejection
+          ('hostId' in resource.data && 'passengerId' in resource.data) &&
+          (resource.data.hostId == request.auth.uid || resource.data.passengerId == request.auth.uid) &&
+          ('status' in incomingData() && incomingData().status in ['cancelled', 'rejected'])
+        )
+      );
+
+      // Delete: participants or admin
+      allow delete: if isAuthenticated() && (
+        isAdmin() || (
+          ('hostId' in resource.data && 'passengerId' in resource.data) &&
+          (resource.data.hostId == request.auth.uid || resource.data.passengerId == request.auth.uid)
+        )
+      );
+    }
+
+    // NOTIFICATIONS COLLECTION
+    match /notifications/{notificationId} {
+      // Read: user can read their own notifications or admin
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        (resource != null && 'userId' in resource.data && resource.data.userId == request.auth.uid)
+      );
+
+      // Update: user can mark as read, but cannot change ownership
+      allow update: if isAuthenticated() && existingData().userId == request.auth.uid
+                    && incomingData().userId == existingData().userId;
+
+      // Create: Allow users to send system notifications with verified sender/recipient identity
+      allow create: if isAuthenticated()
+                    && ('read' in incomingData() && incomingData().read == false)
+                    && (
+                      isAdmin() ||
+                      ('userId' in incomingData() && incomingData().userId == request.auth.uid) ||
+                      ('actorId' in incomingData() && incomingData().actorId == request.auth.uid)
+                    );
+
+      // Delete: user can delete their own
+      allow delete: if isAuthenticated() && existingData().userId == request.auth.uid;
+    }
+
+    // REPORTS COLLECTION
+    match /reports/{reportId} {
+      // Create: users can create a report, but they cannot spoof the reporter identity
+      allow create: if isAuthenticated() && incomingData().reporterId == request.auth.uid;
+
+      // Read: users can view their own reports, or admins can view all reports
+      allow read: if isAdmin() || (isAuthenticated() && existingData().reporterId == request.auth.uid);
+
+      // Admin can update report status or resolve/delete
+      allow update, delete: if isAdmin();
+    }
+
+    // ADMIN ACTIONS COLLECTION
+    match /adminActions/{actionId} {
+      // Accessible by authorized admins for audit logging
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /waymate_places/{placeId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // DATA RIGHTS REQUESTS (DPDPA §11)
+    match /dataRightsRequests/{requestId} {
+      allow create: if isAuthenticated() && incomingData().uid == request.auth.uid;
+      allow read, update: if isAdmin() || (isAuthenticated() && existingData().uid == request.auth.uid);
+      allow delete: if isAdmin();
+    }
+
+    // CAB POOLS COLLECTION
+    match /cabPools/{poolId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated()
+                    && incomingData().maxCapacity <= 4
+                    && incomingData().maxCapacity > 0
+                    && incomingData().members.size() <= 4;
+      allow update: if isAdmin() || (
+                    isAuthenticated()
+                    && incomingData().originRideId == existingData().originRideId
+                    && incomingData().origin == existingData().origin
+                    && incomingData().destination == existingData().destination
+                    && incomingData().date == existingData().date
+                    && incomingData().departureTime == existingData().departureTime
+                    && incomingData().maxCapacity == existingData().maxCapacity
+                    && incomingData().members.size() <= existingData().maxCapacity
+                    && incomingData().status in ['forming', 'matched', 'completed', 'cancelled']
+                    );
+      allow delete: if isAdmin();
+    }
+
+    // COLLEGES COLLECTION (Multi-Campus Platform)
+    match /colleges/{collegeId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // SYSTEM CONFIGURATION & BROADCASTS
+    match /systemConfig/{configId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // VERIFICATION HELP ESCALATIONS
+    match /verificationHelpRequests/{requestId} {
+      allow create: if isAuthenticated() && incomingData().userId == request.auth.uid;
+      allow read: if isAdmin() || (isAuthenticated() && existingData().userId == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
+
+    // Fallback: strictly deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -156,16 +156,31 @@ for i in {1..12}; do
     sleep 3
 done
 
-if [ "${LIVENESS_STATUS}" -eq 1 ]; then
+echo "Checking WayMate Frontend Availability..."
+FRONTEND_STATUS=0
+for i in {1..12}; do
+    if curl -s -f http://127.0.0.1:3000/ > /dev/null; then
+        FRONTEND_STATUS=1
+        break
+    fi
+    echo "Waiting for WayMate Frontend... (${i}/12)"
+    sleep 3
+done
+
+if [ "${LIVENESS_STATUS}" -eq 1 ] && [ "${FRONTEND_STATUS}" -eq 1 ]; then
     echo -e "${GREEN}==============================================================================${NC}"
-    echo -e "${GREEN}✓ WayMate Pool Engine is ONLINE and HEALTHY on this VPS!                     ${NC}"
+    echo -e "${GREEN}✓ WayMate Monorepo (Frontend + Pool Engine) is ONLINE & HEALTHY!             ${NC}"
     echo -e "${GREEN}==============================================================================${NC}"
+    echo -e "Frontend:  http://127.0.0.1:3000 (Proxied to waymate.in)"
+    echo -e "API:       http://127.0.0.1:8000 (Proxied to api-pool.waymate.in)"
     echo -e "Liveness:  http://127.0.0.1:8000/v1/health/liveness"
     echo -e "Readiness: http://127.0.0.1:8000/v1/health/readiness"
     echo -e "Metrics:   http://127.0.0.1:8000/v1/metrics"
-    echo -e "\n${YELLOW}Next Step: Point your DNS A-Record for api-pool.waymate.in to this VPS IP address.${NC}"
-    echo -e "Caddy will automatically provision a free Let's Encrypt TLS certificate."
+    echo -e "\n${YELLOW}Next Step: Point your DNS A-Records to this VPS IP address:${NC}"
+    echo -e "  - waymate.in (Frontend)"
+    echo -e "  - api-pool.waymate.in (Pool Engine API)"
+    echo -e "Caddy will automatically provision free Let's Encrypt TLS certificates."
 else
-    echo -e "${RED}[WARNING] Service took longer than expected to report liveness.${NC}"
+    echo -e "${RED}[WARNING] One or more services took longer than expected to report healthy.${NC}"
     echo "Inspect logs with: docker compose -f deploy/docker/docker-compose.production.yml logs -f"
 fi

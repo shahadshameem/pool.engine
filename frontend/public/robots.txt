@@ -1,0 +1,20 @@
+# https://www.robotstxt.org/robotstxt.html
+User-agent: *
+Allow: /
+Allow: /rides/search
+Allow: /terms
+Allow: /data-rights
+Allow: /login
+Allow: /signup
+
+# Disallow private user states and admin endpoints
+Disallow: /admin/
+Disallow: /admin
+Disallow: /profile/
+Disallow: /profile
+Disallow: /activity
+Disallow: /rides/*/manage
+
+# Host and Sitemap
+Host: https://wmate.app
+Sitemap: https://wmate.app/sitemap.xml

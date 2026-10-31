@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function() {
+        try {
+          document.documentElement.classList.add('dark');
+          document.documentElement.style.backgroundColor = '#000000';
+          document.documentElement.style.colorScheme = 'dark';
+          localStorage.setItem('waymate_theme_mode', 'dark');
+        } catch (e) {}
+      })();
+    </script>
+
+    <!-- Primary Page Metadata & SEO -->
+    <title>WayMate (wmate.app) – Verified College Ridesharing &amp; Student Carpool</title>
+    <meta name="title" content="WayMate (wmate.app) – Verified College Ridesharing &amp; Student Carpool" />
+    <meta name="description" content="WayMate (wmate.app) is the verified student ridesharing and carpool app. Share rides, split cab &amp; auto fares, and commute safely to campus with trusted college peers." />
+    <meta name="keywords" content="wmate, wmate.app, waymate, waymate app, college ridesharing, student carpool, campus ride sharing, CET rideshare, CET Trivandrum cab pool, college carpooling app India, student commute, female only rides, split cab fare, college ride share" />
+    <meta name="author" content="WayMate" />
+    <meta name="application-name" content="WayMate" />
+    <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+    <meta name="googlebot" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+    <link rel="canonical" href="https://wmate.app/" />
+
+    <!-- Open Graph / Facebook / WhatsApp / LinkedIn -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://wmate.app/" />
+    <meta property="og:site_name" content="WayMate" />
+    <meta property="og:title" content="WayMate (wmate.app) – Verified College Ridesharing &amp; Carpooling" />
+    <meta property="og:description" content="Connect with verified college students, split cab &amp; auto rides, and commute safely to campus. Zero commission, verified student community." />
+    <meta property="og:image" content="https://wmate.app/logo.png" />
+    <meta property="og:image:secure_url" content="https://wmate.app/logo.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="512" />
+    <meta property="og:image:height" content="512" />
+    <meta property="og:image:alt" content="WayMate - College Ridesharing &amp; Student Carpool Logo" />
+    <meta property="og:locale" content="en_IN" />
+
+    <!-- Twitter Cards -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:url" content="https://wmate.app/" />
+    <meta name="twitter:title" content="WayMate (wmate.app) – College Ridesharing &amp; Student Carpool" />
+    <meta name="twitter:description" content="The verified campus rideshare community. Share rides, split cab fares, and commute safely with verified college peers." />
+    <meta name="twitter:image" content="https://wmate.app/logo.png" />
+    <meta name="twitter:image:alt" content="WayMate Logo" />
+
+    <!-- Geo & Local SEO for Campus Clusters (CET Trivandrum / Kerala) -->
+    <meta name="geo.region" content="IN-KL" />
+    <meta name="geo.placename" content="Thiruvananthapuram" />
+    <meta name="geo.position" content="8.5465;76.9052" />
+    <meta name="ICBM" content="8.5465, 76.9052" />
+
+    <!-- PWA & Mobile Web App Capabilities -->
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#000000" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="WayMate" />
+    <link rel="apple-touch-icon" href="/pwa-192x192.png" />
+
+    <!-- Google Fonts & Material Icons for EDEX Design System -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Kumbh+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined|Material+Symbols+Outlined" rel="stylesheet" />
+
+    <!-- Schema.org Rich Structured Data (JSON-LD) for Search Engine Ranking -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "WebSite",
+          "@id": "https://wmate.app/#website",
+          "url": "https://wmate.app/",
+          "name": "WayMate",
+          "alternateName": ["wmate", "wmate.app", "WayMate App"],
+          "description": "Verified College Ridesharing and Campus Carpooling Platform.",
+          "inLanguage": "en-IN",
+          "potentialAction": {
+            "@type": "SearchAction",
+            "target": "https://wmate.app/rides/search?destination={search_term_string}",
+            "query-input": "required name=search_term_string"
+          }
+        },
+        {
+          "@type": "WebApplication",
+          "@id": "https://wmate.app/#webapp",
+          "name": "WayMate",
+          "alternateName": "wmate.app",
+          "url": "https://wmate.app/",
+          "applicationCategory": "TravelApplication",
+          "operatingSystem": "All",
+          "browserRequirements": "Requires JavaScript. Requires HTML5.",
+          "offers": {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "INR"
+          },
+          "description": "WayMate (wmate.app) connects college students commuting on identical routes to share auto, cab, car, and bike rides safely with zero platform fee."
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://wmate.app/#organization",
+          "name": "WayMate",
+          "url": "https://wmate.app/",
+          "logo": {
+            "@type": "ImageObject",
+            "url": "https://wmate.app/logo.png"
+          }
+        },
+        {
+          "@type": "FAQPage",
+          "@id": "https://wmate.app/#faq",
+          "mainEntity": [
+            {
+              "@type": "Question",
+              "name": "What is WayMate (wmate.app)?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "WayMate (wmate.app) is a verified campus ridesharing and carpool community designed exclusively for college students to share daily commutes, split auto and cab fares, and travel safely."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "How does college ridesharing work on WayMate?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Students can offer a ride if they commute by car, bike, or are sharing a cab/auto, or search for available rides along their route. When a host accepts a rider request, direct contact details unlock for coordinated pickup."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Is WayMate safe for female students?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "Yes. WayMate features an exclusive 'Female Riders Only' filter, verified student badge validation, safety reporting, and contact exchange safeguards."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "How much does WayMate charge to split rides?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "WayMate is 100% free with zero platform fees or commission. Students split real travel costs directly with peer hosts."
+              }
+            },
+            {
+              "@type": "Question",
+              "name": "Which colleges and areas are supported?",
+              "acceptedAnswer": {
+                "@type": "Answer",
+                "text": "WayMate supports college campuses including College of Engineering Trivandrum (CET), Technopark, Kazhakkoottam, Sreekariyam, PMG, and surrounding student residential areas in Kerala."
+              }
+            }
+          ]
+        }
+      ]
+    }
+    </script>
+  </head>
+  <body style="margin: 0; background-color: inherit; color: inherit; font-family: 'Kumbh Sans', sans-serif;">
+    <div id="root">
+      <!-- Loading Shell with Semantic Pre-render Content for Search Engine Crawlers -->
+      <div style="display: flex; min-height: 100vh; width: 100%; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 1.5rem; background-color: inherit;">
+        <div style="height: 48px; width: 48px; border-radius: 50%; border: 3px solid rgba(197, 255, 0, 0.2); border-top-color: #C5FF00; animation: spin 1s linear infinite;"></div>
+        <p style="margin-top: 1rem; font-size: 0.875rem; color: #a1a1aa; font-weight: 500;">Loading WayMate...</p>
+
+        <!-- Screen-reader and Search-crawler accessible semantic brief (instant indexation) -->
+        <article class="sr-only" style="position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;">
+          <h1>WayMate (wmate.app) – Verified College Ridesharing &amp; Student Carpooling</h1>
+          <p>WayMate is the premier rideshare and carpool application designed for college students. Connect with classmates, share rides, split cab and auto fares, and travel safely to campus.</p>
+          <nav>
+            <ul>
+              <li><a href="/rides/search">Find Student Rides</a></li>
+              <li><a href="/login">Sign In</a></li>
+              <li><a href="/signup">Join WayMate Campus Network</a></li>
+              <li><a href="/terms">Terms of Service &amp; DPDPA Notice</a></li>
+              <li><a href="/data-rights">Data Rights &amp; Privacy Request</a></li>
+            </ul>
+          </nav>
+        </article>
+      </div>
+      <style>
+        @keyframes spin { to { transform: rotate(360deg); } }
+      </style>
+    </div>
+
+    <!-- Fallback for JavaScript-disabled crawlers and accessibility bots -->
+    <noscript>
+      <div style="max-width: 600px; margin: 40px auto; padding: 20px; font-family: sans-serif; line-height: 1.6; color: #fff; background-color: #121212; border-radius: 12px;">
+        <h1 style="color: #C5FF00;">WayMate (wmate.app) – College Ridesharing &amp; Student Carpool</h1>
+        <p>WayMate connects college students commuting along identical routes to share auto, cab, car, and bike rides safely with verified peers and zero commission.</p>
+        <h2>Key Campus Features:</h2>
+        <ul>
+          <li><strong>Verified Student Profiles</strong>: Community-verified college riders and hosts.</li>
+          <li><strong>Female Riders Only Filter</strong>: Safe, dedicated commute options for women students.</li>
+          <li><strong>Zero Commission</strong>: 100% free peer-to-peer campus ride sharing.</li>
+          <li><strong>Smart Route Matching</strong>: Match with classmates from CET Trivandrum, Technopark, Kazhakkoottam, and nearby campuses.</li>
+        </ul>
+        <p><a href="/rides/search" style="color: #C5FF00;">Browse Available Rides</a> | <a href="/login" style="color: #C5FF00;">Log In to WayMate</a></p>
+      </div>
+    </noscript>
+
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

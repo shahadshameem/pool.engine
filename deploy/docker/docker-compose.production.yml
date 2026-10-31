@@ -1,8 +1,11 @@
 # ==============================================================================
-# Pool Engine — Production Compose Specification (Contabo VPS / Linux)
+# WayMate Monorepo — Production Compose Specification (VPS / Linux)
 # ==============================================================================
-# Dedicated production multi-container deployment for Kerala Pilot (in-kl-tvm).
-# Coordinates Pool Engine API (multi-worker), PostgreSQL 16, and Kerala OSRM.
+# Dedicated production multi-container deployment for WayMate:
+# - Frontend: WayMate React 19 SPA (Nginx on Port 3000)
+# - Backend API: Pool Engine ASGI (4 Uvicorn Workers on Port 8000)
+# - Database: PostgreSQL 16 Alpine
+# - Routing: Kerala OSRM Backend
 # ==============================================================================
 
 version: "3.8"
@@ -28,7 +31,7 @@ services:
       POSTGRES_PASSWORD: ${PRODUCTION_DB_PASSWORD:?PRODUCTION_DB_PASSWORD is required}
     volumes:
       - pgdata_production:/var/lib/postgresql/data
-      - ../../src/engine/adapters/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ../../backend/src/engine/adapters/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pool_prod_user -d pool_engine_prod"]
       interval: 5s
@@ -74,15 +77,15 @@ services:
   # ---------------------------------------------------------------------------
   pool-engine-api:
     build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
+      context: ../../backend
+      dockerfile: Dockerfile
     container_name: pool-engine-prod-api
     restart: unless-stopped
     networks:
       - poolengine-prod-net
     command: ["uvicorn", "engine.service.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
     ports:
-      # Expose only to localhost loopback for host reverse proxy (Caddy/Coolify)
+      # Expose to localhost loopback for host reverse proxy (Caddy)
       - "127.0.0.1:8000:8000"
     environment:
       ENVIRONMENT: production
@@ -105,7 +108,7 @@ services:
       MAX_BATCH_SIZE: "500"
       DEFAULT_DISPATCH_TIMEOUT_SECONDS: "0.500"
       SHUTDOWN_TIMEOUT_SECONDS: "5.0"
-      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-https://waymate-u.web.app,https://waymate-u.firebaseapp.com,https://waymate.in,https://app.waymate.in}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-https://waymate-u.web.app,https://waymate-u.firebaseapp.com,https://waymate.in,https://app.waymate.in,http://localhost:3000,http://localhost:5173}"
     depends_on:
       postgres-production:
         condition: service_healthy
@@ -124,6 +127,44 @@ services:
         reservations:
           cpus: "0.5"
           memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # 4. Frontend Web App: WayMate React SPA (Nginx on Port 3000)
+  # ---------------------------------------------------------------------------
+  waymate-frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_POOL_ENGINE_URL: "${VITE_POOL_ENGINE_URL:-https://api-pool.waymate.in}"
+        VITE_USE_POOL_ENGINE: "true"
+        VITE_FIREBASE_PROJECT_ID: "${VITE_FIREBASE_PROJECT_ID:-}"
+        VITE_FIREBASE_AUTH_DOMAIN: "${VITE_FIREBASE_AUTH_DOMAIN:-}"
+        VITE_FIREBASE_STORAGE_BUCKET: "${VITE_FIREBASE_STORAGE_BUCKET:-}"
+        VITE_FIREBASE_API_KEY: "${VITE_FIREBASE_API_KEY:-}"
+        VITE_FIREBASE_MESSAGING_SENDER_ID: "${VITE_FIREBASE_MESSAGING_SENDER_ID:-}"
+        VITE_FIREBASE_APP_ID: "${VITE_FIREBASE_APP_ID:-}"
+        VITE_GOOGLE_MAPS_API_KEY: "${VITE_GOOGLE_MAPS_API_KEY:-}"
+    container_name: waymate-prod-frontend
+    restart: unless-stopped
+    networks:
+      - poolengine-prod-net
+    ports:
+      # Expose to localhost loopback for Caddy to serve
+      - "127.0.0.1:3000:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
 
 volumes:
   pgdata_production:

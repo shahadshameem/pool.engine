@@ -1,16 +1,58 @@
 # ==============================================================================
-# Caddy Reverse Proxy Configuration for WayMate Pool Engine
+# Caddy Reverse Proxy Configuration for WayMate Monorepo
 # Location: /etc/caddy/Caddyfile
-# Automatic HTTPS, TLS certificate management, and rate limiting
+# Automatic HTTPS, TLS certificate management, and security headers
 # ==============================================================================
 
-api-pool.waymate.in {
-    # Automatic TLS with Let's Encrypt / ZeroSSL
+# 1. Main Application Domain (Frontend Web App & Static Assets)
+waymate.in, www.waymate.in {
     tls admin@waymate.in
 
-    # Global request size limiter (1MB)
+    # Security Headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # API pass-through for same-origin requests
+    handle /v1/* {
+        reverse_proxy 127.0.0.1:8000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Reverse proxy to the WayMate Frontend container (Nginx port 3000)
+    handle {
+        reverse_proxy 127.0.0.1:3000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Structured JSON Logging
+    log {
+        output file /var/log/caddy/waymate_frontend_access.log {
+            roll_size 50mb
+            roll_keep 10
+        }
+        format json
+    }
+}
+
+# 2. Dedicated API Subdomain for Mobile Apps & Direct SDK Clients
+api-pool.waymate.in {
+    tls admin@waymate.in
+
+    # Request size limiter
     request_body {
-        max_size 1MB
+        max_size 2MB
     }
 
     # Security Headers
@@ -28,7 +70,6 @@ api-pool.waymate.in {
         header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
 
-        # Health check transport
         transport http {
             dial_timeout 3s
             response_header_timeout 10s
