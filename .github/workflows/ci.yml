@@ -107,6 +107,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Resolve backend layout paths
+        run: |
+          if [ -f backend/Dockerfile ]; then
+            echo "DOCKERFILE=backend/Dockerfile" >> "$GITHUB_ENV"
+            echo "BUILD_CONTEXT=backend" >> "$GITHUB_ENV"
+            echo "SMOKE_TEST_SCRIPT=backend/scripts/smoke_test.py" >> "$GITHUB_ENV"
+            echo "PIP_EDITABLE_TARGET=./backend[service,postgres]" >> "$GITHUB_ENV"
+          else
+            echo "DOCKERFILE=deploy/docker/Dockerfile" >> "$GITHUB_ENV"
+            echo "BUILD_CONTEXT=." >> "$GITHUB_ENV"
+            echo "SMOKE_TEST_SCRIPT=scripts/smoke_test.py" >> "$GITHUB_ENV"
+            echo "PIP_EDITABLE_TARGET=.[service,postgres]" >> "$GITHUB_ENV"
+          fi
+
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
@@ -122,7 +136,7 @@ jobs:
 
       - name: Build Docker image directly
         run: |
-          docker build -t pool-engine:ci -f deploy/docker/Dockerfile .
+          docker build -t pool-engine:ci -f "${DOCKERFILE}" "${BUILD_CONTEXT}"
 
       - name: Launch Docker Compose stack (PostgreSQL and Pool Engine)
         run: |
@@ -144,8 +158,8 @@ jobs:
       - name: Run smoke test against running container
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[service,postgres]"
-          python scripts/smoke_test.py --base-url http://127.0.0.1:8000
+          pip install -e "${PIP_EDITABLE_TARGET}"
+          python "${SMOKE_TEST_SCRIPT}" --base-url http://127.0.0.1:8000
 
       - name: Test graceful container shutdown under SIGTERM
         run: |
